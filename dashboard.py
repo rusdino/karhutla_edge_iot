@@ -256,7 +256,8 @@ class DashboardEngine:
         self.broker_connected = False
         self.node_status = "offline"
 
-        # Embedded SITL state
+        # Embedded SITL / HILS state
+        self.sim_target = "sitl"
         self.sim_running = False
         self.sim_paused = False
         self.sim_scenario = "flaming"
@@ -272,6 +273,8 @@ class DashboardEngine:
         self.sim_csv = None
         self._sim_stop_evt = threading.Event()
         self._sim_thread = None
+        self._hils_cond = threading.Condition()
+        self._hils_by_seq = {}
 
         # SSE subscribers
         self._sse_clients = []
@@ -354,6 +357,14 @@ class DashboardEngine:
                     if not self.sim_running:
                         self._ingest_external(tel, "sitl")
                 else:
+                    if "seq" in tel:
+                        try:
+                            s_val = int(tel["seq"])
+                            with self._hils_cond:
+                                self._hils_by_seq[s_val] = tel
+                                self._hils_cond.notify_all()
+                        except (TypeError, ValueError):
+                            pass
                     self._ingest_external(tel, "esp32")
 
         self.client = mqtt_io.make_client(
@@ -486,6 +497,7 @@ class DashboardEngine:
     def get_sim_status(self):
         with self.lock:
             return {
+                "target": self.sim_target,
                 "running": self.sim_running,
                 "paused": self.sim_paused,
                 "scenario": self.sim_scenario,
@@ -575,6 +587,9 @@ class DashboardEngine:
 
     def control_sim(self, params):
         action = (params.get("action") or "").strip().lower()
+        if params.get("target") in ("sitl", "hils"):
+            with self.lock:
+                self.sim_target = params["target"]
         if "scenario" in params and params["scenario"] in SCENARIOS:
             with self.lock:
                 self.sim_scenario = params["scenario"]
@@ -620,19 +635,29 @@ class DashboardEngine:
 
     def _start_sim_thread(self):
         with self.lock:
-            self.history.clear()
+            target = self.sim_target
+            if target == "hils":
+                self.esp_history.clear()
+                self._esp_fc = LinearTrendForecaster()
+            else:
+                self.history.clear()
             self.sim_plant = SmokeChamber(self.sim_scenario, seed=1)
-            self.sim_fw = Firmware()
+            self.sim_fw = None if target == "hils" else Firmware()
             self.sim_fc = LinearTrendForecaster()
             self.sim_pre = PreemptController() if self.sim_ai_preempt else None
-            self.sim_csv = DailyCsvLogger(self.out_dir, source="sitl")
+            self.sim_csv = DailyCsvLogger(self.out_dir, source=target)
             self.sim_step_idx = 0
             self.sim_running = True
             self.sim_paused = False
             self.node_status = "online"
             self._sim_stop_evt.clear()
 
-        self._broadcast({"type": "clear", "source": "sitl"})
+        if target == "hils":
+            with self._hils_cond:
+                self._hils_by_seq.clear()
+            self._broadcast({"type": "clear", "source": "esp32"})
+        else:
+            self._broadcast({"type": "clear", "source": "sitl"})
 
         if self.client:
             try:
@@ -640,7 +665,8 @@ class DashboardEngine:
             except Exception:
                 pass
 
-        self._sim_thread = threading.Thread(target=self._sim_loop, daemon=True)
+        loop_fn = self._hils_loop if target == "hils" else self._sim_loop
+        self._sim_thread = threading.Thread(target=loop_fn, daemon=True)
         self._sim_thread.start()
 
     def _sim_loop(self):
@@ -722,8 +748,115 @@ class DashboardEngine:
                 self.sim_csv = None
         self._broadcast({"type": "sim", "sim": self.get_sim_status()})
 
+    def _wait_hils_seq(self, seq, vd, vm, timeout=4.0):
+        """Tunggu balasan telemetri ESP32 untuk `seq`, dengan 1x retry di tengah timeout."""
+        deadline = time.time() + timeout
+        retried = False
+        half_at = time.time() + timeout * 0.5
+        while not self._sim_stop_evt.is_set():
+            with self._hils_cond:
+                if seq in self._hils_by_seq:
+                    return self._hils_by_seq.pop(seq)
+                now = time.time()
+                if now >= deadline:
+                    return None
+                if not retried and now >= half_at:
+                    retried = True
+                    if self.client:
+                        try:
+                            self.client.publish(K.T_HILS_IN, f"{seq},{vd:.4f},{vm:.4f}")
+                        except Exception:
+                            pass
+                wait_for = min(0.25, deadline - now)
+                self._hils_cond.wait(timeout=max(0.01, wait_for))
+        return None
+
+    def _hils_loop(self):
+        total_steps = int(self.sim_duration / K.TS)
+        if self.client:
+            try:
+                self.client.publish(K.T_CMD, "RESET")
+            except Exception:
+                pass
+            self._sim_stop_evt.wait(0.35)
+            with self._hils_cond:
+                self._hils_by_seq.clear()
+
+        while not self._sim_stop_evt.is_set():
+            with self.lock:
+                if not self.sim_running or self.sim_step_idx >= total_steps:
+                    break
+                if self.sim_paused:
+                    paused = True
+                else:
+                    paused = False
+                    k = self.sim_step_idx
+                    self.sim_step_idx += 1
+                    t = k * K.TS
+                    vd, vm = self.sim_plant.sensors(t)
+                    fault_now = self.sim_fault_inject or self.sim_plant.dust_disconnected(t)
+                    if self.sim_fault_inject:
+                        vd = 0.0
+                    speed = self.sim_speed
+                    scenario = self.sim_scenario
+
+            if paused:
+                time.sleep(0.1)
+                continue
+
+            if self.client:
+                try:
+                    self.client.publish(K.T_HILS_IN, f"{k},{vd:.4f},{vm:.4f}")
+                except Exception:
+                    pass
+            tel = self._wait_hils_seq(k, vd, vm, timeout=4.0)
+            if self._sim_stop_evt.is_set():
+                break
+
+            if tel is not None:
+                with self.lock:
+                    f = self.sim_fc.update(t, float(tel.get("pm", 0.0)))
+                    pre_cmd = None
+                    if self.sim_ai_preempt and self.sim_pre is not None:
+                        pre_cmd = self.sim_pre.decide(t, str(tel.get("mode", "AUTO")), f["pm_forecast"])
+                    self.sim_plant.advance(float(tel.get("duty", 0.0)) / 100.0, t)
+                    if self.sim_csv:
+                        self.sim_csv.write(_clean_dict({
+                            "t": t, "t_s": t, "seq": k, "scenario": scenario,
+                            "pm_true": self.sim_plant.C, "gas_true": self.sim_plant.gas_ppm,
+                            "v_dust": vd, "v_mq": vm,
+                            "pm_raw": tel.get("pm_raw", 0.0), "pm": tel.get("pm", 0.0),
+                            "dcdt": tel.get("dcdt", 0.0), "gas_ppm": tel.get("gas_ppm", K.MQ_ATM_PPM),
+                            "g": tel.get("g", 0.0), "fi": tel.get("fi", 0.0), "v0": tel.get("v0", K.DUST_V0),
+                            "state": tel.get("state", "NORMAL"), "mode": tel.get("mode", "AUTO"),
+                            "duty": tel.get("duty", 0.0),
+                            "forecast": f.get("pm_forecast", 0.0), "slope": f.get("slope", 0.0),
+                            "eta_bahaya_s": f.get("eta_bahaya_s"), "mae": f.get("mae"),
+                            "sensor_fault": fault_now,
+                        }))
+                if self.client:
+                    try:
+                        mqtt_io.publish_forecast(self.client, f)
+                        if pre_cmd:
+                            self.client.publish(K.T_CMD, pre_cmd)
+                    except Exception:
+                        pass
+
+            self._broadcast({"type": "sim", "sim": self.get_sim_status()})
+            wait_s = max(0.005, K.TS / max(0.1, speed))
+            self._sim_stop_evt.wait(wait_s)
+
+        with self.lock:
+            self.sim_running = False
+            if self.sim_csv:
+                self.sim_csv.close()
+                self.sim_csv = None
+        self._broadcast({"type": "sim", "sim": self.get_sim_status()})
+
     def stop_sim(self):
         self._sim_stop_evt.set()
+        with self._hils_cond:
+            self._hils_cond.notify_all()
         t = self._sim_thread
         if t and t.is_alive():
             t.join(timeout=1.5)
@@ -1468,14 +1601,22 @@ RENDERED_HTML = """<!DOCTYPE html>
         <div style="border-block-start:1px solid var(--border-subtle);padding-block-start:0.75rem;">
           <div style="display:flex;justify-content:space-between;align-items:safe center;">
             <div>
-              <h2 class="panel-title">Operasi Simulasi SITL Terpadu</h2>
-              <p class="brand-sub">Jalankan atau uji skenario langsung dari panel ini</p>
+              <h2 class="panel-title">Operasi Simulasi SITL / HILS Terpadu</h2>
+              <p class="brand-sub">Jalankan skenario ke SITL Python maupun HILS ESP32</p>
             </div>
             <span id="badge-sim-state" class="pill-badge">IDLE</span>
           </div>
         </div>
 
         <div class="op-list">
+          <div class="op-row">
+            <span>Target Eksekusi</span>
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Target Runner Simulasi" id="target-toolbar">
+              <button type="button" class="chip-btn tgt-btn" data-target="sitl" aria-pressed="true">SITL (Python)</button>
+              <button type="button" class="chip-btn tgt-btn" data-target="hils" aria-pressed="false">HILS (ESP32)</button>
+            </div>
+          </div>
+
           <div class="op-row">
             <label for="sel-scenario">Skenario Ruang Asap</label>
             <select id="sel-scenario" class="op-select">
@@ -1734,9 +1875,16 @@ RENDERED_HTML = """<!DOCTYPE html>
       function updateSimBadges(sim) {
         if (!sim) return;
         state.sim = sim;
+        if (sim.target) {
+          state.simTarget = sim.target;
+          document.querySelectorAll('.tgt-btn').forEach((b) => {
+            b.setAttribute('aria-pressed', b.getAttribute('data-target') === sim.target ? 'true' : 'false');
+          });
+        }
+        const tgtLabel = (sim.target || 'sitl').toUpperCase();
         const bSim = document.getElementById('badge-sim-state');
         if (sim.running) {
-          bSim.textContent = sim.paused ? `PAUSED (${sim.scenario})` : `RUNNING: ${sim.scenario} (${sim.speed}x)`;
+          bSim.textContent = sim.paused ? `${tgtLabel} PAUSED (${sim.scenario})` : `${tgtLabel}: ${sim.scenario} (${sim.speed}x)`;
           bSim.setAttribute('data-tone', sim.paused ? 'warn' : 'ok');
         } else {
           bSim.textContent = 'IDLE / MQTT MONITOR';
@@ -2016,13 +2164,30 @@ RENDERED_HTML = """<!DOCTYPE html>
         });
       }
 
+      document.querySelectorAll('.tgt-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const tgt = btn.getAttribute('data-target');
+          state.simTarget = tgt;
+          document.querySelectorAll('.tgt-btn').forEach((b) => {
+            b.setAttribute('aria-pressed', b.getAttribute('data-target') === tgt ? 'true' : 'false');
+          });
+          postSim({ target: tgt });
+        });
+      });
+
       document.getElementById('btn-sim-start').addEventListener('click', () => {
-        state.src.sitl.history = [];
+        const tgt = state.simTarget || 'sitl';
+        if (tgt === 'hils') {
+          state.src.esp32.history = [];
+          if (state.viewMode === 'sitl') state.viewMode = 'esp32';
+        } else {
+          state.src.sitl.history = [];
+        }
         applyView();
         const scenario = document.getElementById('sel-scenario').value;
         const ai_preempt = document.getElementById('sw-preempt').checked;
         const fault_inject = document.getElementById('sw-fault').checked;
-        postSim({ action: 'start', scenario, ai_preempt, fault_inject });
+        postSim({ action: 'start', target: tgt, scenario, ai_preempt, fault_inject });
       });
 
       document.getElementById('btn-sim-pause').addEventListener('click', () => {

@@ -223,6 +223,7 @@ class TestModernWebDashboard(unittest.TestCase):
         self.assertIn("esp_status", html)
         self.assertIn('id="esp-banner"', html)
         self.assertIn('class="chip-btn src-btn"', html)
+        self.assertIn('data-target="hils"', html)
         self.assertIn("requestAnimationFrame", html)
 
     def test_dashboard_server_endpoints_and_fault_injection(self):
@@ -359,6 +360,45 @@ class TestModernWebDashboard(unittest.TestCase):
             eng.shutdown()
             srv.shutdown()
             srv.server_close()
+
+    def test_dashboard_hils_runner_drives_esp32_with_speed_and_stop(self):
+        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=self.broker_port, enable_mqtt=True)
+        fw = Firmware()
+        esp_seen = []
+
+        def on_msg(c, u, msg):
+            if msg.topic == K.T_HILS_IN:
+                parts = msg.payload.decode("utf-8").strip().split(",")
+                seq = int(parts[0])
+                vd, vm = float(parts[1]), float(parts[2])
+                esp_seen.append(seq)
+                tel = fw.step(vd, vm, seq=seq)
+                tel["src"] = "esp32"
+                c.publish(K.T_TELEM, json.dumps(tel))
+            elif msg.topic == K.T_CMD and msg.payload.decode("utf-8").strip() == "RESET":
+                fw.reset()
+
+        def on_conn(c, u, f, rc, p=None):
+            c.subscribe([(K.T_HILS_IN, 0), (K.T_CMD, 0)])
+
+        esp = mqtt_io.make_client("fake-esp32-hils", on_connect=on_conn, on_message=on_msg)
+        try:
+            mqtt_io.connect(esp, "127.0.0.1", self.broker_port)
+            time.sleep(0.4)
+
+            eng.control_sim({"action": "start", "target": "hils", "scenario": "clean", "speed": 20})
+            time.sleep(1.2)
+            snap = eng.get_state_snapshot()
+            self.assertEqual(snap["sim"]["target"], "hils")
+            self.assertTrue(snap["sim"]["running"])
+            self.assertGreaterEqual(len(esp_seen), 4)
+            self.assertGreaterEqual(len(snap["sources"]["esp32"]["history"]), 4)
+
+            eng.control_sim({"action": "stop"})
+            self.assertFalse(eng.get_state_snapshot()["sim"]["running"])
+        finally:
+            mqtt_io.disconnect(esp)
+            eng.shutdown()
 
 
 if __name__ == "__main__":
