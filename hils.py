@@ -56,6 +56,22 @@ class Link:
             return out
 
 
+def reset_and_wait_esp32(client, link, timeout=10.0):
+    """Kosongkan buffer telemetri SEBELUM mengirim RESET agar balasan cepat ESP32 tidak terhapus."""
+    with link.cond:
+        link.tel = None
+        link.cmds = []
+    step_wait = min(2.0, max(0.2, timeout / 5.0))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        client.publish(K.T_CMD, "RESET")
+        got = link.wait_any(step_wait)
+        if got is not None:
+            link.drain_cmds()
+            return got
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scenario", default="flaming", choices=SCENARIOS)
@@ -78,12 +94,8 @@ def main():
 
     print("Mereset ESP32 & menunggu telemetri ...")
     time.sleep(0.5)
-    client.publish(K.T_CMD, "RESET")
-    time.sleep(1.0)
-    link.drain_cmds()
-    link.tel = None
-    # kirim sampel dummy tidak perlu: ESP32 menerbitkan telemetri tiap ada data / perintah RESET
-    if link.wait_any(10) is None:
+    if reset_and_wait_esp32(client, link, timeout=10.0) is None:
+        mqtt_io.disconnect(client)
         raise SystemExit("ESP32 tidak terdeteksi (cek Wi-Fi, IP broker, dan MODE_HILS=1).")
     print("ESP32 terdeteksi. Mulai simulasi.")
 

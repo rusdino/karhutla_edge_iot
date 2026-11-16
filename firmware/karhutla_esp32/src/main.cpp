@@ -467,6 +467,7 @@ static void publishTel(const Tel& t) {
 }
 
 static void txTask(void*) {
+  uint32_t lastHb = 0;
   for (;;) {
     if (mqttConnected) {
       Tel copy; bool fresh = false;
@@ -474,6 +475,15 @@ static void txTask(void*) {
       if (tel.fresh) { copy = tel; tel.fresh = false; fresh = true; }
       xSemaphoreGive(mtx);
       if (fresh) publishTel(copy);
+
+      uint32_t now = nowMs();
+      if (now - lastHb >= 1000) {
+        lastHb = now;
+        char hb[64];
+        snprintf(hb, sizeof(hb), "{\"mode\":\"%s\",\"uptime_ms\":%lu}",
+                 MODE_HILS ? "HILS" : "RIIL", (unsigned long)now);
+        esp_mqtt_client_publish(mqttClient, T_HEARTBEAT, hb, 0, 0, 0);
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }

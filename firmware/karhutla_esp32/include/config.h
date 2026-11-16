@@ -12,7 +12,7 @@
 
 // ---- Jaringan ----
 #define WIFI_SSID   "Hotspot LSKK"
-#define WIFI_PASS   "PASSWORD_WIFI"
+#define WIFI_PASS   "stei.lskk"
 #define MQTT_HOST   "10.8.43.78"       // IP LAN laptop (broker Mosquitto)
 #define MQTT_PORT   6669
 #define MQTT_USER   ""                 // kosong = tanpa autentikasi
@@ -23,6 +23,7 @@
 #define T_CMD           "karhutla/cmd"
 #define T_HILS_IN       "karhutla/hils/sensor"
 #define T_STATUS        "karhutla/status"
+#define T_HEARTBEAT     "karhutla/hb"
 
 // ---- Pin (gunakan ADC1; ADC2 tidak bisa saat Wi-Fi aktif) ----
 #define PIN_DUST_ADC  34      // Sharp Vo  -> divider 10k/20k -> GPIO34 (ADC1_CH6)

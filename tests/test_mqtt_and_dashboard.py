@@ -63,6 +63,25 @@ class TestConfigAndCoreCommands(unittest.TestCase):
         self.assertIn('gas_ppm=tel.get("gas_ppm"', fn_src)
         self.assertIn("mqtt_io.disconnect(client)", fn_src)
 
+    def test_hils_reset_handshake_does_not_wipe_fast_esp32_reply(self):
+        import hils
+        link = hils.Link()
+
+        class DummyClient:
+            def publish(self, topic, payload):
+                if topic == K.T_CMD and payload == "RESET":
+                    # Simulasikan ESP32 membalas RESET dalam 50 ms
+                    class Msg:
+                        pass
+                    m = Msg()
+                    m.topic = K.T_TELEM
+                    m.payload = b'{"seq":0,"state":"NORMAL","mode":"AUTO","duty":0.0}'
+                    link.on_message(self, None, m)
+
+        tel = hils.reset_and_wait_esp32(DummyClient(), link, timeout=1.0)
+        self.assertIsNotNone(tel)
+        self.assertEqual(tel.get("state"), "NORMAL")
+
     def test_firmware_apply_command_and_reset(self):
         fw = Firmware()
         fw.step(1.5, 1.2, seq=1)
@@ -149,6 +168,9 @@ class TestModernWebDashboard(unittest.TestCase):
         self.assertIn('aria-pressed="true"', html)
         self.assertIn('type="checkbox" switch', html)
         self.assertIn("@supports not (scrollbar-color: auto)", html)
+        self.assertIn("esp_status", html)
+        self.assertIn('id="esp-banner"', html)
+        self.assertIn('class="chip-btn src-btn"', html)
 
     def test_dashboard_server_endpoints_and_fault_injection(self):
         eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=K.BROKER_PORT, enable_mqtt=True)
@@ -219,6 +241,47 @@ class TestModernWebDashboard(unittest.TestCase):
                 self.assertGreater(times[i], times[i - 1], f"History time jumped backward or duplicated: {times}")
 
             mqtt_io.disconnect(pub)
+        finally:
+            eng.shutdown()
+
+    def test_esp32_telemetry_not_dropped_while_embedded_sitl_runs(self):
+        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=K.BROKER_PORT, enable_mqtt=True)
+        try:
+            eng.control_sim({"action": "start", "scenario": "clean", "speed": 5})
+            esp = mqtt_io.make_client("fake-esp32")
+            mqtt_io.connect(esp, "127.0.0.1", K.BROKER_PORT)
+            time.sleep(0.4)
+            for seq in range(5):
+                esp.publish(K.T_TELEM, json.dumps({
+                    "seq": seq, "src": "esp32", "v_dust": 0.7, "v_mq": 1.2, "pm_raw": 20.0,
+                    "pm": 20.0, "dcdt": 0.0, "gas_ppm": 420.0, "g": 0.0, "fi": 77.0, "v0": 0.6,
+                    "state": "WASPADA", "mode": "AUTO", "duty": 55.0, "alarm": 1}))
+                time.sleep(0.05)
+            time.sleep(0.4)
+            snap = eng.get_state_snapshot()
+            esp_rows = snap["sources"]["esp32"]["history"]
+            self.assertGreaterEqual(len(esp_rows), 5)
+            self.assertEqual(esp_rows[-1]["fi"], 77.0)
+            # Grafik SITL tidak boleh tercampur dengan baris ESP32
+            self.assertTrue(all(r["fi"] != 77.0 for r in snap["sources"]["sitl"]["history"]))
+            mqtt_io.disconnect(esp)
+        finally:
+            eng.shutdown()
+
+    def test_esp32_marked_offline_when_telemetry_stops(self):
+        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=K.BROKER_PORT,
+                                        enable_mqtt=True, esp_stale_s=0.6)
+        try:
+            esp = mqtt_io.make_client("fake-esp32-2")
+            mqtt_io.connect(esp, "127.0.0.1", K.BROKER_PORT)
+            time.sleep(0.3)
+            esp.publish(K.T_TELEM, json.dumps({"seq": 1, "src": "esp32", "pm": 10.0, "fi": 10.0,
+                                               "state": "NORMAL", "mode": "AUTO", "duty": 0.0}))
+            time.sleep(0.3)
+            self.assertTrue(eng.get_state_snapshot()["sources"]["esp32"]["online"])
+            time.sleep(1.8)  # ESP32 "dicabut": tidak ada data lagi
+            self.assertFalse(eng.get_state_snapshot()["sources"]["esp32"]["online"])
+            mqtt_io.disconnect(esp)
         finally:
             eng.shutdown()
 

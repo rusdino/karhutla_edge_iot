@@ -19,6 +19,7 @@ T_HILS_IN = "karhutla/hils/sensor"     # laptop -> ESP32: "seq,v_dust,v_mq"
 T_FORECAST = "karhutla/forecast"       # laptop -> HP (JSON)
 T_FORECAST_SCALAR = "karhutla/f"       # karhutla/f/pm_forecast, /eta ...
 T_STATUS = "karhutla/status"           # online | offline (retained)
+T_HEARTBEAT = "karhutla/hb"            # ESP32 -> laptop: JSON heartbeat 1 Hz (deteksi dicabut)
 
 # ---------- Sharp GP2Y1010AU0F ----------
 DUST_V0 = 0.60                 # [V] tegangan sensor saat udara bersih (UKUR SENDIRI!)

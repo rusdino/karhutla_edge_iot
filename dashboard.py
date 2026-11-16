@@ -208,11 +208,23 @@ def build_mobile_dashboard_config(broker_host=None, broker_port=None):
 class DashboardEngine:
     """Pengelola state real-time, jembatan MQTT, dan embedded SITL runner."""
 
-    def __init__(self, broker_host=None, broker_port=None, out_dir="logs", enable_mqtt=True):
+    def __init__(self, broker_host=None, broker_port=None, out_dir="logs", enable_mqtt=True,
+                 esp_stale_s=5.0):
         self.broker_host = broker_host or K.BROKER_HOST
         self.broker_port = int(broker_port or K.BROKER_PORT)
         self.out_dir = out_dir
         self.enable_mqtt = enable_mqtt
+        self.esp_stale_s = float(esp_stale_s)
+
+        # Aliran data ESP32 (hardware) dipisah dari aliran SITL agar tidak saling menimpa
+        self.esp_history = deque(maxlen=1800)
+        self.esp_latest = None
+        self.esp_last_rx = None          # waktu dinding terakhir menerima telemetri/heartbeat ESP32
+        self.esp_online = False
+        self.esp_hw_mode = None          # "HILS" / "RIIL" dari heartbeat firmware
+        self._esp_fc = LinearTrendForecaster()
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread = None
 
         self.lock = threading.Lock()
         self.history = deque(maxlen=1800)
@@ -273,6 +285,8 @@ class DashboardEngine:
 
         if self.enable_mqtt:
             self._init_mqtt()
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._watchdog_thread.start()
 
     def _record_mqtt_log(self, line):
         with self.lock:
@@ -316,59 +330,28 @@ class DashboardEngine:
                         else:
                             snap = None
                     if snap is not None:
-                        self._broadcast({"type": "telemetry", "row": snap, "sim": self.get_sim_status()})
-            elif topic == K.T_TELEM and not self.sim_running:
+                        self._broadcast({"type": "telemetry", "source": "sitl", "row": snap,
+                                         "sim": self.get_sim_status()})
+            elif topic == K.T_HEARTBEAT:
+                try:
+                    hb = json.loads(payload)
+                except ValueError:
+                    hb = {}
+                self._esp_alive(hb.get("mode") if isinstance(hb, dict) else None)
+            elif topic == K.T_TELEM:
                 try:
                     tel = json.loads(payload)
                 except ValueError:
                     return
-                t_rel = round(time.time() - self._t0_wall, 1)
-                seq_val = int(tel.get("seq", 0))
-                t_val = float(tel.get("seq", t_rel))
-                did_reset_history = False
-                with self.lock:
-                    if self.history and t_val <= self.history[-1].get("t", -1.0):
-                        # Skenario baru dimulai dari seq=0 atau perintah diikuti re-publish pada detik yang sama
-                        if seq_val == 0 or t_val < self.history[-1].get("t", -1.0):
-                            self.history.clear()
-                            self._external_fc = LinearTrendForecaster()
-                            did_reset_history = True
-                f = self._external_fc.update(t_val, float(tel.get("pm", 0.0)))
-                row = _clean_dict({
-                    "t": t_val,
-                    "seq": seq_val,
-                    "scenario": "mqtt-live",
-                    "pm_true": None,
-                    "gas_true": None,
-                    "v_dust": float(tel.get("v_dust", K.DUST_V0)),
-                    "v_mq": float(tel.get("v_mq", 1.0)),
-                    "pm_raw": float(tel.get("pm_raw", 0.0)),
-                    "pm": float(tel.get("pm", 0.0)),
-                    "dcdt": float(tel.get("dcdt", 0.0)),
-                    "gas_ppm": float(tel.get("gas_ppm", K.MQ_ATM_PPM)),
-                    "g": float(tel.get("g", 0.0)),
-                    "fi": float(tel.get("fi", 0.0)),
-                    "v0": float(tel.get("v0", K.DUST_V0)),
-                    "state": str(tel.get("state", "NORMAL")),
-                    "mode": str(tel.get("mode", "AUTO")),
-                    "duty": float(tel.get("duty", 0.0)),
-                    "forecast": _clean_val(f.get("pm_forecast", 0.0)),
-                    "slope": _clean_val(f.get("slope", 0.0)),
-                    "eta_bahaya_s": _clean_val(f.get("eta_bahaya_s")),
-                    "mae": _clean_val(f.get("mae")),
-                    "sensor_fault": str(tel.get("state", "")) == "FAILSAFE",
-                })
-                with self.lock:
-                    self.latest = row
-                    if self.history and self.history[-1].get("t") == t_val:
-                        self.history[-1] = row
-                    else:
-                        self.history.append(row)
-                    if self.node_status == "offline":
-                        self.node_status = "online"
-                if did_reset_history:
-                    self._broadcast({"type": "clear"})
-                self._broadcast({"type": "telemetry", "row": row, "sim": self.get_sim_status()})
+                if not isinstance(tel, dict):
+                    return
+                if tel.get("src") == "sitl":
+                    # Gema dari runner SITL milik dashboard sendiri sudah dicatat langsung; abaikan.
+                    # Bila SITL berasal dari proses lain (sitl.py), tampilkan sebagai aliran SITL.
+                    if not self.sim_running:
+                        self._ingest_external(tel, "sitl")
+                else:
+                    self._ingest_external(tel, "esp32")
 
         self.client = mqtt_io.make_client(
             f"karhutla-dashboard-{int(time.time() * 1000) % 100000}",
@@ -383,6 +366,95 @@ class DashboardEngine:
                 self.broker_connected = True
         except Exception as exc:
             self._record_mqtt_log(f"{datetime.datetime.now().isoformat(timespec='milliseconds')} [dashboard] ERROR connect failed: {exc}")
+
+    # ---------- Aliran ESP32 (hardware) ----------
+    def _esp_alive(self, hw_mode=None):
+        """Tandai ESP32 hidup (dipanggil oleh telemetri maupun heartbeat)."""
+        changed = False
+        with self.lock:
+            self.esp_last_rx = time.time()
+            if hw_mode:
+                self.esp_hw_mode = hw_mode
+            if not self.esp_online:
+                self.esp_online = True
+                changed = True
+        if changed:
+            self._broadcast({"type": "esp_status", "online": True, "hw_mode": self.esp_hw_mode, "age_s": 0.0})
+
+    def _watchdog_loop(self):
+        """Deteksi ESP32 dicabut: tidak ada telemetri/heartbeat > esp_stale_s."""
+        while not self._watchdog_stop.wait(0.25):
+            went_offline = False
+            with self.lock:
+                if self.esp_online and self.esp_last_rx is not None \
+                        and time.time() - self.esp_last_rx > self.esp_stale_s:
+                    self.esp_online = False
+                    went_offline = True
+                age = None if self.esp_last_rx is None else time.time() - self.esp_last_rx
+            if went_offline:
+                self._broadcast({"type": "esp_status", "online": False, "hw_mode": self.esp_hw_mode,
+                                 "age_s": age})
+
+    def _ingest_external(self, tel, target):
+        """Masukkan telemetri dari MQTT ke aliran `target` ('esp32' atau 'sitl')."""
+        is_esp = target == "esp32"
+        hist = self.esp_history if is_esp else self.history
+        t_rel = round(time.time() - self._t0_wall, 1)
+        seq_val = int(tel.get("seq", 0))
+        t_val = float(tel.get("seq", t_rel))
+        did_reset_history = False
+        with self.lock:
+            if hist and t_val <= hist[-1].get("t", -1.0):
+                # Skenario/run baru dimulai dari seq=0 atau re-publish pada detik yang sama
+                if seq_val == 0 or t_val < hist[-1].get("t", -1.0):
+                    hist.clear()
+                    if is_esp:
+                        self._esp_fc = LinearTrendForecaster()
+                    else:
+                        self._external_fc = LinearTrendForecaster()
+                    did_reset_history = True
+            fc = self._esp_fc if is_esp else self._external_fc
+        f = fc.update(t_val, float(tel.get("pm", 0.0)))
+        row = _clean_dict({
+            "t": t_val,
+            "seq": seq_val,
+            "scenario": "esp32-live" if is_esp else "mqtt-live",
+            "pm_true": None,
+            "gas_true": None,
+            "v_dust": float(tel.get("v_dust", K.DUST_V0)),
+            "v_mq": float(tel.get("v_mq", 1.0)),
+            "pm_raw": float(tel.get("pm_raw", 0.0)),
+            "pm": float(tel.get("pm", 0.0)),
+            "dcdt": float(tel.get("dcdt", 0.0)),
+            "gas_ppm": float(tel.get("gas_ppm", K.MQ_ATM_PPM)),
+            "g": float(tel.get("g", 0.0)),
+            "fi": float(tel.get("fi", 0.0)),
+            "v0": float(tel.get("v0", K.DUST_V0)),
+            "state": str(tel.get("state", "NORMAL")),
+            "mode": str(tel.get("mode", "AUTO")),
+            "duty": float(tel.get("duty", 0.0)),
+            "forecast": _clean_val(f.get("pm_forecast", 0.0)),
+            "slope": _clean_val(f.get("slope", 0.0)),
+            "eta_bahaya_s": _clean_val(f.get("eta_bahaya_s")),
+            "mae": _clean_val(f.get("mae")),
+            "sensor_fault": str(tel.get("state", "")) == "FAILSAFE",
+        })
+        with self.lock:
+            if is_esp:
+                self.esp_latest = row
+            else:
+                self.latest = row
+            if hist and hist[-1].get("t") == t_val:
+                hist[-1] = row
+            else:
+                hist.append(row)
+            if not is_esp and self.node_status == "offline":
+                self.node_status = "online"
+        if is_esp:
+            self._esp_alive()
+        if did_reset_history:
+            self._broadcast({"type": "clear", "source": target})
+        self._broadcast({"type": "telemetry", "source": target, "row": row, "sim": self.get_sim_status()})
 
     def _broadcast(self, payload):
         msg = f"data: {json.dumps(payload)}\n\n".encode("utf-8")
@@ -426,14 +498,31 @@ class DashboardEngine:
                 "log_file": self.mqtt_logger.path or f"{self.out_dir}/mqtt_{datetime.date.today().isoformat()}.log",
             }
 
+    def get_esp_status(self):
+        with self.lock:
+            age = None if self.esp_last_rx is None else round(time.time() - self.esp_last_rx, 1)
+            return {"online": self.esp_online, "age_s": age, "hw_mode": self.esp_hw_mode,
+                    "stale_s": self.esp_stale_s}
+
     def get_state_snapshot(self):
         with self.lock:
-            hist = list(self.history)
+            sitl_hist = list(self.history)
+            esp_hist = list(self.esp_history)
             logs = list(self.mqtt_logs)
-            lat = dict(self.latest)
+            sitl_latest = dict(self.latest)
+            esp_latest = dict(self.esp_latest) if self.esp_latest else None
+            esp_online = self.esp_online
+            sim_running = self.sim_running
+        # Tampilan bawaan (kompatibilitas): ESP32 bila hidup/ada data & SITL tidak jalan, selain itu SITL
+        use_esp = esp_online or (esp_hist and not sim_running)
         return {
-            "latest": lat,
-            "history": hist,
+            "latest": (esp_latest if use_esp and esp_latest else sitl_latest),
+            "history": (esp_hist if use_esp else sitl_hist),
+            "sources": {
+                "sitl": {"history": sitl_hist, "latest": sitl_latest, "online": sim_running},
+                "esp32": {"history": esp_hist, "latest": esp_latest, "online": esp_online},
+            },
+            "esp": self.get_esp_status(),
             "mqtt_logs": logs,
             "sim": self.get_sim_status(),
             "thresholds": {"waspada": K.T_W_IN, "bahaya": K.T_B_IN, "horizon_s": K.FORECAST_HORIZON_S},
@@ -476,9 +565,9 @@ class DashboardEngine:
             except Exception:
                 pass
         if did_clear:
-            self._broadcast({"type": "clear"})
+            self._broadcast({"type": "clear", "source": "sitl"})
         if snap is not None:
-            self._broadcast({"type": "telemetry", "row": snap, "sim": self.get_sim_status()})
+            self._broadcast({"type": "telemetry", "source": "sitl", "row": snap, "sim": self.get_sim_status()})
         return True
 
     def control_sim(self, params):
@@ -515,9 +604,14 @@ class DashboardEngine:
             with self.lock:
                 self.sim_paused = False
         elif action == "clear":
+            src = params.get("source", "sitl")
             with self.lock:
-                self.history.clear()
-            self._broadcast({"type": "clear"})
+                if src == "esp32":
+                    self.esp_history.clear()
+                    self._esp_fc = LinearTrendForecaster()
+                else:
+                    self.history.clear()
+            self._broadcast({"type": "clear", "source": "esp32" if src == "esp32" else "sitl"})
         self._broadcast({"type": "sim", "sim": self.get_sim_status()})
         return True
 
@@ -535,7 +629,7 @@ class DashboardEngine:
             self.node_status = "online"
             self._sim_stop_evt.clear()
 
-        self._broadcast({"type": "clear"})
+        self._broadcast({"type": "clear", "source": "sitl"})
 
         if self.client:
             try:
@@ -614,7 +708,7 @@ class DashboardEngine:
                 except Exception:
                     pass
 
-            self._broadcast({"type": "telemetry", "row": row, "sim": self.get_sim_status()})
+            self._broadcast({"type": "telemetry", "source": "sitl", "row": row, "sim": self.get_sim_status()})
             wait_s = max(0.005, K.TS / max(0.1, speed))
             self._sim_stop_evt.wait(wait_s)
 
@@ -638,6 +732,7 @@ class DashboardEngine:
                 self.sim_csv = None
 
     def shutdown(self):
+        self._watchdog_stop.set()
         self.stop_sim()
         if self.client:
             mqtt_io.disconnect(self.client)
@@ -1010,6 +1105,27 @@ RENDERED_HTML = """<!DOCTYPE html>
       position: relative;
     }
 
+    .offline-banner {
+      position: absolute;
+      inset-block-start: 0.6rem;
+      inset-inline: 0.6rem;
+      z-index: 2;
+      padding-block: 0.5rem;
+      padding-inline: 0.85rem;
+      border-radius: 10px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      text-align: center;
+      pointer-events: none;
+      color: var(--danger);
+      background: color-mix(in oklab, var(--bg-surface), var(--danger) 14%);
+      border: 1px solid color-mix(in oklab, var(--danger), transparent 35%);
+    }
+
+    .offline-banner[hidden] { display: none; }
+
+    .canvas-wrap.is-stale canvas { opacity: 0.45; }
+
     canvas.chart-stage {
       display: block;
       inline-size: 100%;
@@ -1153,8 +1269,8 @@ RENDERED_HTML = """<!DOCTYPE html>
         <span id="badge-broker" class="pill-badge" data-tone="ok">
           <span aria-hidden="true">●</span> <span id="txt-broker">Broker :6669 Connected</span>
         </span>
-        <span id="badge-node" class="pill-badge" data-tone="ok">
-          <span aria-hidden="true">✓</span> <span id="txt-node">karhutla/status: online</span>
+        <span id="badge-node" class="pill-badge" data-tone="warn">
+          <span id="ico-node" aria-hidden="true">○</span> <span id="txt-node">ESP32: belum terdeteksi</span>
         </span>
         <span id="badge-fsm" class="pill-badge" data-tone="ok">
           <span id="ico-fsm" aria-hidden="true">✓</span> <span id="txt-fsm">FSM: NORMAL</span>
@@ -1256,10 +1372,16 @@ RENDERED_HTML = """<!DOCTYPE html>
         <div class="panel-header">
           <div>
             <h2 class="panel-title">Grafik Multi-Overlay Real-Time (Klik untuk Toggle Layer)</h2>
-            <p class="brand-sub">Arahkan kursor pada grafik untuk melihat detail semua nilai pada detik tersebut</p>
+            <p class="brand-sub">Sumber data: <strong id="src-label">SITL</strong> • Arahkan kursor pada grafik untuk melihat detail semua nilai pada detik tersebut</p>
           </div>
 
           <div role="toolbar" focusgroup="toolbar wrap" aria-label="Pengaturan Jendela Waktu dan Ekspor">
+            <div role="group" aria-label="Sumber Data">
+              <button type="button" class="chip-btn src-btn" data-src="auto" aria-pressed="true">Otomatis</button>
+              <button type="button" class="chip-btn src-btn" data-src="esp32" aria-pressed="false" style="--chip-color:#4ade80;">ESP32</button>
+              <button type="button" class="chip-btn src-btn" data-src="sitl" aria-pressed="false" style="--chip-color:#38bdf8;">SITL</button>
+            </div>
+            <span role="separator" aria-orientation="vertical"></span>
             <div role="group" aria-label="Rentang Waktu">
               <button type="button" class="chip-btn win-btn" data-win="120" aria-pressed="false">120s</button>
               <button type="button" class="chip-btn win-btn" data-win="300" aria-pressed="true">300s</button>
@@ -1308,7 +1430,8 @@ RENDERED_HTML = """<!DOCTYPE html>
           </div>
         </div>
 
-        <div class="canvas-wrap">
+        <div class="canvas-wrap" id="main-wrap">
+          <div id="esp-banner" class="offline-banner" role="status" hidden></div>
           <canvas id="main-chart" class="chart-stage" width="960" height="320" aria-label="Grafik Utama Multi-Overlay"></canvas>
         </div>
 
@@ -1435,6 +1558,12 @@ RENDERED_HTML = """<!DOCTYPE html>
 
       const state = {
         history: [],
+        src: {
+          sitl: { history: [], latest: null },
+          esp32: { history: [], latest: null },
+        },
+        esp: { online: false, age_s: null, hw_mode: null, lastRx: null },
+        viewMode: 'auto',
         latest: {},
         sim: {},
         windowSec: 300,
@@ -1470,6 +1599,75 @@ RENDERED_HTML = """<!DOCTYPE html>
         if (document.getElementById('sw-autoscroll').checked) {
           logBox.scrollTop = logBox.scrollHeight;
         }
+      }
+
+      function activeSource() {
+        if (state.viewMode === 'sitl' || state.viewMode === 'esp32') return state.viewMode;
+        if (state.esp.online) return 'esp32';
+        if (state.sim && state.sim.running) return 'sitl';
+        if (state.src.esp32.history.length) return 'esp32';
+        return 'sitl';
+      }
+
+      function updateEspBadge() {
+        const bNode = document.getElementById('badge-node');
+        const txt = document.getElementById('txt-node');
+        const ico = document.getElementById('ico-node');
+        const mode = state.esp.hw_mode ? ` (${state.esp.hw_mode})` : '';
+        if (state.esp.online) {
+          txt.textContent = `ESP32: ONLINE${mode}`;
+          ico.textContent = '✓';
+          bNode.setAttribute('data-tone', 'ok');
+        } else if (state.esp.lastRx) {
+          const age = Math.round((Date.now() - state.esp.lastRx) / 1000);
+          txt.textContent = `ESP32: TERPUTUS (${age} dtk tanpa data)`;
+          ico.textContent = '✕';
+          bNode.setAttribute('data-tone', 'danger');
+        } else {
+          txt.textContent = 'ESP32: belum terdeteksi';
+          ico.textContent = '○';
+          bNode.setAttribute('data-tone', 'warn');
+        }
+        const src = activeSource();
+        const banner = document.getElementById('esp-banner');
+        const wrap = document.getElementById('main-wrap');
+        const stale = src === 'esp32' && !state.esp.online;
+        wrap.classList.toggle('is-stale', stale);
+        banner.hidden = !stale;
+        if (stale) {
+          banner.textContent = state.esp.lastRx
+            ? `⚠ ESP32 TERPUTUS — tidak ada data sejak ${Math.round((Date.now() - state.esp.lastRx) / 1000)} detik lalu (grafik dibekukan)`
+            : '⚠ Menunggu ESP32 — belum ada telemetri/heartbeat diterima dari broker';
+        }
+      }
+
+      function applyView() {
+        const src = activeSource();
+        state.history = state.src[src].history;
+        document.getElementById('src-label').textContent =
+          (src === 'esp32' ? 'ESP32 (hardware)' : 'SITL (simulasi)') + (state.viewMode === 'auto' ? ' — otomatis' : '');
+        document.querySelectorAll('.src-btn').forEach((b) =>
+          b.setAttribute('aria-pressed', b.getAttribute('data-src') === state.viewMode ? 'true' : 'false'));
+        const lat = state.src[src].latest;
+        if (lat) updateKpis(lat, state.sim);
+        updateEspBadge();
+        drawCharts();
+      }
+
+      function pushRow(source, row) {
+        const bucket = state.src[source] || state.src.sitl;
+        const rt = row.t ?? 0;
+        const hist = bucket.history;
+        const last = hist.length ? hist[hist.length - 1] : null;
+        if (last && rt < (last.t ?? 0)) {
+          bucket.history = [row];
+        } else if (last && rt === (last.t ?? -1)) {
+          hist[hist.length - 1] = row;
+        } else {
+          hist.push(row);
+        }
+        if (bucket.history.length > 1800) bucket.history.shift();
+        bucket.latest = row;
       }
 
       function updateKpis(row, sim) {
@@ -1536,9 +1734,6 @@ RENDERED_HTML = """<!DOCTYPE html>
         if (sim.log_file) {
           document.getElementById('txt-logfile').textContent = sim.log_file;
         }
-        const bNode = document.getElementById('badge-node');
-        document.getElementById('txt-node').textContent = `karhutla/status: ${sim.node_status || 'offline'}`;
-        bNode.setAttribute('data-tone', sim.node_status === 'online' ? 'ok' : 'warn');
       }
 
       function drawCharts() {
@@ -1562,7 +1757,9 @@ RENDERED_HTML = """<!DOCTYPE html>
         if (!rows.length) {
           mCtx.fillStyle = textColor;
           mCtx.font = '600 14px system-ui, sans-serif';
-          mCtx.fillText('Menunggu data telemetri MQTT (:6669) atau klik "▶ Mulai" pada panel Operasi Simulasi SITL...', padL + 20, h / 2);
+          mCtx.fillText(activeSource() === 'esp32'
+            ? 'Menunggu telemetri ESP32 dari broker MQTT (:6669) ...'
+            : 'Belum ada data SITL — klik "▶ Mulai" pada panel Operasi Simulasi SITL ...', padL + 20, h / 2);
           return;
         }
 
@@ -1807,8 +2004,8 @@ RENDERED_HTML = """<!DOCTYPE html>
       }
 
       document.getElementById('btn-sim-start').addEventListener('click', () => {
-        state.history = [];
-        drawCharts();
+        state.src.sitl.history = [];
+        applyView();
         const scenario = document.getElementById('sel-scenario').value;
         const ai_preempt = document.getElementById('sw-preempt').checked;
         const fault_inject = document.getElementById('sw-fault').checked;
@@ -1825,10 +2022,20 @@ RENDERED_HTML = """<!DOCTYPE html>
       });
 
       document.getElementById('btn-sim-clear').addEventListener('click', () => {
-        state.history = [];
-        postSim({ action: 'clear' });
-        drawCharts();
+        const src = activeSource();
+        state.src[src].history = [];
+        postSim({ action: 'clear', source: src });
+        applyView();
       });
+
+      document.querySelectorAll('.src-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          state.viewMode = btn.getAttribute('data-src');
+          applyView();
+        });
+      });
+
+      setInterval(updateEspBadge, 1000);
 
       document.getElementById('sel-scenario').addEventListener('change', (e) => {
         postSim({ scenario: e.target.value });
@@ -1854,11 +2061,24 @@ RENDERED_HTML = """<!DOCTYPE html>
       fetch('/api/state')
         .then((r) => r.json())
         .then((d) => {
-          state.history = d.history || [];
+          if (d.sources) {
+            state.src.sitl.history = (d.sources.sitl && d.sources.sitl.history) || [];
+            state.src.sitl.latest = (d.sources.sitl && d.sources.sitl.latest) || null;
+            state.src.esp32.history = (d.sources.esp32 && d.sources.esp32.history) || [];
+            state.src.esp32.latest = (d.sources.esp32 && d.sources.esp32.latest) || null;
+          } else {
+            state.src.sitl.history = d.history || [];
+            state.src.sitl.latest = d.latest || null;
+          }
+          if (d.esp) {
+            state.esp.online = !!d.esp.online;
+            state.esp.hw_mode = d.esp.hw_mode || null;
+            state.esp.lastRx = d.esp.age_s != null ? Date.now() - d.esp.age_s * 1000 : null;
+          }
           state.latest = d.latest || {};
           (d.mqtt_logs || []).forEach(appendMqttLog);
-          updateKpis(state.latest, d.sim);
-          drawCharts();
+          updateSimBadges(d.sim);
+          applyView();
         })
         .catch(() => {});
 
@@ -1867,26 +2087,32 @@ RENDERED_HTML = """<!DOCTYPE html>
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === 'clear') {
-            state.history = [];
-            drawCharts();
+            const src = msg.source === 'esp32' ? 'esp32' : 'sitl';
+            state.src[src].history = [];
+            applyView();
           } else if (msg.type === 'telemetry' && msg.row) {
-            state.latest = msg.row;
-            const rt = msg.row.t ?? 0;
-            const last = state.history.length ? state.history[state.history.length - 1] : null;
-            if (last && rt < (last.t ?? 0)) {
-              state.history = [msg.row];
-            } else if (last && rt === (last.t ?? -1)) {
-              state.history[state.history.length - 1] = msg.row;
-            } else {
-              state.history.push(msg.row);
+            const src = msg.source === 'esp32' ? 'esp32' : 'sitl';
+            pushRow(src, msg.row);
+            if (src === 'esp32') {
+              state.esp.online = true;
+              state.esp.lastRx = Date.now();
             }
-            if (state.history.length > 1800) state.history.shift();
-            updateKpis(msg.row, msg.sim);
-            drawCharts();
+            if (msg.sim) updateSimBadges(msg.sim);
+            applyView();
+          } else if (msg.type === 'esp_status') {
+            state.esp.online = !!msg.online;
+            if (msg.hw_mode) state.esp.hw_mode = msg.hw_mode;
+            if (msg.online) {
+              state.esp.lastRx = Date.now();
+            } else if (msg.age_s != null) {
+              state.esp.lastRx = Date.now() - msg.age_s * 1000;
+            }
+            applyView();
           } else if (msg.type === 'mqtt_log') {
             appendMqttLog(msg.line);
           } else if (msg.type === 'sim') {
             updateSimBadges(msg.sim);
+            applyView();
           } else if (msg.type === 'status') {
             if (state.sim) {
               state.sim.broker_connected = msg.broker_connected;

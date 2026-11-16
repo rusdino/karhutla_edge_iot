@@ -147,7 +147,7 @@ def disconnect(c):
 
 def publish_telemetry(c, tel):
     """Dipakai SITL / Dashboard SITL runner (ESP32 asli mempublikasikan sendiri)."""
-    c.publish(K.T_TELEM, json.dumps(tel))
+    c.publish(K.T_TELEM, json.dumps(dict(tel, src="sitl")))   # penanda sumber: bukan ESP32
     scalar_formats = {
         "pm": "{:.2f}",
         "pm_raw": "{:.2f}",
