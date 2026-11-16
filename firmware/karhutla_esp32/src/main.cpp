@@ -455,7 +455,7 @@ static void publishTel(const Tel& t) {
     "\"gas_ppm\":%.1f,\"g\":%.3f,\"fi\":%.2f,\"v0\":%.3f,\"state\":\"%s\",\"mode\":\"%s\",\"duty\":%.1f,\"alarm\":%d}",
     (unsigned long)t.seq, t.v_dust, t.v_mq, t.pm_raw, t.pm, t.dcdt, t.gas_ppm, t.g, t.fi, t.v0,
     STATE_NAMES[t.state], MODE_NAMES[t.mode], t.duty, t.alarm);
-  esp_mqtt_client_enqueue(mqttClient, T_TELEM, js, 0, 0, 0, true);
+  esp_mqtt_client_publish(mqttClient, T_TELEM, js, 0, 0, 0);
 
 #if !MODE_HILS
   // Mode RIIL: kirim topik skalar untuk dashboard mobile maks 1 Hz
@@ -467,15 +467,15 @@ static void publishTel(const Tel& t) {
     prevState = t.state;
     prevMode = t.mode;
     char v[24];
-    snprintf(v, sizeof(v), "%.2f", t.pm);      esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/pm", v, 0, 0, 0, true);
-    snprintf(v, sizeof(v), "%.2f", t.pm_raw);  esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/pm_raw", v, 0, 0, 0, true);
-    snprintf(v, sizeof(v), "%.2f", t.fi);      esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/fi", v, 0, 0, 0, true);
-    snprintf(v, sizeof(v), "%.3f", t.dcdt);    esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/dcdt", v, 0, 0, 0, true);
-    snprintf(v, sizeof(v), "%.1f", t.gas_ppm); esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/gas_ppm", v, 0, 0, 0, true);
-    snprintf(v, sizeof(v), "%.2f", t.g);       esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/g", v, 0, 0, 0, true);
-    snprintf(v, sizeof(v), "%.0f", t.duty);    esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/duty", v, 0, 0, 0, true);
-    esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/state", STATE_NAMES[t.state], 0, 0, 0, true);
-    esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/mode", MODE_NAMES[t.mode], 0, 0, 0, true);
+    snprintf(v, sizeof(v), "%.2f", t.pm);      esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/pm", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.2f", t.pm_raw);  esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/pm_raw", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.2f", t.fi);      esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/fi", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.3f", t.dcdt);    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/dcdt", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.1f", t.gas_ppm); esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/gas_ppm", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.2f", t.g);       esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/g", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.0f", t.duty);    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/duty", v, 0, 0, 0);
+    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/state", STATE_NAMES[t.state], 0, 0, 0);
+    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/mode", MODE_NAMES[t.mode], 0, 0, 0);
   }
 #endif
 }
@@ -499,7 +499,7 @@ static void txTask(void*) {
         char hb[64];
         snprintf(hb, sizeof(hb), "{\"mode\":\"%s\",\"uptime_ms\":%lu}",
                  MODE_HILS ? "HILS" : "RIIL", (unsigned long)now);
-        esp_mqtt_client_enqueue(mqttClient, T_HEARTBEAT, hb, 0, 0, 0, true);
+        esp_mqtt_client_publish(mqttClient, T_HEARTBEAT, hb, 0, 0, 0);
       }
     } else if (!wifiConnected && (now - lastWifiRetryMs) >= 3000) {
       lastWifiRetryMs = now;
