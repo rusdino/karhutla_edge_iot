@@ -78,8 +78,12 @@ def make_client(client_id, on_connect=None, on_message=None, publish_status=Fals
     orig_publish = c.publish
     orig_subscribe = c.subscribe
 
+    def _should_log_topic(topic):
+        return not (topic.startswith(f"{K.T_TELEM_SCALAR}/") or topic.startswith(f"{K.T_FORECAST_SCALAR}/"))
+
     def logged_publish(topic, payload=None, qos=0, retain=False, *args, **kwargs):
-        logger.log_event(client_id, "PUBLISH", topic, payload)
+        if _should_log_topic(str(topic)):
+            logger.log_event(client_id, "PUBLISH", topic, payload)
         return orig_publish(topic, payload, qos=qos, retain=retain, *args, **kwargs)
 
     def logged_subscribe(topic, qos=0, *args, **kwargs):
@@ -100,8 +104,9 @@ def make_client(client_id, on_connect=None, on_message=None, publish_status=Fals
                 on_connect(client, userdata, flags, rc)
 
     def _wrapped_on_message(client, userdata, msg):
-        payload_txt = msg.payload.decode("utf-8", errors="ignore")
-        logger.log_event(client_id, "RECV", msg.topic, payload_txt)
+        if _should_log_topic(msg.topic):
+            payload_txt = msg.payload.decode("utf-8", errors="ignore")
+            logger.log_event(client_id, "RECV", msg.topic, payload_txt)
         if on_message:
             on_message(client, userdata, msg)
 

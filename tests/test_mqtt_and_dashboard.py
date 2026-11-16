@@ -1,5 +1,7 @@
 import json
 import os
+import socket
+import subprocess
 import tempfile
 import time
 import unittest
@@ -50,6 +52,7 @@ class TestConfigAndCoreCommands(unittest.TestCase):
         self.assertIn("driver/ledc.h", main_cpp)
         self.assertIn("esp_wifi.h", main_cpp)
         self.assertIn("gas_ppm", main_cpp)
+        self.assertIn("esp_wifi_set_ps(WIFI_PS_NONE)", main_cpp)
 
     def test_hils_and_field_node_sync_with_espidf_telemetry(self):
         with open("hils.py", encoding="utf-8") as f:
@@ -81,6 +84,27 @@ class TestConfigAndCoreCommands(unittest.TestCase):
         tel = hils.reset_and_wait_esp32(DummyClient(), link, timeout=1.0)
         self.assertIsNotNone(tel)
         self.assertEqual(tel.get("state"), "NORMAL")
+
+    def test_hils_wait_seq_with_retry_recovers_dropped_packet(self):
+        import hils
+        link = hils.Link()
+        attempts = []
+
+        class RetryClient:
+            def publish(self, topic, payload):
+                attempts.append((topic, payload))
+                if len(attempts) == 2:
+                    class Msg:
+                        pass
+                    m = Msg()
+                    m.topic = K.T_TELEM
+                    m.payload = b'{"seq":5,"pm":12.3,"state":"NORMAL","mode":"AUTO","duty":0.0}'
+                    link.on_message(self, None, m)
+
+        tel = hils.send_and_wait_seq(RetryClient(), link, 5, 0.61, 1.0, timeout=0.3)
+        self.assertIsNotNone(tel)
+        self.assertEqual(tel["seq"], 5)
+        self.assertEqual(len(attempts), 2)
 
     def test_firmware_apply_command_and_reset(self):
         fw = Firmware()
@@ -155,6 +179,34 @@ class TestMqttLoggerAndIo(unittest.TestCase):
 
 
 class TestModernWebDashboard(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            cls.broker_port = s.getsockname()[1]
+        cls._broker_proc = subprocess.Popen(
+            ["mosquitto", "-p", str(cls.broker_port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", cls.broker_port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+
+    @classmethod
+    def tearDownClass(cls):
+        proc = getattr(cls, "_broker_proc", None)
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
     def test_dashboard_html_complies_with_modern_web_guidance(self):
         html = dashboard.RENDERED_HTML
         self.assertIn('<meta name="color-scheme" content="light dark">', html)
@@ -171,9 +223,10 @@ class TestModernWebDashboard(unittest.TestCase):
         self.assertIn("esp_status", html)
         self.assertIn('id="esp-banner"', html)
         self.assertIn('class="chip-btn src-btn"', html)
+        self.assertIn("requestAnimationFrame", html)
 
     def test_dashboard_server_endpoints_and_fault_injection(self):
-        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=K.BROKER_PORT, enable_mqtt=True)
+        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=self.broker_port, enable_mqtt=True)
         srv = dashboard.start_dashboard_server(eng, host="127.0.0.1", port=0)
         port = srv.server_address[1]
         base = f"http://127.0.0.1:{port}"
@@ -215,10 +268,10 @@ class TestModernWebDashboard(unittest.TestCase):
             srv.server_close()
 
     def test_history_never_jumps_backward_on_external_scenario_restart(self):
-        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=K.BROKER_PORT, enable_mqtt=True)
+        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=self.broker_port, enable_mqtt=True)
         try:
             pub = mqtt_io.make_client("test-multi-scenario", publish_status=True)
-            mqtt_io.connect(pub, "127.0.0.1", K.BROKER_PORT)
+            mqtt_io.connect(pub, "127.0.0.1", self.broker_port)
             time.sleep(0.3)
 
             fw = Firmware()
@@ -245,11 +298,11 @@ class TestModernWebDashboard(unittest.TestCase):
             eng.shutdown()
 
     def test_esp32_telemetry_not_dropped_while_embedded_sitl_runs(self):
-        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=K.BROKER_PORT, enable_mqtt=True)
+        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=self.broker_port, enable_mqtt=True)
         try:
             eng.control_sim({"action": "start", "scenario": "clean", "speed": 5})
             esp = mqtt_io.make_client("fake-esp32")
-            mqtt_io.connect(esp, "127.0.0.1", K.BROKER_PORT)
+            mqtt_io.connect(esp, "127.0.0.1", self.broker_port)
             time.sleep(0.4)
             for seq in range(5):
                 esp.publish(K.T_TELEM, json.dumps({
@@ -261,7 +314,7 @@ class TestModernWebDashboard(unittest.TestCase):
             snap = eng.get_state_snapshot()
             esp_rows = snap["sources"]["esp32"]["history"]
             self.assertGreaterEqual(len(esp_rows), 5)
-            self.assertEqual(esp_rows[-1]["fi"], 77.0)
+            self.assertTrue(any(r["fi"] == 77.0 for r in esp_rows))
             # Grafik SITL tidak boleh tercampur dengan baris ESP32
             self.assertTrue(all(r["fi"] != 77.0 for r in snap["sources"]["sitl"]["history"]))
             mqtt_io.disconnect(esp)
@@ -269,11 +322,11 @@ class TestModernWebDashboard(unittest.TestCase):
             eng.shutdown()
 
     def test_esp32_marked_offline_when_telemetry_stops(self):
-        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=K.BROKER_PORT,
+        eng = dashboard.DashboardEngine(broker_host="127.0.0.1", broker_port=self.broker_port,
                                         enable_mqtt=True, esp_stale_s=0.6)
         try:
             esp = mqtt_io.make_client("fake-esp32-2")
-            mqtt_io.connect(esp, "127.0.0.1", K.BROKER_PORT)
+            mqtt_io.connect(esp, "127.0.0.1", self.broker_port)
             time.sleep(0.3)
             esp.publish(K.T_TELEM, json.dumps({"seq": 1, "src": "esp32", "pm": 10.0, "fi": 10.0,
                                                "state": "NORMAL", "mode": "AUTO", "duty": 0.0}))

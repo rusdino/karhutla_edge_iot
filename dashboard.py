@@ -297,6 +297,9 @@ class DashboardEngine:
         orig_log_event = self.mqtt_logger.log_event
 
         def hooked_log_event(client_id, event, topic="", payload=""):
+            # Topik skalar berfrekuensi tinggi (karhutla/t/* & karhutla/f/*) tidak perlu membanjiri log & SSE browser
+            if event == "RECV" and (topic.startswith(f"{K.T_TELEM_SCALAR}/") or topic.startswith(f"{K.T_FORECAST_SCALAR}/")):
+                return ""
             line = orig_log_event(client_id, event, topic, payload)
             self._record_mqtt_log(line)
             return line
@@ -1641,6 +1644,16 @@ RENDERED_HTML = """<!DOCTYPE html>
         }
       }
 
+      let rafPending = false;
+      function scheduleDraw() {
+        if (rafPending) return;
+        rafPending = true;
+        requestAnimationFrame(() => {
+          rafPending = false;
+          drawCharts();
+        });
+      }
+
       function applyView() {
         const src = activeSource();
         state.history = state.src[src].history;
@@ -1651,7 +1664,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         const lat = state.src[src].latest;
         if (lat) updateKpis(lat, state.sim);
         updateEspBadge();
-        drawCharts();
+        scheduleDraw();
       }
 
       function pushRow(source, row) {

@@ -72,6 +72,18 @@ def reset_and_wait_esp32(client, link, timeout=10.0):
     return None
 
 
+def send_and_wait_seq(client, link, seq, vd, vm, timeout=4.0):
+    """Kirim sampel HILS dan tunggu balasan seq yang sama; coba ulang 1x bila paket Wi-Fi tertahan."""
+    payload = f"{seq},{vd:.4f},{vm:.4f}"
+    half = max(0.05, timeout / 2.0)
+    client.publish(K.T_HILS_IN, payload)
+    tel = link.wait_seq(seq, timeout=half)
+    if tel is None:
+        client.publish(K.T_HILS_IN, payload)
+        tel = link.wait_seq(seq, timeout=half)
+    return tel
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scenario", default="flaming", choices=SCENARIOS)
@@ -124,8 +136,7 @@ def main():
             if shadow:
                 shadow.force_failsafe()
 
-        client.publish(K.T_HILS_IN, f"{k},{vd:.4f},{vm:.4f}")
-        tel = link.wait_seq(k, timeout=3.0)
+        tel = send_and_wait_seq(client, link, k, vd, vm, timeout=5.0)
         if tel is None:
             lost += 1
             print(f"[t={t:.0f}s] telemetri hilang (total {lost})")

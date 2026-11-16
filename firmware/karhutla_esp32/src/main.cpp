@@ -454,16 +454,25 @@ static void publishTel(const Tel& t) {
     STATE_NAMES[t.state], MODE_NAMES[t.mode], t.duty, t.alarm);
   esp_mqtt_client_publish(mqttClient, T_TELEM, js, 0, 0, 0);
 
-  char v[24];
-  snprintf(v, sizeof(v), "%.2f", t.pm);      esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/pm", v, 0, 0, 0);
-  snprintf(v, sizeof(v), "%.2f", t.pm_raw);  esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/pm_raw", v, 0, 0, 0);
-  snprintf(v, sizeof(v), "%.2f", t.fi);      esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/fi", v, 0, 0, 0);
-  snprintf(v, sizeof(v), "%.3f", t.dcdt);    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/dcdt", v, 0, 0, 0);
-  snprintf(v, sizeof(v), "%.1f", t.gas_ppm); esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/gas_ppm", v, 0, 0, 0);
-  snprintf(v, sizeof(v), "%.2f", t.g);       esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/g", v, 0, 0, 0);
-  snprintf(v, sizeof(v), "%.0f", t.duty);    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/duty", v, 0, 0, 0);
-  esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/state", STATE_NAMES[t.state], 0, 0, 0);
-  esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/mode", MODE_NAMES[t.mode], 0, 0, 0);
+  // Batasi topik skalar HP maks 2 Hz (atau langsung saat state/mode berubah) agar Wi-Fi tidak jenuh saat HILS cepat
+  static uint32_t lastScalarMs = 0;
+  static uint8_t prevState = 0xFF, prevMode = 0xFF;
+  uint32_t now = nowMs();
+  if (t.state != prevState || t.mode != prevMode || (now - lastScalarMs) >= 500) {
+    lastScalarMs = now;
+    prevState = t.state;
+    prevMode = t.mode;
+    char v[24];
+    snprintf(v, sizeof(v), "%.2f", t.pm);      esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/pm", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.2f", t.pm_raw);  esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/pm_raw", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.2f", t.fi);      esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/fi", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.3f", t.dcdt);    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/dcdt", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.1f", t.gas_ppm); esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/gas_ppm", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.2f", t.g);       esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/g", v, 0, 0, 0);
+    snprintf(v, sizeof(v), "%.0f", t.duty);    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/duty", v, 0, 0, 0);
+    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/state", STATE_NAMES[t.state], 0, 0, 0);
+    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/mode", MODE_NAMES[t.mode], 0, 0, 0);
+  }
 }
 
 static void txTask(void*) {
@@ -603,6 +612,8 @@ static void initWifiAndMqtt() {
   mqttClient = esp_mqtt_client_init(&mqttCfg);
   ESP_ERROR_CHECK(esp_mqtt_client_register_event(mqttClient, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqttEventHandler, nullptr));
   ESP_ERROR_CHECK(esp_wifi_start());
+  // Nonaktifkan Wi-Fi modem sleep agar latensi MQTT HILS tidak melonjak & burst
+  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
 
 // ===================== Entry Point Native ESP-IDF =====================
