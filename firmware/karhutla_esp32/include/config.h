@@ -1,15 +1,19 @@
 #pragma once
 // ======================================================================
-//  Konfigurasi firmware.  Nilai algoritma HARUS sama dengan config.py
+//  Konfigurasi firmware Native ESP-IDF.
+//  Nilai algoritma HARUS sama dengan config.py
 // ======================================================================
 
 // ---- MODE: 1 = HILS (sensor dari laptop via MQTT), 0 = RIIL (sensor fisik) ----
+// Dapat di-override langsung oleh platformio.ini (-e hils / -e riil)
+#ifndef MODE_HILS
 #define MODE_HILS 1
+#endif
 
 // ---- Jaringan ----
-#define WIFI_SSID   "NAMA_WIFI"
+#define WIFI_SSID   "Hotspot LSKK"
 #define WIFI_PASS   "PASSWORD_WIFI"
-#define MQTT_HOST   "192.168.1.10"     // IP LAN laptop (broker Mosquitto)
+#define MQTT_HOST   "10.8.43.78"       // IP LAN laptop (broker Mosquitto)
 #define MQTT_PORT   6669
 #define MQTT_USER   ""                 // kosong = tanpa autentikasi
 #define MQTT_PASS   ""
@@ -21,8 +25,8 @@
 #define T_STATUS        "karhutla/status"
 
 // ---- Pin (gunakan ADC1; ADC2 tidak bisa saat Wi-Fi aktif) ----
-#define PIN_DUST_ADC  34      // Sharp Vo  -> divider 10k/20k -> GPIO34
-#define PIN_MQ_ADC    35      // MQ-135 AO -> divider 10k/20k -> GPIO35
+#define PIN_DUST_ADC  34      // Sharp Vo  -> divider 10k/20k -> GPIO34 (ADC1_CH6)
+#define PIN_MQ_ADC    35      // MQ-135 AO -> divider 10k/20k -> GPIO35 (ADC1_CH7)
 #define PIN_DUST_LED  4       // Sharp LED (aktif LOW) lewat R150 + C220uF sesuai datasheet
 #define PIN_FAN       18      // gate MOSFET (pull-down 10k + seri 100R)
 #define PIN_BUZZER    23

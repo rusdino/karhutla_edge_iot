@@ -18,12 +18,50 @@ class TestConfigAndCoreCommands(unittest.TestCase):
         with open("mosquitto.conf", encoding="utf-8") as f:
             conf = f.read()
         self.assertIn("listener 6669 0.0.0.0", conf)
-        with open("firmware/karhutla_esp32/config.h", encoding="utf-8") as f:
+
+    def test_espidf_firmware_structure_no_arduino(self):
+        self.assertFalse(os.path.exists("firmware/karhutla_esp32/karhutla_esp32.ino"))
+        self.assertTrue(os.path.exists("firmware/karhutla_esp32/platformio.ini"))
+        self.assertTrue(os.path.exists("firmware/karhutla_esp32/CMakeLists.txt"))
+        self.assertTrue(os.path.exists("firmware/karhutla_esp32/src/CMakeLists.txt"))
+        self.assertTrue(os.path.exists("firmware/karhutla_esp32/include/config.h"))
+        self.assertTrue(os.path.exists("firmware/karhutla_esp32/src/main.cpp"))
+
+        with open("firmware/karhutla_esp32/platformio.ini", encoding="utf-8") as f:
+            pio_ini = f.read()
+        self.assertIn("espidf_sdk.py", pio_ini)
+        self.assertNotIn("framework = arduino", pio_ini)
+        self.assertIn("board = esp32dev", pio_ini)
+        self.assertIn("[env:hils]", pio_ini)
+        self.assertIn("[env:riil]", pio_ini)
+
+        with open("firmware/karhutla_esp32/include/config.h", encoding="utf-8") as f:
             ch = f.read()
         self.assertIn("#define MQTT_PORT   6669", ch)
-        with open("firmware/karhutla_esp32/karhutla_esp32.ino", encoding="utf-8") as f:
-            ino = f.read()
-        self.assertIn("gas_ppm", ino)
+        self.assertIn("#ifndef MODE_HILS", ch)
+
+        with open("firmware/karhutla_esp32/src/main.cpp", encoding="utf-8") as f:
+            main_cpp = f.read()
+        self.assertNotIn("Arduino.h", main_cpp)
+        self.assertNotIn("PubSubClient", main_cpp)
+        self.assertIn("app_main", main_cpp)
+        self.assertIn("mqtt_client.h", main_cpp)
+        self.assertIn("driver/gpio.h", main_cpp)
+        self.assertIn("driver/ledc.h", main_cpp)
+        self.assertIn("esp_wifi.h", main_cpp)
+        self.assertIn("gas_ppm", main_cpp)
+
+    def test_hils_and_field_node_sync_with_espidf_telemetry(self):
+        with open("hils.py", encoding="utf-8") as f:
+            hils_src = f.read()
+        self.assertIn('gas_ppm=tel.get("gas_ppm"', hils_src)
+        self.assertIn("gas_true=plant.gas_ppm", hils_src)
+        self.assertIn("mqtt_io.disconnect(client)", hils_src)
+
+        with open("field_node.py", encoding="utf-8") as f:
+            fn_src = f.read()
+        self.assertIn('gas_ppm=tel.get("gas_ppm"', fn_src)
+        self.assertIn("mqtt_io.disconnect(client)", fn_src)
 
     def test_firmware_apply_command_and_reset(self):
         fw = Firmware()

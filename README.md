@@ -6,12 +6,12 @@ Satu basis algoritma, tiga cara menjalankan:
 |---|---|---|---|---|
 | **SITL** | `core.py` (virtual ESP32) | model Python | `plant.py` | `python sitl.py` |
 | **Web Dashboard** | `core.py` / monitor MQTT `:6669` | model Python / live MQTT | `plant.py` / live | `python dashboard.py` |
-| **HILS** | ESP32 asli (`MODE_HILS 1`) | tegangan dikirim laptop via MQTT | `plant.py` | `python hils.py` |
-| **Riil** | ESP32 asli (`MODE_HILS 0`) | Sharp + MQ-135 fisik | dunia nyata | `python field_node.py` |
+| **HILS** | ESP32 asli (`pio run -e hils`) | tegangan dikirim laptop via MQTT | `plant.py` | `python hils.py` |
+| **Riil** | ESP32 asli (`pio run -e riil`) | Sharp + MQ-135 fisik | dunia nyata | `python field_node.py` |
 
 ## Struktur
 ```
-config.py            parameter bersama (harus sama dgn firmware/.../config.h)
+config.py            parameter bersama (harus sama dgn firmware/.../include/config.h)
 core.py              firmware virtual: median3 -> Kalman 2-state -> fusi -> FSM -> PWM -> failsafe
 plant.py             ruang asap + model tegangan Sharp & MQ-135 (skenario clean/smolder/flaming/fault)
 forecast.py          AI tren linear (t+horizon) + PreemptController (FORCE_MAX proaktif yang aman)
@@ -20,23 +20,26 @@ report.py            ringkasan + uji lulus/gagal
 dashboard.py         Modern Web Dashboard di laptop (grafik multi-overlay, kontrol cmd, runner SITL, live MQTT log)
 sitl.py  hils.py  field_node.py
 mosquitto.conf       broker lokal (port 6669)
-firmware/karhutla_esp32/{karhutla_esp32.ino, config.h}
+firmware/karhutla_esp32/{platformio.ini, CMakeLists.txt, include/config.h, src/main.cpp}
 ```
 
-## Arsitektur FreeRTOS pada Firmware ESP32 (`karhutla_esp32.ino`)
-Firmware menggunakan FreeRTOS bawaan Arduino-ESP32 yang memisahkan kontrol lokal dan jaringan di dua core:
-- **`controlTask` (Core 1, prioritas 2, stack 8192 bytes):** Menjalankan akuisisi ADC (mode Riil dengan pewaktu deterministik `vTaskDelayUntil` 1 Hz) atau menerima sampel dari `hilsQueue` (mode HILS *lock-step*), mengeksekusi rantai `step()` (`Median3` → PM-proxy → `Kalman2` → skor gas → fusi `FI` → `Fsm` → PWM kipas & LED), serta memproses perintah masuk dari `cmdQueue`.
-- **`buzzerTask` (Core 1, prioritas 1, stack 2048 bytes):** Berjalan independen setiap 20 ms membaca variabel tunggal `volatile uint8_t activeBuzzerState` yang diperbarui oleh `controlTask`, sehingga pola kedip buzzer tetap presisi tanpa tertahan saat pembacaan sensor fisik (~96 ms).
-- **`netTask` (Core 0, prioritas 1, stack 8192 bytes):** Menangani koneksi Wi-Fi dan MQTT (`PubSubClient`), mendorong perintah `karhutla/cmd` ke `cmdQueue` dan sampel `karhutla/hils/sensor` ke `hilsQueue`, serta mempublikasikan telemetri yang dilindungi mutex (`mtx`). **Kontrol lokal di Core 1 tidak bergantung pada koneksi Wi-Fi/MQTT.**
-- **`loop()`:** Dihapus saat runtime menggunakan `vTaskDelete(NULL)` untuk membebaskan memori stack `loopTask` bawaan.
+## Arsitektur Native ESP-IDF & FreeRTOS pada Firmware ESP32 (`src/main.cpp`)
+Firmware ditulis **100% menggunakan Native ESP-IDF (`framework = espidf`) di PlatformIO** tanpa ketergantungan pada framework/library Arduino sama sekali (`app_main()`, `driver/gpio.h`, `driver/ledc.h`, `esp_adc/adc_oneshot.h`, `esp_adc/adc_cali.h`, `esp_wifi.h`, `esp_event.h`, `nvs_flash.h`, dan `mqtt_client.h`):
+- **`controlTask` (Core 1, prioritas 5, stack 8192 bytes):** Menjalankan akuisisi ADC (`adc_oneshot` + `adc_cali` pada mode Riil dengan pewaktu deterministik `vTaskDelayUntil` 1 Hz dan pulsa IR `esp_rom_delay_us`) atau menerima sampel dari `hilsQueue` (mode HILS *lock-step*), mengeksekusi rantai `step()` (`Median3` → PM-proxy → `Kalman2` → skor gas → fusi `FI` → `Fsm` → `ledc` PWM kipas & `gpio_set_level` LED), serta memproses perintah masuk dari `cmdQueue`.
+- **`buzzerTask` (Core 1, prioritas 3, stack 2048 bytes):** Berjalan independen setiap 20 ms membaca variabel tunggal `volatile uint8_t activeBuzzerState` yang diperbarui oleh `controlTask` menggunakan waktu milidetik dari `esp_timer_get_time()`, sehingga pola kedip buzzer tetap presisi tanpa tertahan saat pembacaan sensor fisik (~96 ms).
+- **Wi-Fi & `esp_mqtt_client` Event-Driven + `txTask` (Core 0, prioritas 2, stack 6144 bytes):** Menangani koneksi ulang Wi-Fi (`WIFI_EVENT_STA_DISCONNECTED`) dan broker MQTT `:6669` secara *event-driven*, mendorong perintah `karhutla/cmd` ke `cmdQueue` dan sampel `karhutla/hils/sensor` ke `hilsQueue` pada event `MQTT_EVENT_DATA`, serta mempublikasikan telemetri yang dilindungi mutex (`mtx`). **Kontrol lokal di Core 1 tidak bergantung pada koneksi Wi-Fi/MQTT.**
 
 ## Instalasi
 ```bash
 pip install -r requirements.txt
 mosquitto -c mosquitto.conf -v        # untuk HILS / riil / dashboard HP
 ```
-Arduino IDE / PlatformIO: pasang board **esp32** dan library **PubSubClient**. Edit `config.h`
-(`WIFI_SSID`, `WIFI_PASS`, `MQTT_HOST` = IP LAN laptop, `MODE_HILS`) dan `BROKER_HOST` di `config.py`.
+**PlatformIO (Native ESP-IDF):** Edit `firmware/karhutla_esp32/include/config.h` (`WIFI_SSID`, `WIFI_PASS`, `MQTT_HOST` = IP LAN laptop) dan `BROKER_HOST` di `config.py`, lalu kompilasi/flash sesuai mode:
+```bash
+cd firmware/karhutla_esp32
+pio run -e hils -t upload             # flash mode HILS (MODE_HILS=1) ke esp32dev
+pio run -e riil -t upload             # flash mode Riil (MODE_HILS=0) ke esp32dev
+```
 
 ## 1. SITL & Modern Web Dashboard di Laptop (tanpa hardware)
 ```bash
@@ -59,7 +62,7 @@ python dashboard.py --auto-sim flaming --speed 1                    # buka Web D
 tanpa chattering, FAILSAFE terdeteksi lalu pulih).
 
 ## 2. HILS (ESP32 asli, sensor virtual)
-1. Flash dengan `#define MODE_HILS 1`.
+1. Flash dengan PlatformIO: `cd firmware/karhutla_esp32 && pio run -e hils -t upload`.
 2. `python hils.py --scenario flaming --speed 5 --shadow`
 3. Uji watchdog: `python hils.py --scenario smolder --dropout-at 150 --dropout-s 8`
 
@@ -69,7 +72,7 @@ persentase langkah yang berbeda (paritas SITL ↔ ESP32).
 Validasi pin-level: ukur GPIO18 (gate MOSFET) dengan logic analyzer / LED / multimeter.
 
 ## 3. Riil (lapangan)
-1. Flash dengan `#define MODE_HILS 0`.
+1. Flash dengan PlatformIO: `cd firmware/karhutla_esp32 && pio run -e riil -t upload`.
 2. `python field_node.py --host <IP_laptop>` → forecast, log CSV harian, (opsional) `--ai-preempt`.
 
 ### Wiring

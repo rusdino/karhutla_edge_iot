@@ -136,10 +136,11 @@ def main():
                     shadow.set_mode(cmd)
         mqtt_io.publish_forecast(client, f)
 
-        row = dict(t=t, t_s=t, scenario=args.scenario, pm_true=plant.C, v_dust=vd, v_mq=vm,
-                   pm_raw=tel["pm_raw"], pm=tel["pm"], dcdt=tel["dcdt"], g=tel["g"],
-                   fi=tel["fi"], v0=tel["v0"], state=tel["state"], mode=tel["mode"],
-                   duty=last_duty, forecast=f["pm_forecast"], slope=f["slope"],
+        row = dict(t=t, t_s=t, scenario=args.scenario, pm_true=plant.C, gas_true=plant.gas_ppm,
+                   v_dust=vd, v_mq=vm, pm_raw=tel["pm_raw"], pm=tel["pm"], dcdt=tel["dcdt"],
+                   gas_ppm=tel.get("gas_ppm", K.MQ_ATM_PPM), g=tel["g"], fi=tel["fi"], v0=tel["v0"],
+                   state=tel["state"], mode=tel["mode"], duty=last_duty,
+                   forecast=f["pm_forecast"], slope=f["slope"],
                    eta_bahaya_s=f["eta_bahaya_s"], mae=f["mae"],
                    sensor_fault=plant.dust_disconnected(t))
         rows.append(row)
@@ -150,7 +151,7 @@ def main():
             time.sleep(max(0.0, K.TS / args.speed - (time.time() - t0)))
 
     log.close()
-    client.loop_stop()
+    mqtt_io.disconnect(client)
     ok = summarize(rows, args.scenario, "HILS")
     print(f"Telemetri hilang: {lost}")
     if shadow:

@@ -47,7 +47,8 @@ def main():
                     c.publish(K.T_CMD, cmd)
             mqtt_io.publish_forecast(c, f)
             row = dict(t_s=round(t, 3), scenario="field", v_dust=tel.get("v_dust"), v_mq=tel.get("v_mq"),
-                       pm_raw=tel["pm_raw"], pm=tel["pm"], dcdt=tel["dcdt"], g=tel["g"],
+                       pm_raw=tel["pm_raw"], pm=tel["pm"], dcdt=tel["dcdt"],
+                       gas_ppm=tel.get("gas_ppm", K.MQ_ATM_PPM), g=tel["g"],
                        fi=tel["fi"], v0=tel.get("v0"), state=tel["state"], mode=tel["mode"],
                        duty=tel["duty"], forecast=f["pm_forecast"], slope=f["slope"],
                        eta_bahaya_s=f["eta_bahaya_s"], mae=f["mae"])
@@ -63,7 +64,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        client.loop_stop()
+        mqtt_io.disconnect(client)
         log.close()
 
 

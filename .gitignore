@@ -1,5 +1,7 @@
-# Virtual Environment & Python Bytecode
+# Virtual Environment, PlatformIO Build & Python Bytecode
 sitl_venv/
+.pio/
+firmware/**/.pio/
 __pycache__/
 *.py[cod]
 *$py.class
