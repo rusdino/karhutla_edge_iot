@@ -28,6 +28,8 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "nvs_flash.h"
 #include "mqtt_client.h"
 #include "esp_log.h"
@@ -125,7 +127,9 @@ static bool hilsActive = false;
 static uint8_t cmdMode = MD_AUTO;
 // Satu variabel state tunggal yang ditulis oleh controlTask dan dibaca oleh buzzerTask
 static volatile uint8_t activeBuzzerState = ST_NORMAL;
+static volatile bool wifiConnected = false;
 static volatile bool mqttConnected = false;
+static bool mqttStarted = false;
 
 static Tel tel;
 static SemaphoreHandle_t mtx = nullptr;
@@ -476,22 +480,44 @@ static void publishTel(const Tel& t) {
 }
 
 static void txTask(void*) {
+  const bool wdtOk = (esp_task_wdt_add(nullptr) == ESP_OK);
   uint32_t lastHb = 0;
+  uint32_t lastOkMs = nowMs();
+  uint32_t lastWifiRetryMs = 0;
+  uint32_t lastMqttRetryMs = 0;
   for (;;) {
+    if (wdtOk) esp_task_wdt_reset();
+    uint32_t now = nowMs();
     if (mqttConnected) {
+      lastOkMs = now;
       Tel copy; bool fresh = false;
       xSemaphoreTake(mtx, portMAX_DELAY);
       if (tel.fresh) { copy = tel; tel.fresh = false; fresh = true; }
       xSemaphoreGive(mtx);
       if (fresh) publishTel(copy);
 
-      uint32_t now = nowMs();
       if (now - lastHb >= 1000) {
         lastHb = now;
         char hb[64];
         snprintf(hb, sizeof(hb), "{\"mode\":\"%s\",\"uptime_ms\":%lu}",
                  MODE_HILS ? "HILS" : "RIIL", (unsigned long)now);
         esp_mqtt_client_publish(mqttClient, T_HEARTBEAT, hb, 0, 0, 0);
+      }
+    } else {
+      // Pemulihan otomatis Wi-Fi/MQTT tanpa perlu menekan tombol RESET fisik
+      if (!wifiConnected && (now - lastWifiRetryMs) >= 2500) {
+        lastWifiRetryMs = now;
+        ESP_LOGW(TAG, "Wi-Fi terputus, mencoba hubungkan ulang...");
+        esp_wifi_connect();
+      } else if (wifiConnected && mqttStarted && (now - lastMqttRetryMs) >= 5000) {
+        lastMqttRetryMs = now;
+        ESP_LOGW(TAG, "MQTT belum terhubung, mencoba reconnect...");
+        esp_mqtt_client_reconnect(mqttClient);
+      }
+      if ((now - lastOkMs) >= 30000) {
+        ESP_LOGE(TAG, "Koneksi terhenti >30s, melakukan restart otomatis...");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
       }
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -558,10 +584,19 @@ static void wifiEventHandler(void*, esp_event_base_t eventBase, int32_t eventId,
   if (eventBase == WIFI_EVENT && eventId == WIFI_EVENT_STA_START) {
     esp_wifi_connect();
   } else if (eventBase == WIFI_EVENT && eventId == WIFI_EVENT_STA_DISCONNECTED) {
-    esp_wifi_connect();
+    wifiConnected = false;
+    mqttConnected = false;
   } else if (eventBase == IP_EVENT && eventId == IP_EVENT_STA_GOT_IP) {
+    wifiConnected = true;
     ESP_LOGI(TAG, "Wi-Fi terhubung, memulai MQTT client ...");
-    if (mqttClient) esp_mqtt_client_start(mqttClient);
+    if (mqttClient) {
+      if (!mqttStarted) {
+        mqttStarted = true;
+        esp_mqtt_client_start(mqttClient);
+      } else {
+        esp_mqtt_client_reconnect(mqttClient);
+      }
+    }
   }
 }
 
@@ -585,6 +620,8 @@ static void initWifiAndMqtt() {
   wifi_config_t wifiCfg = {};
   strncpy((char*)wifiCfg.sta.ssid, WIFI_SSID, sizeof(wifiCfg.sta.ssid) - 1);
   strncpy((char*)wifiCfg.sta.password, WIFI_PASS, sizeof(wifiCfg.sta.password) - 1);
+  wifiCfg.sta.pmf_cfg.capable = true;
+  wifiCfg.sta.pmf_cfg.required = false;
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifiCfg));
 
@@ -607,7 +644,9 @@ static void initWifiAndMqtt() {
   mqttCfg.session.last_will.msg_len = 7;
   mqttCfg.session.last_will.qos = 0;
   mqttCfg.session.last_will.retain = 1;
-  mqttCfg.session.keepalive = 30;
+  mqttCfg.session.keepalive = 10;
+  mqttCfg.network.timeout_ms = 3000;
+  mqttCfg.network.reconnect_timeout_ms = 2000;
 
   mqttClient = esp_mqtt_client_init(&mqttCfg);
   ESP_ERROR_CHECK(esp_mqtt_client_register_event(mqttClient, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, mqttEventHandler, nullptr));
