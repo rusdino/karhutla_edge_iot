@@ -17,7 +17,7 @@ plant.py             ruang asap + model tegangan Sharp & MQ-135 (skenario clean/
 forecast.py          AI tren linear (t+horizon) + PreemptController (FORCE_MAX proaktif yang aman)
 logger.py            CSV harian logs/karhutla_<sumber>_YYYY-MM-DD.csv & log MQTT logs/mqtt_YYYY-MM-DD.log
 report.py            ringkasan + uji lulus/gagal
-dashboard.py         Modern Web Dashboard di laptop (grafik multi-overlay, kontrol cmd, runner SITL, live MQTT log)
+dashboard.py         Modern Web Dashboard di laptop (grafik multi-overlay, kontrol cmd, runner SITL & HILS, live MQTT log)
 sitl.py  hils.py  field_node.py
 mosquitto.conf       broker lokal (port 6669)
 firmware/karhutla_esp32/{platformio.ini, CMakeLists.txt, include/config.h, src/main.cpp}
@@ -53,7 +53,8 @@ python dashboard.py --auto-sim flaming --speed 1                    # buka Web D
 - **Auto-Start Broker & Auto-Log MQTT:** Saat `--mqtt` atau `dashboard.py` dijalankan, sistem otomatis menyalakan broker Mosquitto di port **`6669`** (jika belum aktif) dan mencatat seluruh trafik MQTT (`CONNECT`, `SUBSCRIBE`, `PUBLISH`, `RECV`, `DISCONNECT`) ke `logs/mqtt_YYYY-MM-DD.log`.
 - **Fitur Modern Web Dashboard (`dashboard.py`):**
   - **Grafik Multi-Overlay Interaktif:** Toggle kurva `Fusion Index (FI)`, `PM-proxy Kalman`, `PM Plant (True)`, `PM Raw (Median)`, `AI Forecast (t+60s)`, `Gas MQ-135 (ppm)`, `Skor Gas (g)`, `Tegangan Sensor (V)`, serta sub-grafik sinkron `Duty Kipas (%)` dan `State FSM`.
-  - **Kontrol Override & Operasi Simulasi:** Tombol `AUTO`, `FORCE MAX`, `FORCE OFF`, `RESET` (ke topik `karhutla/cmd`), kontrol eksekusi simulasi (`Mulai`, `Jeda`, `Berhenti`, pilih skenario & kecepatan `1x`–`20x`), saklar `AI Preempt`, serta saklar injeksi uji putus kabel sensor (`FAILSAFE`).
+  - **Kontrol Override & Operasi Simulasi:** Tombol `AUTO`, `FORCE MAX`, `FORCE OFF`, `RESET` (ke topik `karhutla/cmd`), pemilih **Target Eksekusi** (`SITL (Python)` atau `HILS (ESP32)`), kontrol eksekusi (`Mulai`, `Jeda`, `Berhenti`, `Bersihkan`, pilih skenario & kecepatan `1x`–`20x`), saklar `AI Preempt`, serta saklar injeksi uji putus kabel sensor (`FAILSAFE`).
+    > **Catatan HILS via Web Dashboard:** Saat menjalankan `HILS (ESP32)` dari `dashboard.py`, pastikan tidak menjalankan `hils.py` di terminal secara bersamaan agar kedua runner tidak berebut mengirim sampel ke ESP32 yang sama.
 - Flag `--plot` menghasilkan file gambar PNG 3-panel di folder kerja (default: `sitl_<skenario>.png`, misalnya `sitl_flaming.png`):
   1. **Panel 1 (PM-proxy & Fusion Index):** PM sebenarnya (plant), PM-proxy mentah (median), PM-proxy Kalman, Fusion Index (`FI`), prakiraan AI `t+60s`, serta garis ambang `WASPADA` (55) dan `BAHAYA` (150).
   2. **Panel 2 (Sensor Gas MQ-135):** Kurva konsentrasi gas sebenarnya (`plant.gas_ppm`) vs estimasi gas MQ-135 (`ppm`) pada sumbu kiri, serta kurva skor gas `g` (EMA `0–1`) pada sumbu kanan.
