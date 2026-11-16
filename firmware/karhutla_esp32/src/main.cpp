@@ -28,7 +28,6 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
-#include "esp_system.h"
 #include "esp_task_wdt.h"
 #include "nvs_flash.h"
 #include "mqtt_client.h"
@@ -456,40 +455,39 @@ static void publishTel(const Tel& t) {
     "\"gas_ppm\":%.1f,\"g\":%.3f,\"fi\":%.2f,\"v0\":%.3f,\"state\":\"%s\",\"mode\":\"%s\",\"duty\":%.1f,\"alarm\":%d}",
     (unsigned long)t.seq, t.v_dust, t.v_mq, t.pm_raw, t.pm, t.dcdt, t.gas_ppm, t.g, t.fi, t.v0,
     STATE_NAMES[t.state], MODE_NAMES[t.mode], t.duty, t.alarm);
-  esp_mqtt_client_publish(mqttClient, T_TELEM, js, 0, 0, 0);
+  esp_mqtt_client_enqueue(mqttClient, T_TELEM, js, 0, 0, 0, true);
 
-  // Batasi topik skalar HP maks 2 Hz (atau langsung saat state/mode berubah) agar Wi-Fi tidak jenuh saat HILS cepat
+#if !MODE_HILS
+  // Mode RIIL: kirim topik skalar untuk dashboard mobile maks 1 Hz
   static uint32_t lastScalarMs = 0;
   static uint8_t prevState = 0xFF, prevMode = 0xFF;
   uint32_t now = nowMs();
-  if (t.state != prevState || t.mode != prevMode || (now - lastScalarMs) >= 500) {
+  if (t.state != prevState || t.mode != prevMode || (now - lastScalarMs) >= 1000) {
     lastScalarMs = now;
     prevState = t.state;
     prevMode = t.mode;
     char v[24];
-    snprintf(v, sizeof(v), "%.2f", t.pm);      esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/pm", v, 0, 0, 0);
-    snprintf(v, sizeof(v), "%.2f", t.pm_raw);  esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/pm_raw", v, 0, 0, 0);
-    snprintf(v, sizeof(v), "%.2f", t.fi);      esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/fi", v, 0, 0, 0);
-    snprintf(v, sizeof(v), "%.3f", t.dcdt);    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/dcdt", v, 0, 0, 0);
-    snprintf(v, sizeof(v), "%.1f", t.gas_ppm); esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/gas_ppm", v, 0, 0, 0);
-    snprintf(v, sizeof(v), "%.2f", t.g);       esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/g", v, 0, 0, 0);
-    snprintf(v, sizeof(v), "%.0f", t.duty);    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/duty", v, 0, 0, 0);
-    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/state", STATE_NAMES[t.state], 0, 0, 0);
-    esp_mqtt_client_publish(mqttClient, T_TELEM_SCALAR "/mode", MODE_NAMES[t.mode], 0, 0, 0);
+    snprintf(v, sizeof(v), "%.2f", t.pm);      esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/pm", v, 0, 0, 0, true);
+    snprintf(v, sizeof(v), "%.2f", t.pm_raw);  esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/pm_raw", v, 0, 0, 0, true);
+    snprintf(v, sizeof(v), "%.2f", t.fi);      esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/fi", v, 0, 0, 0, true);
+    snprintf(v, sizeof(v), "%.3f", t.dcdt);    esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/dcdt", v, 0, 0, 0, true);
+    snprintf(v, sizeof(v), "%.1f", t.gas_ppm); esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/gas_ppm", v, 0, 0, 0, true);
+    snprintf(v, sizeof(v), "%.2f", t.g);       esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/g", v, 0, 0, 0, true);
+    snprintf(v, sizeof(v), "%.0f", t.duty);    esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/duty", v, 0, 0, 0, true);
+    esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/state", STATE_NAMES[t.state], 0, 0, 0, true);
+    esp_mqtt_client_enqueue(mqttClient, T_TELEM_SCALAR "/mode", MODE_NAMES[t.mode], 0, 0, 0, true);
   }
+#endif
 }
 
 static void txTask(void*) {
   const bool wdtOk = (esp_task_wdt_add(nullptr) == ESP_OK);
   uint32_t lastHb = 0;
-  uint32_t lastOkMs = nowMs();
   uint32_t lastWifiRetryMs = 0;
-  uint32_t lastMqttRetryMs = 0;
   for (;;) {
     if (wdtOk) esp_task_wdt_reset();
     uint32_t now = nowMs();
     if (mqttConnected) {
-      lastOkMs = now;
       Tel copy; bool fresh = false;
       xSemaphoreTake(mtx, portMAX_DELAY);
       if (tel.fresh) { copy = tel; tel.fresh = false; fresh = true; }
@@ -501,24 +499,12 @@ static void txTask(void*) {
         char hb[64];
         snprintf(hb, sizeof(hb), "{\"mode\":\"%s\",\"uptime_ms\":%lu}",
                  MODE_HILS ? "HILS" : "RIIL", (unsigned long)now);
-        esp_mqtt_client_publish(mqttClient, T_HEARTBEAT, hb, 0, 0, 0);
+        esp_mqtt_client_enqueue(mqttClient, T_HEARTBEAT, hb, 0, 0, 0, true);
       }
-    } else {
-      // Pemulihan otomatis Wi-Fi/MQTT tanpa perlu menekan tombol RESET fisik
-      if (!wifiConnected && (now - lastWifiRetryMs) >= 2500) {
-        lastWifiRetryMs = now;
-        ESP_LOGW(TAG, "Wi-Fi terputus, mencoba hubungkan ulang...");
-        esp_wifi_connect();
-      } else if (wifiConnected && mqttStarted && (now - lastMqttRetryMs) >= 5000) {
-        lastMqttRetryMs = now;
-        ESP_LOGW(TAG, "MQTT belum terhubung, mencoba reconnect...");
-        esp_mqtt_client_reconnect(mqttClient);
-      }
-      if ((now - lastOkMs) >= 30000) {
-        ESP_LOGE(TAG, "Koneksi terhenti >30s, melakukan restart otomatis...");
-        vTaskDelay(pdMS_TO_TICKS(100));
-        esp_restart();
-      }
+    } else if (!wifiConnected && (now - lastWifiRetryMs) >= 3000) {
+      lastWifiRetryMs = now;
+      ESP_LOGW(TAG, "Wi-Fi terputus, mencoba hubungkan ulang...");
+      esp_wifi_connect();
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
@@ -644,8 +630,8 @@ static void initWifiAndMqtt() {
   mqttCfg.session.last_will.msg_len = 7;
   mqttCfg.session.last_will.qos = 0;
   mqttCfg.session.last_will.retain = 1;
-  mqttCfg.session.keepalive = 10;
-  mqttCfg.network.timeout_ms = 3000;
+  mqttCfg.session.keepalive = 20;
+  mqttCfg.network.timeout_ms = 10000;
   mqttCfg.network.reconnect_timeout_ms = 2000;
 
   mqttClient = esp_mqtt_client_init(&mqttCfg);
