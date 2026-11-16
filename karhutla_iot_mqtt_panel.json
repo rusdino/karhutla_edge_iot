@@ -1,0 +1,141 @@
+{
+  "app": "IoT MQTT Panel",
+  "version": 2,
+  "generated_at": "2026-11-16T13:00:38",
+  "web_dashboard_lan_url": "http://10.8.43.78:8080",
+  "connections": [
+    {
+      "connectionName": "Karhutla Edge-IoT",
+      "clientId": "hp-dashboard-karhutla",
+      "host": "10.8.43.78",
+      "port": 6669,
+      "protocol": "tcp",
+      "autoReconnect": true,
+      "cleanSession": true,
+      "keepAlive": 60,
+      "username": "",
+      "password": "",
+      "dashboards": [
+        {
+          "dashboardName": "Monitor Karhutla",
+          "panels": [
+            {
+              "panelName": "Status Koneksi ESP32 / SITL",
+              "type": "led_status",
+              "topic": "karhutla/status",
+              "payloadOnline": "online",
+              "payloadOffline": "offline",
+              "qos": 0
+            },
+            {
+              "panelName": "Gauge Fusion Index (FI)",
+              "type": "gauge",
+              "topic": "karhutla/t/fi",
+              "min": 0,
+              "max": 250,
+              "unit": "ug/m3",
+              "qos": 0
+            },
+            {
+              "panelName": "Gauge PM-proxy Kalman",
+              "type": "gauge",
+              "topic": "karhutla/t/pm",
+              "min": 0,
+              "max": 300,
+              "unit": "ug/m3",
+              "qos": 0
+            },
+            {
+              "panelName": "Kecepatan Kipas (PWM)",
+              "type": "progress",
+              "topic": "karhutla/t/duty",
+              "min": 0,
+              "max": 100,
+              "unit": "%",
+              "qos": 0
+            },
+            {
+              "panelName": "Status Bahaya (FSM)",
+              "type": "text_log",
+              "topic": "karhutla/t/state",
+              "qos": 0
+            },
+            {
+              "panelName": "Mode Operasi",
+              "type": "text_log",
+              "topic": "karhutla/t/mode",
+              "qos": 0
+            },
+            {
+              "panelName": "Gas MQ-135 (ppm)",
+              "type": "gauge",
+              "topic": "karhutla/t/gas_ppm",
+              "min": 300,
+              "max": 1500,
+              "unit": "ppm",
+              "qos": 0
+            },
+            {
+              "panelName": "Skor Gas (g 0-1)",
+              "type": "text",
+              "topic": "karhutla/t/g",
+              "qos": 0
+            },
+            {
+              "panelName": "Prakiraan AI (t+60s)",
+              "type": "gauge",
+              "topic": "karhutla/f/pm_forecast",
+              "min": 0,
+              "max": 300,
+              "unit": "ug/m3",
+              "qos": 0
+            },
+            {
+              "panelName": "ETA Menuju BAHAYA",
+              "type": "text",
+              "topic": "karhutla/f/eta_bahaya_s",
+              "unit": "s",
+              "qos": 0
+            },
+            {
+              "panelName": "Grafik Tren PM-proxy vs Forecast",
+              "type": "line_graph",
+              "topic": "karhutla/t/pm",
+              "topic2": "karhutla/f/pm_forecast",
+              "unit": "ug/m3",
+              "qos": 0
+            },
+            {
+              "panelName": "Mode AUTO (FSM)",
+              "type": "button",
+              "topic": "karhutla/cmd",
+              "payload": "AUTO",
+              "qos": 0
+            },
+            {
+              "panelName": "KIPAS 100% (FORCE MAX)",
+              "type": "button",
+              "topic": "karhutla/cmd",
+              "payload": "FORCE_MAX",
+              "qos": 0
+            },
+            {
+              "panelName": "MATIKAN KIPAS (FORCE OFF)",
+              "type": "button",
+              "topic": "karhutla/cmd",
+              "payload": "FORCE_OFF",
+              "qos": 0
+            },
+            {
+              "panelName": "RESET SISTEM",
+              "type": "button",
+              "topic": "karhutla/cmd",
+              "payload": "RESET",
+              "qos": 0
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

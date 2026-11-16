@@ -1,0 +1,12 @@
+# Virtual Environment & Python Bytecode
+sitl_venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Superpowers Brainstorm & SDD Scratch
+.superpowers/
+
+# Runtime CSV & MQTT Log Files
+logs/*.csv
+logs/*.log
