@@ -45,28 +45,44 @@ def _clean_dict(d):
     return {k: _clean_val(v) for k, v in d.items()}
 
 
-def detect_lan_ip():
-    """Deteksi IP LAN laptop agar mudah diakses dari HP."""
+def detect_lan_ip_info():
+    """Deteksi IP LAN laptop beserta status apakah nilai berasal dari fallback."""
+    for target_ip in ("8.8.8.8", "192.168.1.1", "10.0.0.1"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((target_ip, 80))
+                ip = s.getsockname()[0]
+                if ip and not ip.startswith("127."):
+                    return ip, False
+        except OSError:
+            pass
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            if ip and not ip.startswith("127."):
-                return ip
+        host_ip = socket.gethostbyname(socket.gethostname())
+        if host_ip and not host_ip.startswith("127."):
+            return host_ip, False
     except OSError:
         pass
-    return "192.168.1.10"
+    return "192.168.1.10", True
+
+
+def detect_lan_ip():
+    """Deteksi IP LAN laptop agar mudah diakses dari HP."""
+    return detect_lan_ip_info()[0]
 
 
 def build_mobile_dashboard_config(broker_host=None, broker_port=None):
     """Hasilkan JSON konfigurasi siap-import untuk aplikasi HP (IoT MQTT Panel)."""
-    ip = broker_host if (broker_host and broker_host not in ("localhost", "127.0.0.1", "0.0.0.0")) else detect_lan_ip()
+    if broker_host and broker_host not in ("localhost", "127.0.0.1", "0.0.0.0"):
+        ip, is_fallback = broker_host, False
+    else:
+        ip, is_fallback = detect_lan_ip_info()
     port = int(broker_port or K.BROKER_PORT)
     return {
         "app": "IoT MQTT Panel",
         "version": 2,
         "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "web_dashboard_lan_url": f"http://{ip}:8080",
+        "ip_is_fallback": is_fallback,
         "connections": [
             {
                 "connectionName": "Karhutla Edge-IoT",
@@ -229,30 +245,8 @@ class DashboardEngine:
         self.lock = threading.Lock()
         self.history = deque(maxlen=1800)
         self.mqtt_logs = deque(maxlen=300)
-        self.latest = {
-            "t": 0.0,
-            "seq": 0,
-            "scenario": "idle",
-            "pm_true": None,
-            "gas_true": None,
-            "v_dust": K.DUST_V0,
-            "v_mq": 1.0,
-            "pm_raw": 0.0,
-            "pm": 0.0,
-            "dcdt": 0.0,
-            "gas_ppm": K.MQ_ATM_PPM,
-            "g": 0.0,
-            "fi": 0.0,
-            "v0": K.DUST_V0,
-            "state": "NORMAL",
-            "mode": "AUTO",
-            "duty": 0.0,
-            "forecast": 0.0,
-            "slope": 0.0,
-            "eta_bahaya_s": None,
-            "mae": None,
-            "sensor_fault": False,
-        }
+        self.latest = self._idle_latest()
+        self._lan_ip, self._ip_is_fallback = detect_lan_ip_info()
         self.broker_connected = False
         self.node_status = "offline"
 
@@ -268,6 +262,7 @@ class DashboardEngine:
         self.sim_step_idx = 0
         self.sim_plant = None
         self.sim_fw = None
+        self.sim_ref_fw = None
         self.sim_fc = None
         self.sim_pre = None
         self.sim_csv = None
@@ -275,6 +270,17 @@ class DashboardEngine:
         self._sim_thread = None
         self._hils_cond = threading.Condition()
         self._hils_by_seq = {}
+        self._hils_meta = {}
+        self.hils_timeouts = 0
+        self.hils_consec_timeouts = 0
+        self.hils_parity = {
+            "samples": 0,
+            "state_matches": 0,
+            "max_delta_fi": 0.0,
+            "last_delta_fi": None,
+            "last_delta_pm": None,
+        }
+        self._last_cmd_error = None
 
         # SSE subscribers
         self._sse_clients = []
@@ -338,6 +344,9 @@ class DashboardEngine:
                     if snap is not None:
                         self._broadcast({"type": "telemetry", "source": "sitl", "row": snap,
                                          "sim": self.get_sim_status()})
+                elif self.sim_running and self.sim_target == "hils" and self.sim_ref_fw is not None:
+                    with self.lock:
+                        self.sim_ref_fw.apply_command(payload)
             elif topic == K.T_HEARTBEAT:
                 try:
                     hb = json.loads(payload)
@@ -374,6 +383,19 @@ class DashboardEngine:
             publish_status=False,
             mqtt_logger=self.mqtt_logger,
         )
+        prev_disc = getattr(self.client, "on_disconnect", None)
+
+        def on_disc(c, u, *args):
+            with self.lock:
+                self.broker_connected = False
+            self._broadcast({"type": "status", "broker_connected": False, "node_status": self.node_status})
+            if callable(prev_disc):
+                try:
+                    prev_disc(c, u, *args)
+                except Exception:
+                    pass
+
+        self.client.on_disconnect = on_disc
         try:
             mqtt_io.connect(self.client, self.broker_host, self.broker_port, auto_start_broker=True)
             with self.lock:
@@ -417,6 +439,7 @@ class DashboardEngine:
         seq_val = int(tel.get("seq", 0))
         t_val = float(tel.get("seq", t_rel))
         did_reset_history = False
+        hils_meta = None
         with self.lock:
             if hist and t_val <= hist[-1].get("t", -1.0):
                 # Skenario/run baru dimulai dari seq=0 atau re-publish pada detik yang sama
@@ -427,35 +450,58 @@ class DashboardEngine:
                     else:
                         self._external_fc = LinearTrendForecaster()
                     did_reset_history = True
+            if is_esp:
+                hils_meta = self._hils_meta.pop(seq_val, None)
             fc = self._esp_fc if is_esp else self._external_fc
         f = fc.update(t_val, float(tel.get("pm", 0.0)))
+        tel_pm = float(tel.get("pm", 0.0))
+        tel_fi = float(tel.get("fi", 0.0))
+        tel_state = str(tel.get("state", "NORMAL"))
+        delta_fi = round(abs(tel_fi - float(hils_meta["ref_fi"])), 3) if hils_meta else None
+        delta_pm = round(abs(tel_pm - float(hils_meta["ref_pm"])), 3) if hils_meta else None
+        parity_match = (tel_state == hils_meta["ref_state"] and abs(tel_fi - float(hils_meta["ref_fi"])) < 1.0) if hils_meta else None
         row = _clean_dict({
             "t": t_val,
             "seq": seq_val,
-            "scenario": "esp32-live" if is_esp else "mqtt-live",
-            "pm_true": None,
-            "gas_true": None,
+            "scenario": (f"hils:{hils_meta['scenario']}" if hils_meta else "esp32-live") if is_esp else "mqtt-live",
+            "pm_true": hils_meta["pm_true"] if hils_meta else None,
+            "gas_true": hils_meta["gas_true"] if hils_meta else None,
+            "ref_pm": hils_meta["ref_pm"] if hils_meta else None,
+            "ref_fi": hils_meta["ref_fi"] if hils_meta else None,
+            "ref_state": hils_meta["ref_state"] if hils_meta else None,
+            "parity_delta_fi": delta_fi,
+            "parity_delta_pm": delta_pm,
+            "parity_match": parity_match,
             "v_dust": float(tel.get("v_dust", K.DUST_V0)),
             "v_mq": float(tel.get("v_mq", 1.0)),
             "pm_raw": float(tel.get("pm_raw", 0.0)),
-            "pm": float(tel.get("pm", 0.0)),
+            "pm": tel_pm,
             "dcdt": float(tel.get("dcdt", 0.0)),
             "gas_ppm": float(tel.get("gas_ppm", K.MQ_ATM_PPM)),
             "g": float(tel.get("g", 0.0)),
-            "fi": float(tel.get("fi", 0.0)),
+            "fi": tel_fi,
             "v0": float(tel.get("v0", K.DUST_V0)),
-            "state": str(tel.get("state", "NORMAL")),
+            "state": tel_state,
             "mode": str(tel.get("mode", "AUTO")),
             "duty": float(tel.get("duty", 0.0)),
             "forecast": _clean_val(f.get("pm_forecast", 0.0)),
             "slope": _clean_val(f.get("slope", 0.0)),
             "eta_bahaya_s": _clean_val(f.get("eta_bahaya_s")),
             "mae": _clean_val(f.get("mae")),
-            "sensor_fault": str(tel.get("state", "")) == "FAILSAFE",
+            "sensor_fault": tel_state == "FAILSAFE",
         })
         with self.lock:
             if is_esp:
                 self.esp_latest = row
+                if hils_meta:
+                    self.hils_parity["samples"] += 1
+                    if parity_match or tel_state == hils_meta["ref_state"]:
+                        self.hils_parity["state_matches"] += 1
+                    self.hils_parity["last_delta_fi"] = delta_fi
+                    self.hils_parity["last_delta_pm"] = delta_pm
+                    self.hils_parity["max_delta_fi"] = round(
+                        max(self.hils_parity["max_delta_fi"], delta_fi), 3
+                    )
             else:
                 self.latest = row
             if hist and hist[-1].get("t") == t_val:
@@ -504,12 +550,19 @@ class DashboardEngine:
                 "speed": self.sim_speed,
                 "duration": self.sim_duration,
                 "ai_preempt": self.sim_ai_preempt,
+                "ai_preempt_active": bool(
+                    self.sim_running and self.sim_ai_preempt and self.sim_pre and getattr(self.sim_pre, "active", False)
+                ),
                 "fault_inject": self.sim_fault_inject,
                 "step": self.sim_step_idx,
+                "enable_mqtt": self.enable_mqtt,
                 "broker_host": self.broker_host,
                 "broker_port": self.broker_port,
                 "broker_connected": self.broker_connected,
                 "node_status": self.node_status,
+                "hils_timeouts": self.hils_timeouts,
+                "hils_consec_timeouts": self.hils_consec_timeouts,
+                "hils_parity": dict(self.hils_parity),
                 "log_file": self.mqtt_logger.path or f"{self.out_dir}/mqtt_{datetime.date.today().isoformat()}.log",
             }
 
@@ -518,6 +571,33 @@ class DashboardEngine:
             age = None if self.esp_last_rx is None else round(time.time() - self.esp_last_rx, 1)
             return {"online": self.esp_online, "age_s": age, "hw_mode": self.esp_hw_mode,
                     "stale_s": self.esp_stale_s}
+
+    @staticmethod
+    def _idle_latest():
+        return {
+            "t": 0.0,
+            "seq": 0,
+            "scenario": "idle",
+            "pm_true": None,
+            "gas_true": None,
+            "v_dust": K.DUST_V0,
+            "v_mq": 1.0,
+            "pm_raw": 0.0,
+            "pm": 0.0,
+            "dcdt": 0.0,
+            "gas_ppm": K.MQ_ATM_PPM,
+            "g": 0.0,
+            "fi": 0.0,
+            "v0": K.DUST_V0,
+            "state": "NORMAL",
+            "mode": "AUTO",
+            "duty": 0.0,
+            "forecast": 0.0,
+            "slope": 0.0,
+            "eta_bahaya_s": None,
+            "mae": None,
+            "sensor_fault": False,
+        }
 
     def get_state_snapshot(self):
         with self.lock:
@@ -538,6 +618,7 @@ class DashboardEngine:
                 "esp32": {"history": esp_hist, "latest": esp_latest, "online": esp_online},
             },
             "esp": self.get_esp_status(),
+            "mobile": {"ip": self._lan_ip, "ip_is_fallback": self._ip_is_fallback},
             "mqtt_logs": logs,
             "sim": self.get_sim_status(),
             "thresholds": {"waspada": K.T_W_IN, "bahaya": K.T_B_IN, "horizon_s": K.FORECAST_HORIZON_S},
@@ -546,11 +627,19 @@ class DashboardEngine:
     def send_cmd(self, cmd):
         clean_cmd = (cmd or "").strip().upper()
         if clean_cmd not in ("AUTO", "FORCE_MAX", "FORCE_OFF", "RESET"):
+            self._last_cmd_error = "Perintah tidak dikenali."
             return False
         snap = None
         did_clear = False
+        tel_now = None
+        publish_needed = False
         with self.lock:
-            if self.sim_running and self.sim_fw is not None:
+            has_sitl = bool(self.sim_running and self.sim_fw is not None)
+            has_broker = bool(self.client is not None and self.broker_connected)
+            if not has_sitl and not has_broker:
+                self._last_cmd_error = "Tidak ada simulasi SITL aktif dan broker MQTT tidak terhubung."
+                return False
+            if has_sitl:
                 tel_now = self.sim_fw.apply_command(clean_cmd)
                 if tel_now is not None:
                     if clean_cmd == "RESET":
@@ -568,17 +657,30 @@ class DashboardEngine:
                     if self.history and not did_clear:
                         self.history[-1] = dict(self.latest)
                     snap = dict(self.latest)
-                else:
-                    tel_now = None
-            else:
-                tel_now = None
-        if self.client:
+            if self.sim_running and self.sim_target == "hils" and self.sim_ref_fw is not None:
+                self.sim_ref_fw.apply_command(clean_cmd)
+                if clean_cmd == "RESET":
+                    self.esp_history.clear()
+                    self.esp_latest = None
+                    self._hils_meta.clear()
+                    self.hils_parity = {
+                        "samples": 0,
+                        "state_matches": 0,
+                        "max_delta_fi": 0.0,
+                        "last_delta_fi": None,
+                        "last_delta_pm": None,
+                    }
+            publish_needed = bool(self.client is not None and self.broker_connected)
+        if publish_needed:
             try:
                 self.client.publish(K.T_CMD, clean_cmd)
                 if tel_now is not None:
                     mqtt_io.publish_telemetry(self.client, tel_now)
-            except Exception:
-                pass
+            except Exception as exc:
+                if tel_now is None:
+                    self._last_cmd_error = f"Gagal mengirim ke broker MQTT: {exc}"
+                    return False
+        self._last_cmd_error = None
         if did_clear:
             self._broadcast({"type": "clear", "source": "sitl"})
         if snap is not None:
@@ -587,10 +689,12 @@ class DashboardEngine:
 
     def control_sim(self, params):
         action = (params.get("action") or "").strip().lower()
-        if params.get("target") in ("sitl", "hils"):
+        with self.lock:
+            can_retarget = (not self.sim_running) or (action == "start")
+        if can_retarget and params.get("target") in ("sitl", "hils"):
             with self.lock:
                 self.sim_target = params["target"]
-        if "scenario" in params and params["scenario"] in SCENARIOS:
+        if can_retarget and "scenario" in params and params["scenario"] in SCENARIOS:
             with self.lock:
                 self.sim_scenario = params["scenario"]
         if "speed" in params:
@@ -601,11 +705,22 @@ class DashboardEngine:
                         self.sim_speed = sp
             except (TypeError, ValueError):
                 pass
+        if can_retarget and "duration" in params:
+            try:
+                dur = float(params["duration"])
+                if dur > 0:
+                    with self.lock:
+                        self.sim_duration = dur
+            except (TypeError, ValueError):
+                pass
         if "ai_preempt" in params:
             with self.lock:
                 self.sim_ai_preempt = bool(params["ai_preempt"])
-                if self.sim_pre is None and self.sim_ai_preempt:
-                    self.sim_pre = PreemptController()
+                if self.sim_ai_preempt:
+                    if self.sim_pre is None:
+                        self.sim_pre = PreemptController()
+                elif self.sim_pre is not None:
+                    self.sim_pre.active = False
         if "fault_inject" in params:
             with self.lock:
                 self.sim_fault_inject = bool(params["fault_inject"])
@@ -621,14 +736,26 @@ class DashboardEngine:
         elif action == "resume":
             with self.lock:
                 self.sim_paused = False
+                self.hils_consec_timeouts = 0
         elif action == "clear":
             src = params.get("source", "sitl")
             with self.lock:
                 if src == "esp32":
                     self.esp_history.clear()
+                    self.esp_latest = None
                     self._esp_fc = LinearTrendForecaster()
+                    self._hils_meta.clear()
+                    self.hils_parity = {
+                        "samples": 0,
+                        "state_matches": 0,
+                        "max_delta_fi": 0.0,
+                        "last_delta_fi": None,
+                        "last_delta_pm": None,
+                    }
                 else:
                     self.history.clear()
+                    self.latest = self._idle_latest()
+                    self._external_fc = LinearTrendForecaster()
             self._broadcast({"type": "clear", "source": "esp32" if src == "esp32" else "sitl"})
         self._broadcast({"type": "sim", "sim": self.get_sim_status()})
         return True
@@ -638,8 +765,21 @@ class DashboardEngine:
             target = self.sim_target
             if target == "hils":
                 self.esp_history.clear()
+                self.esp_latest = None
                 self._esp_fc = LinearTrendForecaster()
+                self.sim_ref_fw = Firmware()
+                self._hils_meta.clear()
+                self.hils_timeouts = 0
+                self.hils_consec_timeouts = 0
+                self.hils_parity = {
+                    "samples": 0,
+                    "state_matches": 0,
+                    "max_delta_fi": 0.0,
+                    "last_delta_fi": None,
+                    "last_delta_pm": None,
+                }
             else:
+                self.sim_ref_fw = None
                 self.history.clear()
             self.sim_plant = SmokeChamber(self.sim_scenario, seed=1)
             self.sim_fw = None if target == "hils" else Firmware()
@@ -741,12 +881,26 @@ class DashboardEngine:
             wait_s = max(0.005, K.TS / max(0.1, speed))
             self._sim_stop_evt.wait(wait_s)
 
+        summary = None
         with self.lock:
+            completed_naturally = (not self._sim_stop_evt.is_set()) and (self.sim_step_idx >= total_steps)
             self.sim_running = False
             if self.sim_csv:
                 self.sim_csv.close()
                 self.sim_csv = None
+            if completed_naturally:
+                peak_fi = max((float(r.get("fi", 0.0)) for r in self.history), default=0.0)
+                summary = {
+                    "target": self.sim_target,
+                    "source": "sitl",
+                    "scenario": self.sim_scenario,
+                    "samples": len(self.history),
+                    "peak_fi": round(peak_fi, 1),
+                    "hils_parity": None,
+                }
         self._broadcast({"type": "sim", "sim": self.get_sim_status()})
+        if summary is not None:
+            self._broadcast({"type": "sim_complete", "summary": summary, "sim": self.get_sim_status()})
 
     def _wait_hils_seq(self, seq, vd, vm, timeout=4.0):
         """Tunggu balasan telemetri ESP32 untuk `seq`, dengan 1x retry di tengah timeout."""
@@ -797,8 +951,25 @@ class DashboardEngine:
                     fault_now = self.sim_fault_inject or self.sim_plant.dust_disconnected(t)
                     if self.sim_fault_inject:
                         vd = 0.0
+                    vd_tx = round(float(vd), 4)
+                    vm_tx = round(float(vm), 4)
                     speed = self.sim_speed
                     scenario = self.sim_scenario
+                    pm_true_val = float(self.sim_plant.C)
+                    gas_true_val = float(self.sim_plant.gas_ppm)
+                    if k not in self._hils_meta and self.sim_ref_fw is not None:
+                        ref_tel = self.sim_ref_fw.step(vd_tx, vm_tx, seq=k)
+                        self._hils_meta[k] = {
+                            "pm_true": pm_true_val,
+                            "gas_true": gas_true_val,
+                            "ref_pm": float(ref_tel["pm"]),
+                            "ref_fi": float(ref_tel["fi"]),
+                            "ref_state": str(ref_tel["state"]),
+                            "ref_duty": float(ref_tel["duty"]),
+                            "scenario": scenario,
+                        }
+                        for old_k in [ok for ok in self._hils_meta if ok < k - 60]:
+                            self._hils_meta.pop(old_k, None)
 
             if paused:
                 time.sleep(0.1)
@@ -806,24 +977,27 @@ class DashboardEngine:
 
             if self.client:
                 try:
-                    self.client.publish(K.T_HILS_IN, f"{k},{vd:.4f},{vm:.4f}")
+                    self.client.publish(K.T_HILS_IN, f"{k},{vd_tx:.4f},{vm_tx:.4f}")
                 except Exception:
                     pass
-            tel = self._wait_hils_seq(k, vd, vm, timeout=4.0)
+            tel = self._wait_hils_seq(k, vd_tx, vm_tx, timeout=4.0)
             if self._sim_stop_evt.is_set():
                 break
 
             if tel is not None:
                 with self.lock:
+                    self.hils_consec_timeouts = 0
                     f = self.sim_fc.update(t, float(tel.get("pm", 0.0)))
                     pre_cmd = None
                     if self.sim_ai_preempt and self.sim_pre is not None:
                         pre_cmd = self.sim_pre.decide(t, str(tel.get("mode", "AUTO")), f["pm_forecast"])
+                    if pre_cmd and self.sim_ref_fw is not None:
+                        self.sim_ref_fw.apply_command(pre_cmd)
                     self.sim_plant.advance(float(tel.get("duty", 0.0)) / 100.0, t)
                     if self.sim_csv:
                         self.sim_csv.write(_clean_dict({
                             "t": t, "t_s": t, "seq": k, "scenario": scenario,
-                            "pm_true": self.sim_plant.C, "gas_true": self.sim_plant.gas_ppm,
+                            "pm_true": pm_true_val, "gas_true": gas_true_val,
                             "v_dust": vd, "v_mq": vm,
                             "pm_raw": tel.get("pm_raw", 0.0), "pm": tel.get("pm", 0.0),
                             "dcdt": tel.get("dcdt", 0.0), "gas_ppm": tel.get("gas_ppm", K.MQ_ATM_PPM),
@@ -841,17 +1015,49 @@ class DashboardEngine:
                             self.client.publish(K.T_CMD, pre_cmd)
                     except Exception:
                         pass
+            else:
+                with self.lock:
+                    self.hils_timeouts += 1
+                    self.hils_consec_timeouts += 1
+                    self.sim_step_idx = max(0, self.sim_step_idx - 1)
+                    auto_paused = self.hils_consec_timeouts >= 3
+                    if auto_paused:
+                        self.sim_paused = True
+                    timeouts = self.hils_timeouts
+                    consec = self.hils_consec_timeouts
+                self._broadcast({
+                    "type": "hils_timeout",
+                    "seq": k,
+                    "timeouts": timeouts,
+                    "consec": consec,
+                    "auto_paused": auto_paused,
+                    "sim": self.get_sim_status(),
+                })
 
             self._broadcast({"type": "sim", "sim": self.get_sim_status()})
             wait_s = max(0.005, K.TS / max(0.1, speed))
             self._sim_stop_evt.wait(wait_s)
 
+        summary = None
         with self.lock:
+            completed_naturally = (not self._sim_stop_evt.is_set()) and (self.sim_step_idx >= total_steps)
             self.sim_running = False
             if self.sim_csv:
                 self.sim_csv.close()
                 self.sim_csv = None
+            if completed_naturally:
+                peak_fi = max((float(r.get("fi", 0.0)) for r in self.esp_history), default=0.0)
+                summary = {
+                    "target": self.sim_target,
+                    "source": "esp32",
+                    "scenario": self.sim_scenario,
+                    "samples": len(self.esp_history),
+                    "peak_fi": round(peak_fi, 1),
+                    "hils_parity": dict(self.hils_parity),
+                }
         self._broadcast({"type": "sim", "sim": self.get_sim_status()})
+        if summary is not None:
+            self._broadcast({"type": "sim_complete", "summary": summary, "sim": self.get_sim_status()})
 
     def stop_sim(self):
         self._sim_stop_evt.set()
@@ -883,34 +1089,43 @@ RENDERED_HTML = """<!DOCTYPE html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>Karhutla Edge-IoT — Telemetry &amp; Command Center</title>
+  <title>Karhutla Edge-IoT — Pusat Telemetri &amp; Kendali</title>
   <style>
     :root {
       color-scheme: light dark;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
-      --bg-canvas-light: #f1f5f9;
-      --bg-canvas-dark: #090d16;
+      --bg-canvas-light: #f3f4f6;
+      --bg-canvas-dark: #0e1114;
       --bg-surface-light: #ffffff;
-      --bg-surface-dark: #111827;
-      --bg-elevated-light: #f8fafc;
-      --bg-elevated-dark: #1e293b;
-      --text-main-light: #0f172a;
-      --text-main-dark: #f8fafc;
-      --text-muted-light: #475569;
-      --text-muted-dark: #94a3b8;
-      --border-subtle-light: #cbd5e1;
-      --border-subtle-dark: #334155;
+      --bg-surface-dark: #161a1f;
+      --bg-elevated-light: #e8ecf1;
+      --bg-elevated-dark: #1f252c;
+      --text-main-light: #111827;
+      --text-main-dark: #f3f5f7;
+      --text-muted-light: #4b5563;
+      --text-muted-dark: #9ca7b4;
+      --border-subtle-light: #c9d2dc;
+      --border-subtle-dark: #333c47;
 
-      --accent-light: #0284c7;
+      --brand-ember-light: #c2410c;
+      --brand-ember-dark: #fb923c;
+      --ember-fg-light: #ffffff;
+      --ember-fg-dark: #111315;
+      --accent-light: #0369a1;
       --accent-dark: #38bdf8;
-      --ok-light: #15803d;
+      --accent-fg-light: #ffffff;
+      --accent-fg-dark: #0c1117;
+      --ok-light: #14532d;
       --ok-dark: #4ade80;
-      --warn-light: #b45309;
+      --warn-light: #92400e;
       --warn-dark: #fbbf24;
       --danger-light: #b91c1c;
       --danger-dark: #f87171;
       --violet-light: #6d28d9;
-      --violet-dark: #c084fc;
+      --violet-dark: #e879f9;
+      --teal-light: #0f766e;
+      --teal-dark: #2dd4bf;
 
       --bg-canvas: var(--bg-canvas-light);
       --bg-surface: var(--bg-surface-light);
@@ -918,11 +1133,15 @@ RENDERED_HTML = """<!DOCTYPE html>
       --text-main: var(--text-main-light);
       --text-muted: var(--text-muted-light);
       --border-subtle: var(--border-subtle-light);
+      --brand-ember: var(--brand-ember-light);
+      --ember-fg: var(--ember-fg-light);
       --accent: var(--accent-light);
+      --accent-fg: var(--accent-fg-light);
       --ok: var(--ok-light);
       --warn: var(--warn-light);
       --danger: var(--danger-light);
       --violet: var(--violet-light);
+      --teal: var(--teal-light);
 
       --scrollbar-thumb: #64748b;
       --scrollbar-track: #e2e8f0;
@@ -934,13 +1153,17 @@ RENDERED_HTML = """<!DOCTYPE html>
         --text-main: var(--text-main-dark);
         --text-muted: var(--text-muted-dark);
         --border-subtle: var(--border-subtle-dark);
+        --brand-ember: var(--brand-ember-dark);
+        --ember-fg: var(--ember-fg-dark);
         --accent: var(--accent-dark);
+        --accent-fg: var(--accent-fg-dark);
         --ok: var(--ok-dark);
         --warn: var(--warn-dark);
         --danger: var(--danger-dark);
         --violet: var(--violet-dark);
-        --scrollbar-thumb: #64748b;
-        --scrollbar-track: #0f172a;
+        --teal: var(--teal-dark);
+        --scrollbar-thumb: #9ca7b4;
+        --scrollbar-track: #161a1f;
       }
 
       @supports (color: light-dark(white, black)) {
@@ -950,89 +1173,190 @@ RENDERED_HTML = """<!DOCTYPE html>
         --text-main: light-dark(var(--text-main-light), var(--text-main-dark));
         --text-muted: light-dark(var(--text-muted-light), var(--text-muted-dark));
         --border-subtle: light-dark(var(--border-subtle-light), var(--border-subtle-dark));
+        --brand-ember: light-dark(var(--brand-ember-light), var(--brand-ember-dark));
+        --ember-fg: light-dark(var(--ember-fg-light), var(--ember-fg-dark));
         --accent: light-dark(var(--accent-light), var(--accent-dark));
+        --accent-fg: light-dark(var(--accent-fg-light), var(--accent-fg-dark));
         --ok: light-dark(var(--ok-light), var(--ok-dark));
         --warn: light-dark(var(--warn-light), var(--warn-dark));
         --danger: light-dark(var(--danger-light), var(--danger-dark));
         --violet: light-dark(var(--violet-light), var(--violet-dark));
-        --scrollbar-thumb: light-dark(#64748b, #94a3b8);
-        --scrollbar-track: light-dark(#e2e8f0, #0f172a);
+        --teal: light-dark(var(--teal-light), var(--teal-dark));
+        --scrollbar-thumb: light-dark(#64748b, #9ca7b4);
+        --scrollbar-track: light-dark(#e2e8f0, #161a1f);
       }
 
       accent-color: var(--accent);
       scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
     }
 
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg-canvas: var(--bg-canvas-light);
+      --bg-surface: var(--bg-surface-light);
+      --bg-elevated: var(--bg-elevated-light);
+      --text-main: var(--text-main-light);
+      --text-muted: var(--text-muted-light);
+      --border-subtle: var(--border-subtle-light);
+      --brand-ember: var(--brand-ember-light);
+      --ember-fg: var(--ember-fg-light);
+      --accent: var(--accent-light);
+      --accent-fg: var(--accent-fg-light);
+      --ok: var(--ok-light);
+      --warn: var(--warn-light);
+      --danger: var(--danger-light);
+      --violet: var(--violet-light);
+      --teal: var(--teal-light);
+      --scrollbar-thumb: #64748b;
+      --scrollbar-track: #e2e8f0;
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg-canvas: var(--bg-canvas-dark);
+      --bg-surface: var(--bg-surface-dark);
+      --bg-elevated: var(--bg-elevated-dark);
+      --text-main: var(--text-main-dark);
+      --text-muted: var(--text-muted-dark);
+      --border-subtle: var(--border-subtle-dark);
+      --brand-ember: var(--brand-ember-dark);
+      --ember-fg: var(--ember-fg-dark);
+      --accent: var(--accent-dark);
+      --accent-fg: var(--accent-fg-dark);
+      --ok: var(--ok-dark);
+      --warn: var(--warn-dark);
+      --danger: var(--danger-dark);
+      --violet: var(--violet-dark);
+      --teal: var(--teal-dark);
+      --scrollbar-thumb: #9ca7b4;
+      --scrollbar-track: #161a1f;
+    }
+
     @media (forced-colors: active) {
       :root {
         --border-subtle: CanvasText;
         --accent: Highlight;
+        --accent-fg: HighlightText;
       }
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
+    ::selection {
+      background: color-mix(in oklab, var(--accent), transparent 72%);
+      color: var(--text-main);
+    }
+
     body {
-      font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background-color: var(--bg-canvas);
       color: var(--text-main);
+      caret-color: var(--accent);
       min-block-size: 100dvb;
-      padding-block: 1rem;
-      padding-inline: clamp(0.85rem, 2.5vw, 1.75rem);
+      padding: 12px clamp(10px, 2.2vw, 24px);
       line-height: 1.5;
     }
 
-    .dashboard-shell {
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
+    svg.ico {
+      inline-size: 16px;
+      block-size: 16px;
+      flex-shrink: 0;
+      display: block;
+    }
+
+    code.topic-tag, kbd.key-hint {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      padding: 1px 6px;
+      border-radius: 5px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-main);
+    }
+
+    kbd.key-hint {
+      font-weight: 700;
+      padding: 0 5px;
+      line-height: 1.4;
+      color: var(--text-muted);
+    }
+
+    .src-btn[aria-pressed="true"] kbd.key-hint,
+    .preset-btn[aria-pressed="true"] kbd.key-hint,
+    .cmd-btn[aria-pressed="true"]:not(#btn-sim-pause) kbd.key-hint {
+      color: var(--accent-fg);
+      background: color-mix(in oklab, var(--accent-fg), transparent 85%);
+      border-color: color-mix(in oklab, var(--accent-fg), transparent 65%);
+    }
+
+    #btn-sim-pause[aria-pressed="true"] kbd.key-hint {
+      color: var(--text-main);
+      background: var(--bg-surface);
+      border-color: var(--border-subtle);
+    }
+
+    .page-frame {
       max-inline-size: 1520px;
       margin-inline: auto;
-      display: grid;
-      grid-template-columns: 1fr;
-      grid-template-areas:
-        "topbar"
-        "kpis"
-        "workspace";
-      gap: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
     }
 
     .topbar {
-      grid-area: topbar;
       background: var(--bg-surface);
       border: 1px solid var(--border-subtle);
-      border-radius: 16px;
-      padding-block: 0.75rem;
-      padding-inline: 1.2rem;
+      border-radius: 14px;
+      padding: 10px 16px;
       display: flex;
       flex-wrap: wrap;
-      align-items: safe center;
-      gap: 1rem;
-      box-shadow: 0 4px 20px -4px color-mix(in oklab, var(--text-main), transparent 92%);
+      align-items: center;
+      gap: 10px 14px;
+      box-shadow: 0 4px 18px -6px color-mix(in oklab, var(--text-main), transparent 90%);
     }
 
     .brand-group {
       display: flex;
-      align-items: safe center;
-      gap: 0.85rem;
+      align-items: center;
+      gap: 12px;
     }
 
     .brand-badge {
-      inline-size: 2.5rem;
-      block-size: 2.5rem;
-      border-radius: 12px;
-      background: color-mix(in oklab, var(--accent), transparent 84%);
-      border: 1px solid color-mix(in oklab, var(--accent), transparent 55%);
+      inline-size: 38px;
+      block-size: 38px;
+      border-radius: 10px;
+      background: color-mix(in oklab, var(--brand-ember), transparent 84%);
+      border: 1px solid color-mix(in oklab, var(--brand-ember), transparent 45%);
+      color: var(--brand-ember);
       display: grid;
       place-content: center;
-      font-size: 1.2rem;
+      flex-shrink: 0;
     }
 
     .brand-title {
-      font-size: 1.05rem;
+      font-size: 1.35rem;
       font-weight: 700;
-      letter-spacing: -0.01em;
+      letter-spacing: -0.02em;
+      line-height: 1.2;
+    }
+
+    @media (max-width: 767px) {
+      .brand-title {
+        font-size: 1.3rem;
+      }
     }
 
     .brand-sub {
-      font-size: 0.76rem;
+      font-size: 0.8125rem;
       color: var(--text-muted);
     }
 
@@ -1040,22 +1364,54 @@ RENDERED_HTML = """<!DOCTYPE html>
       margin-inline-start: auto;
       display: flex;
       flex-wrap: wrap;
-      flex-wrap: balance;
-      align-items: safe center;
-      gap: 0.55rem;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .topbar-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .theme-switch {
+      display: inline-flex;
+      padding: 2px;
+      border-radius: 999px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-subtle);
+      gap: 2px;
+    }
+
+    .theme-switch .theme-btn {
+      min-block-size: 30px;
+      padding: 4px 10px;
+      border: none;
+      background: transparent;
     }
 
     .pill-badge {
       display: inline-flex;
-      align-items: safe center;
-      gap: 0.4rem;
-      padding-block: 0.32rem;
-      padding-inline: 0.72rem;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 11px;
       border-radius: 999px;
-      font-size: 0.76rem;
+      font-size: 0.75rem;
       font-weight: 600;
       background: var(--bg-elevated);
       border: 1px solid var(--border-subtle);
+      color: var(--text-main);
+    }
+
+    .pill-badge[hidden] { display: none; }
+
+    .status-dot {
+      inline-size: 8px;
+      block-size: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      flex-shrink: 0;
     }
 
     .pill-badge[data-tone="ok"] {
@@ -1071,163 +1427,370 @@ RENDERED_HTML = """<!DOCTYPE html>
     }
 
     .pill-badge[data-tone="danger"] {
-      background: color-mix(in oklab, var(--danger), transparent 84%);
+      background: color-mix(in oklab, var(--danger), transparent 86%);
       border-color: color-mix(in oklab, var(--danger), transparent 40%);
       color: var(--danger);
     }
 
-    /* KPI Subgrid Section */
+    .pill-badge[data-tone="accent"] {
+      background: color-mix(in oklab, var(--accent), transparent 86%);
+      border-color: color-mix(in oklab, var(--accent), transparent 45%);
+      color: var(--accent);
+    }
+
+    .safety-callout {
+      border-radius: 12px;
+      padding: 10px 14px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-surface);
+      color: var(--text-main);
+    }
+
+    .safety-callout[hidden] { display: none; }
+
+    .safety-callout[data-tone="danger"] {
+      background: color-mix(in oklab, var(--bg-surface), var(--danger) 12%);
+      border-color: color-mix(in oklab, var(--danger), transparent 30%);
+      color: var(--danger);
+    }
+
+    .safety-callout[data-tone="warn"] {
+      background: color-mix(in oklab, var(--bg-surface), var(--warn) 12%);
+      border-color: color-mix(in oklab, var(--warn), transparent 30%);
+      color: var(--warn);
+    }
+
+    .safety-callout[data-tone="accent"] {
+      background: color-mix(in oklab, var(--bg-surface), var(--accent) 12%);
+      border-color: color-mix(in oklab, var(--accent), transparent 30%);
+      color: var(--accent);
+    }
+
+    .callout-msg {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .callout-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .dashboard-shell {
+      display: grid;
+      grid-template-columns: 1fr;
+      grid-template-areas:
+        "kpis"
+        "workspace";
+      gap: 12px;
+    }
+
+    /* KPI Subgrid Section — State & FI emphasized, symmetric breakpoints 6 -> 3 -> 2 */
     .kpi-grid {
       grid-area: kpis;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(205px, 1fr));
+      grid-template-columns: 1.2fr 1.15fr repeat(4, minmax(0, 1fr));
       grid-template-rows: auto 1fr auto;
-      gap: 0.85rem;
+      gap: 10px;
     }
 
     article.kpi-card {
       grid-row: span 3;
       display: grid;
-      grid-template-rows: auto 1fr auto;
       grid-template-rows: subgrid;
-      container: kpi / inline-size;
       container-type: inline-size;
       background: var(--bg-surface);
       border: 1px solid var(--border-subtle);
-      border-radius: 16px;
-      padding-block: 0.9rem;
-      padding-inline: 1.05rem;
-      gap: 0.35rem;
-      box-shadow: 0 2px 10px -2px color-mix(in oklab, var(--text-main), transparent 94%);
+      border-radius: 14px;
+      padding: 10px 12px;
+      gap: 6px;
+      box-shadow: 0 2px 10px -4px color-mix(in oklab, var(--text-main), transparent 92%);
+    }
+
+    article.kpi-card[data-primary="true"] {
+      background: color-mix(in oklab, var(--bg-surface), var(--ok) 5%);
+      border-color: color-mix(in oklab, var(--ok), transparent 48%);
+    }
+
+    article.kpi-card[data-primary="true"][data-tone="warn"] {
+      background: color-mix(in oklab, var(--bg-surface), var(--warn) 8%);
+      border-color: color-mix(in oklab, var(--warn), transparent 35%);
+    }
+
+    article.kpi-card[data-primary="true"][data-tone="danger"] {
+      background: color-mix(in oklab, var(--bg-surface), var(--danger) 11%);
+      border-color: color-mix(in oklab, var(--danger), transparent 25%);
+    }
+
+    article.kpi-card[data-primary="true"][data-tone="idle"] {
+      background: var(--bg-surface);
+      border-color: var(--border-subtle);
     }
 
     article.kpi-card > header {
       display: flex;
-      align-items: safe center;
+      align-items: center;
       justify-content: space-between;
-      font-size: 0.72rem;
-      font-weight: 600;
+      gap: 6px;
+      font-size: 0.75rem;
+      font-weight: 700;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: 0.03em;
       color: var(--text-muted);
     }
 
     .kpi-value {
-      font-size: clamp(1.3rem, 8cqi, 1.8rem);
+      font-family: var(--font-mono);
+      font-size: clamp(1.25rem, 9cqi, 1.75rem);
       font-weight: 700;
       letter-spacing: -0.02em;
       font-variant-numeric: tabular-nums;
       display: flex;
       align-items: baseline;
-      gap: 0.35rem;
+      gap: 5px;
+      flex-wrap: wrap;
     }
 
+    .kpi-meter {
+      inline-size: 100%;
+      block-size: 6px;
+      border-radius: 999px;
+      background: var(--bg-elevated);
+      border: 1px solid color-mix(in oklab, var(--border-subtle), transparent 30%);
+      position: relative;
+      overflow: hidden;
+      margin-block-start: 4px;
+    }
+
+    .kpi-meter-fill {
+      block-size: 100%;
+      border-radius: 999px;
+      inline-size: 0%;
+      background: var(--ok);
+      transition: inline-size 160ms ease, background-color 160ms ease;
+    }
+
+    .fi-tick {
+      position: absolute;
+      inset-block: 0;
+      inline-size: 1.5px;
+      background: var(--text-muted);
+      opacity: 0.7;
+    }
+
+    .kpi-parity-tag {
+      font-size: 0.75rem;
+      font-weight: 700;
+    }
+
+    .kpi-parity-tag[hidden] { display: none; }
+
     .kpi-unit {
-      font-size: 0.8rem;
-      font-weight: 500;
+      font-family: system-ui, sans-serif;
+      font-size: 0.8125rem;
+      font-weight: 600;
       color: var(--text-muted);
     }
 
     article.kpi-card > footer {
-      font-size: 0.74rem;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
       color: var(--text-muted);
       display: flex;
-      align-items: safe center;
+      align-items: center;
       justify-content: space-between;
-      gap: 0.5rem;
-      padding-block-start: 0.25rem;
-      border-block-start: 1px dashed color-mix(in oklab, var(--border-subtle), transparent 35%);
+      gap: 6px;
+      flex-wrap: wrap;
+      padding-block-start: 6px;
+      border-block-start: 1px dashed color-mix(in oklab, var(--border-subtle), transparent 30%);
+      font-variant-numeric: tabular-nums;
     }
 
     .workspace {
       grid-area: workspace;
       display: grid;
-      grid-template-columns: minmax(0, 2.2fr) minmax(340px, 1fr);
-      gap: 1rem;
+      grid-template-columns: minmax(0, 2.15fr) minmax(350px, 1fr);
+      gap: 12px;
       align-items: start;
     }
 
-    @media (max-width: 1080px) {
-      .workspace {
-        grid-template-columns: 1fr;
-      }
+    .control-column {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
     }
 
     .panel-card {
-      container: panel / inline-size;
       container-type: inline-size;
       background: var(--bg-surface);
       border: 1px solid var(--border-subtle);
-      border-radius: 16px;
-      padding: 1.1rem;
+      border-radius: 14px;
+      padding: 14px 16px;
       display: flex;
       flex-direction: column;
-      gap: 0.9rem;
-      box-shadow: 0 4px 20px -4px color-mix(in oklab, var(--text-main), transparent 93%);
+      gap: 10px;
+      box-shadow: 0 4px 18px -6px color-mix(in oklab, var(--text-main), transparent 90%);
     }
 
     .panel-header {
       display: flex;
       flex-wrap: wrap;
-      align-items: safe center;
+      align-items: center;
       justify-content: space-between;
-      gap: 0.65rem;
+      gap: 8px 12px;
     }
 
     .panel-title {
-      font-size: 0.96rem;
+      font-size: 1rem;
       font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .panel-subtitle-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin-block-start: 2px;
+    }
+
+    .preset-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 10px;
+      background: var(--bg-elevated);
+      border: 1px solid color-mix(in oklab, var(--border-subtle), transparent 25%);
+    }
+
+    .preset-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: var(--text-muted);
+    }
+
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px 14px;
+      padding: 4px 2px;
+      font-size: 0.75rem;
+      color: var(--text-main);
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .legend-swatch {
+      inline-size: 18px;
+      block-size: 0;
+      border-block-start: 3px solid currentColor;
+      flex-shrink: 0;
+    }
+
+    .legend-swatch[data-style="dashed"] {
+      border-block-start-style: dashed;
+    }
+
+    .legend-swatch[data-style="dotted"] {
+      border-block-start-style: dotted;
     }
 
     [role="toolbar"] {
       display: flex;
       flex-wrap: wrap;
-      flex-wrap: balance;
-      align-items: safe center;
-      gap: 0.4rem;
+      align-items: center;
+      gap: 6px;
     }
 
     [role="toolbar"] [role="group"] {
       display: flex;
       flex-wrap: wrap;
-      align-items: safe center;
-      gap: 0.35rem;
+      align-items: center;
+      gap: 5px;
     }
 
     [role="separator"][aria-orientation="vertical"] {
       inline-size: 0;
-      block-size: 1.3rem;
+      block-size: 18px;
       border-inline-start: 1px solid var(--border-subtle);
-      margin-inline: 0.15rem;
+      margin-inline: 2px;
     }
 
     .chip-btn, .cmd-btn {
-      min-inline-size: 24px;
-      min-block-size: 30px;
-      padding-block: 0.3rem;
-      padding-inline: 0.68rem;
+      min-inline-size: 32px;
+      min-block-size: 34px;
+      padding: 6px 12px;
       border-radius: 999px;
       border: 1px solid var(--border-subtle);
       background: var(--bg-elevated);
       color: var(--text-main);
-      font-size: 0.74rem;
+      font-size: 0.75rem;
       font-weight: 600;
       cursor: pointer;
       display: inline-flex;
-      align-items: safe center;
-      gap: 0.38rem;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      white-space: nowrap;
     }
 
-    .chip-btn:focus-visible, .cmd-btn:focus-visible, select:focus-visible {
+    .chip-btn[disabled], .cmd-btn[disabled] {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .cmd-btn[aria-busy="true"] {
+      opacity: 0.6;
+      cursor: wait;
+    }
+
+    button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible, [tabindex="0"]:focus-visible {
       outline: 2px solid var(--accent);
       outline-offset: 2px;
     }
 
-    .chip-btn[aria-pressed="true"] {
-      background: color-mix(in oklab, var(--chip-color, var(--accent)), transparent 82%);
+    .src-btn[aria-pressed="true"],
+    .spd-btn[aria-pressed="true"],
+    .tgt-btn[aria-pressed="true"],
+    .preset-btn[aria-pressed="true"],
+    .theme-btn[aria-pressed="true"],
+    .win-btn[aria-pressed="true"] {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-fg);
+      font-weight: 700;
+    }
+
+    .layer-btn[aria-pressed="true"],
+    #btn-toggle-layers[aria-expanded="true"],
+    #btn-sim-pause[aria-pressed="true"] {
+      background: color-mix(in oklab, var(--chip-color, var(--accent)), transparent 74%);
       border-color: var(--chip-color, var(--accent));
       color: var(--text-main);
       box-shadow: inset 0 0 0 1px var(--chip-color, var(--accent));
+      font-weight: 700;
     }
 
     .chip-dot {
@@ -1235,6 +1798,54 @@ RENDERED_HTML = """<!DOCTYPE html>
       block-size: 8px;
       border-radius: 50%;
       background: var(--chip-color, var(--accent));
+      flex-shrink: 0;
+    }
+
+    .compact-drawer {
+      border-radius: 10px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-elevated);
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .compact-drawer[hidden] { display: none; }
+
+    details.drawer-card > summary {
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 0.875rem;
+      font-weight: 700;
+      color: var(--text-main);
+      user-select: none;
+    }
+
+    details.drawer-card > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .drawer-chev {
+      transition: transform 150ms ease;
+      color: var(--text-muted);
+    }
+
+    details[open] .drawer-chev {
+      transform: rotate(180deg);
+    }
+
+    .drawer-body {
+      margin-block-start: 8px;
+      padding-block-start: 10px;
+      border-block-start: 1px dashed var(--border-subtle);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
     }
 
     .canvas-wrap {
@@ -1243,24 +1854,26 @@ RENDERED_HTML = """<!DOCTYPE html>
 
     .offline-banner {
       position: absolute;
-      inset-block-start: 0.6rem;
-      inset-inline: 0.6rem;
-      z-index: 2;
-      padding-block: 0.5rem;
-      padding-inline: 0.85rem;
+      inset-block-start: 10px;
+      inset-inline: 10px;
+      z-index: 3;
+      padding: 8px 14px;
       border-radius: 10px;
-      font-size: 0.82rem;
+      font-size: 0.8125rem;
       font-weight: 700;
-      text-align: center;
-      pointer-events: none;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      pointer-events: auto;
       color: var(--danger);
       background: color-mix(in oklab, var(--bg-surface), var(--danger) 14%);
       border: 1px solid color-mix(in oklab, var(--danger), transparent 35%);
     }
 
     .offline-banner[hidden] { display: none; }
-
-    .canvas-wrap.is-stale canvas { opacity: 0.45; }
+    .canvas-wrap.is-stale canvas { opacity: 0.42; }
 
     canvas.chart-stage {
       display: block;
@@ -1270,58 +1883,132 @@ RENDERED_HTML = """<!DOCTYPE html>
       border: 1px solid var(--border-subtle);
       border-radius: 12px;
       cursor: crosshair;
+      touch-action: pan-y;
     }
 
     canvas.subchart-stage {
       display: block;
       inline-size: 100%;
-      block-size: 130px;
+      block-size: 150px;
       background: var(--bg-elevated);
       border: 1px solid var(--border-subtle);
       border-radius: 12px;
+      cursor: crosshair;
+      touch-action: pan-y;
     }
 
     .cmd-grid {
       display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 0.5rem;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
     }
 
     .cmd-btn {
       border-radius: 10px;
-      justify-content: center;
-      min-block-size: 38px;
-      font-size: 0.8rem;
+      min-block-size: 40px;
+      padding: 8px 10px;
+      font-size: 0.75rem;
     }
 
     .cmd-btn[aria-pressed="true"] {
       background: var(--accent);
       border-color: var(--accent);
-      color: #ffffff;
+      color: var(--accent-fg);
+      font-weight: 700;
+    }
+
+    .btn-primary {
+      background: var(--brand-ember);
+      border-color: var(--brand-ember);
+      color: var(--ember-fg);
+      font-weight: 700;
     }
 
     .cmd-btn[data-variant="danger"] {
-      border-color: color-mix(in oklab, var(--danger), transparent 40%);
+      border-color: color-mix(in oklab, var(--danger), transparent 35%);
       color: var(--danger);
+      background: color-mix(in oklab, var(--bg-elevated), var(--danger) 8%);
+    }
+
+    .reset-zone {
+      padding-block-start: 10px;
+      border-block-start: 1px dashed var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .exec-top {
+      display: grid;
+      grid-template-columns: 1.3fr 1fr 1fr;
+      gap: 8px;
+    }
+
+    .sim-zone {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: var(--bg-elevated);
+      border: 1px solid color-mix(in oklab, var(--border-subtle), transparent 20%);
+    }
+
+    .sim-active-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      font-size: 0.8125rem;
+      font-weight: 600;
+    }
+
+    .sim-active-bar[hidden], #sim-config-fields[hidden] { display: none; }
+
+    .shortcut-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+      gap: 6px 12px;
+      margin-block-start: 8px;
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+    }
+
+    .shortcut-grid strong {
+      color: var(--text-main);
+    }
+
+    .sim-zone-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
     }
 
     .op-list {
       display: flex;
       flex-direction: column;
-      gap: 0.55rem;
+      gap: 8px;
     }
 
     .op-row {
       display: flex;
-      align-items: safe center;
+      flex-wrap: wrap;
+      align-items: center;
       justify-content: space-between;
-      gap: 0.65rem;
-      padding-block: 0.45rem;
-      padding-inline: 0.7rem;
-      border-radius: 10px;
-      background: var(--bg-elevated);
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: var(--bg-surface);
       border: 1px solid color-mix(in oklab, var(--border-subtle), transparent 35%);
-      font-size: 0.8rem;
+      font-size: 0.8125rem;
     }
 
     .op-select {
@@ -1329,20 +2016,79 @@ RENDERED_HTML = """<!DOCTYPE html>
       color: var(--text-main);
       border: 1px solid var(--border-subtle);
       border-radius: 8px;
-      padding: 0.28rem 0.55rem;
-      font-size: 0.78rem;
+      padding: 6px 10px;
+      font-size: 0.75rem;
       font-weight: 600;
+      min-block-size: 34px;
+      max-inline-size: 100%;
     }
 
-    input[type="checkbox"][switch] {
-      accent-color: var(--accent);
-      inline-size: 1.15rem;
-      block-size: 1.15rem;
+    .hils-hint {
+      font-size: 0.75rem;
+      color: var(--warn);
+      background: color-mix(in oklab, var(--warn), transparent 88%);
+      border: 1px solid color-mix(in oklab, var(--warn), transparent 50%);
+      border-radius: 8px;
+      padding: 6px 10px;
+    }
+
+    .hils-hint[hidden] { display: none; }
+
+    .touch-label {
+      font-size: 0.75rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
       cursor: pointer;
     }
 
+    /* Custom accessible switch pill preserving input[type="checkbox"][switch] */
+    input[type="checkbox"][switch] {
+      appearance: none;
+      -webkit-appearance: none;
+      position: relative;
+      inline-size: 40px;
+      block-size: 22px;
+      border-radius: 999px;
+      background: color-mix(in oklab, var(--text-muted), transparent 62%);
+      border: 1px solid var(--border-subtle);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    input[type="checkbox"][switch]::before {
+      content: "";
+      position: absolute;
+      inset-block-start: 2px;
+      inset-inline-start: 2px;
+      inline-size: 16px;
+      block-size: 16px;
+      border-radius: 50%;
+      background: #ffffff;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+    }
+
+    input[type="checkbox"][switch]:checked {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    input[type="checkbox"][switch]:checked::before {
+      inset-inline-start: 20px;
+      background: var(--accent-fg);
+    }
+
+    @media (forced-colors: active) {
+      input[type="checkbox"][switch] {
+        appearance: auto;
+      }
+      input[type="checkbox"][switch]::before {
+        display: none;
+      }
+    }
+
     .mqtt-stream {
-      max-block-size: 210px;
+      max-block-size: 200px;
       overflow-y: auto;
       scrollbar-gutter: stable;
       overscroll-behavior: contain;
@@ -1351,12 +2097,12 @@ RENDERED_HTML = """<!DOCTYPE html>
       background: var(--bg-elevated);
       border: 1px solid var(--border-subtle);
       border-radius: 10px;
-      padding: 0.65rem;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 0.72rem;
+      padding: 10px;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
       display: flex;
       flex-direction: column;
-      gap: 0.3rem;
+      gap: 4px;
     }
 
     @supports not (scrollbar-color: auto) {
@@ -1376,329 +2122,710 @@ RENDERED_HTML = """<!DOCTYPE html>
     .log-line {
       white-space: pre-wrap;
       word-break: break-all;
-      border-block-end: 1px solid color-mix(in oklab, var(--border-subtle), transparent 70%);
-      padding-block-end: 0.2rem;
+      border-block-end: 1px solid color-mix(in oklab, var(--border-subtle), transparent 65%);
+      padding-block-end: 3px;
+    }
+
+    .glossary-list {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      margin-block-start: 10px;
+    }
+
+    .glossary-list strong {
+      color: var(--text-main);
+    }
+
+    dialog.confirm-modal {
+      margin: auto;
+      max-inline-size: min(440px, calc(100vw - 32px));
+      border-radius: 14px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-surface);
+      color: var(--text-main);
+      padding: 20px;
+      box-shadow: 0 20px 40px -12px rgba(0, 0, 0, 0.38);
+    }
+
+    dialog.help-modal {
+      max-inline-size: min(620px, calc(100vw - 32px));
+      max-block-size: min(84dvh, 720px);
+      overflow-y: auto;
+    }
+
+    dialog.confirm-modal::backdrop {
+      background: rgba(14, 17, 20, 0.65);
+    }
+
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-block-start: 16px;
+    }
+
+    .toast-region {
+      position: fixed;
+      inset-block-end: 16px;
+      inset-inline-end: 16px;
+      z-index: 30;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-inline-size: min(360px, calc(100vw - 32px));
+      pointer-events: none;
+    }
+
+    .toast {
+      pointer-events: auto;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      background: var(--bg-surface);
+      color: var(--text-main);
+      border: 1px solid var(--border-subtle);
+      box-shadow: 0 8px 24px -6px rgba(0, 0, 0, 0.24);
+    }
+
+    .toast[data-tone="ok"] {
+      border-color: var(--ok);
+      color: var(--ok);
+    }
+
+    .toast[data-tone="danger"] {
+      border-color: var(--danger);
+      color: var(--danger);
+    }
+
+    .toast[data-tone="warn"] {
+      border-color: var(--warn);
+      color: var(--warn);
+    }
+
+    .mobile-dock {
+      display: none;
+    }
+
+    @media (max-width: 1279px) {
+      .kpi-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-rows: none;
+      }
+      article.kpi-card {
+        grid-row: auto;
+        grid-template-rows: auto 1fr auto;
+      }
+      .workspace {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 767px) {
+      body {
+        padding-block-end: calc(74px + env(safe-area-inset-bottom));
+      }
+      .topbar {
+        padding: 8px 10px;
+        gap: 6px 8px;
+      }
+      .topbar .brand-sub, .override-card-sub, #cmd-toolbar {
+        display: none;
+      }
+      .brand-badge {
+        inline-size: 32px;
+        block-size: 32px;
+      }
+      .status-cluster {
+        margin-inline-start: 0;
+      }
+      .kpi-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+      article.kpi-card {
+        padding: 10px 11px;
+      }
+      .cmd-grid {
+        grid-template-columns: 1fr;
+      }
+      .exec-top {
+        grid-template-columns: 1fr 1fr;
+      }
+      .exec-top #btn-sim-start {
+        grid-column: span 2;
+      }
+      canvas.chart-stage {
+        block-size: 250px;
+      }
+      canvas.subchart-stage {
+        block-size: 132px;
+      }
+      .mobile-dock {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 6px;
+        position: fixed;
+        inset-block-end: 0;
+        inset-inline: 0;
+        z-index: 25;
+        padding: 8px 10px max(8px, env(safe-area-inset-bottom));
+        background: var(--bg-surface);
+        border-block-start: 1px solid var(--border-subtle);
+        box-shadow: 0 -6px 20px -6px color-mix(in oklab, var(--text-main), transparent 85%);
+      }
+      .mobile-dock .cmd-btn {
+        min-block-size: 44px;
+        padding: 6px 4px;
+        font-size: 0.75rem;
+      }
+      .toast-region {
+        inset-block-end: calc(68px + env(safe-area-inset-bottom));
+      }
+    }
+
+    @media (pointer: coarse) {
+      .chip-btn, .cmd-btn, .op-select, .touch-label, .theme-switch .theme-btn, details.drawer-card > summary {
+        min-block-size: 44px;
+      }
+      .chip-btn {
+        padding: 8px 12px;
+      }
     }
 
     @media (hover: hover) and (prefers-reduced-motion: no-preference) {
-      .chip-btn, .cmd-btn {
-        transition: background-color 140ms ease, border-color 140ms ease;
+      .chip-btn, .cmd-btn, input[type="checkbox"][switch]::before {
+        transition: background-color 140ms ease, border-color 140ms ease, inset-inline-start 140ms ease;
       }
-      .chip-btn:hover, .cmd-btn:hover {
+      .chip-btn:hover:not([disabled]), .cmd-btn:hover:not([disabled]) {
         border-color: var(--accent);
       }
     }
   </style>
 </head>
 <body>
-  <main class="dashboard-shell">
+  <div id="safety-live" class="sr-only" role="status" aria-live="assertive" aria-atomic="true"></div>
+  <div id="toast-region" class="toast-region"></div>
+
+  <div class="page-frame">
     <header class="topbar">
       <div class="brand-group">
-        <div class="brand-badge" aria-hidden="true">🔥</div>
+        <div class="brand-badge" aria-hidden="true">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2c.5 4-3 6-3 10a5 5 0 0 0 10 0c0-3-2-5.5-4-8"/><path d="M9 14a3 3 0 0 0 6 0"/></svg>
+        </div>
         <div>
-          <h1 class="brand-title">Karhutla Edge-IoT — Telemetry &amp; Command Center</h1>
-          <p class="brand-sub">Monitor Real-time SITL / HILS / Field Node • Broker Port 6669 • Modern Web UI</p>
+          <h1 class="brand-title">Karhutla Edge-IoT — Pusat Telemetri &amp; Kendali</h1>
+          <p class="brand-sub">Monitor Real-time SITL, HILS &amp; Node Lapangan • Broker Port 6669</p>
         </div>
       </div>
 
       <div class="status-cluster">
-        <span id="badge-broker" class="pill-badge" data-tone="ok">
-          <span aria-hidden="true">●</span> <span id="txt-broker">Broker :6669 Connected</span>
+        <span id="badge-broker" class="pill-badge" data-tone="warn">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="txt-broker">Broker :6669: memeriksa...</span>
         </span>
-        <span id="badge-node" class="pill-badge" data-tone="warn">
-          <span id="ico-node" aria-hidden="true">○</span> <span id="txt-node">ESP32: belum terdeteksi</span>
+        <span id="badge-node" class="pill-badge">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="txt-node">ESP32: siaga</span>
         </span>
-        <span id="badge-fsm" class="pill-badge" data-tone="ok">
-          <span id="ico-fsm" aria-hidden="true">✓</span> <span id="txt-fsm">FSM: NORMAL</span>
+        <span id="badge-fsm" class="pill-badge">
+          <svg id="ico-fsm-svg" class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+          <span id="txt-fsm">FSM: SIAGA</span>
         </span>
-        <span class="pill-badge">
-          <span aria-hidden="true">⏺</span> <span id="txt-logfile">logs/mqtt.log</span>
-        </span>
+      </div>
+
+      <div class="topbar-actions">
+        <div class="theme-switch" role="group" aria-label="Pilih Tema Tampilan">
+          <button type="button" class="chip-btn theme-btn" data-theme-val="light" aria-pressed="false" title="Tema Proyektor Terang">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+            Terang
+          </button>
+          <button type="button" class="chip-btn theme-btn" data-theme-val="dark" aria-pressed="false" title="Tema Gelap Laboratorium">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+            Gelap
+          </button>
+        </div>
+        <button type="button" class="chip-btn" id="btn-open-help" title="Buka Glosarium Metrik dan Pintasan Keyboard">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          Glosarium <kbd class="key-hint">?</kbd>
+        </button>
       </div>
     </header>
 
-    <!-- 6 KPI Cards aligned via CSS Subgrid -->
-    <section class="kpi-grid" aria-label="Indikator Utama Sensor dan Aktuator">
-      <article class="kpi-card">
-        <header>
-          <span>State FSM &amp; Mode</span>
-          <span id="kpi-state-ico" aria-hidden="true">✓</span>
-        </header>
-        <div id="kpi-state" class="kpi-value" style="color:var(--ok);">NORMAL</div>
-        <footer>
-          <span>Mode: <strong id="kpi-mode">AUTO</strong></span>
-          <span>t = <span id="kpi-t">0</span>s (#<span id="kpi-seq">0</span>)</span>
-        </footer>
-      </article>
-
-      <article class="kpi-card">
-        <header>
-          <span>Fusion Index (FI)</span>
-          <span aria-hidden="true">📈</span>
-        </header>
-        <div class="kpi-value">
-          <span id="kpi-fi">0.0</span> <span class="kpi-unit">µg/m³</span>
-        </div>
-        <footer>
-          <span>Waspada ≥ 55</span>
-          <span>Bahaya ≥ 150</span>
-        </footer>
-      </article>
-
-      <article class="kpi-card">
-        <header>
-          <span>PM-proxy Kalman</span>
-          <span aria-hidden="true">🌫️</span>
-        </header>
-        <div class="kpi-value" style="color:var(--accent);">
-          <span id="kpi-pm">0.0</span> <span class="kpi-unit">µg/m³</span>
-        </div>
-        <footer>
-          <span>Raw: <span id="kpi-pmraw">0.0</span></span>
-          <span>dC/dt: <span id="kpi-dcdt">+0.00</span>/s</span>
-        </footer>
-      </article>
-
-      <article class="kpi-card">
-        <header>
-          <span>Gas MQ-135 &amp; Skor g</span>
-          <span aria-hidden="true">🧪</span>
-        </header>
-        <div class="kpi-value" style="color:var(--violet);">
-          <span id="kpi-ppm">400</span> <span class="kpi-unit">ppm</span>
-        </div>
-        <footer>
-          <span>Skor g: <span id="kpi-g">0.00</span></span>
-          <span>V0: <span id="kpi-v0">0.600</span>V</span>
-        </footer>
-      </article>
-
-      <article class="kpi-card">
-        <header>
-          <span>Prakiraan AI (t+60s)</span>
-          <span aria-hidden="true">🤖</span>
-        </header>
-        <div class="kpi-value" style="color:var(--danger);">
-          <span id="kpi-fc">0.0</span> <span class="kpi-unit">µg/m³</span>
-        </div>
-        <footer>
-          <span>ETA Bahaya: <strong id="kpi-eta">-</strong></span>
-          <span>MAE: <span id="kpi-mae">-</span></span>
-        </footer>
-      </article>
-
-      <article class="kpi-card">
-        <header>
-          <span>Aktuator Kipas PWM</span>
-          <span aria-hidden="true">🌀</span>
-        </header>
-        <div class="kpi-value" style="color:var(--ok);">
-          <span id="kpi-duty">0.0</span> <span class="kpi-unit">%</span>
-        </div>
-        <footer>
-          <span>Vd: <span id="kpi-vd">0.60</span>V</span>
-          <span>Vm: <span id="kpi-vm">1.00</span>V</span>
-        </footer>
-      </article>
-    </section>
-
-    <section class="workspace">
-      <!-- Left: Multi-Overlay Chart -->
-      <div class="panel-card">
-        <div class="panel-header">
-          <div>
-            <h2 class="panel-title">Grafik Multi-Overlay Real-Time (Klik untuk Toggle Layer)</h2>
-            <p class="brand-sub">Sumber data: <strong id="src-label">SITL</strong> • Arahkan kursor pada grafik untuk melihat detail semua nilai pada detik tersebut</p>
-          </div>
-
-          <div role="toolbar" focusgroup="toolbar wrap" aria-label="Pengaturan Jendela Waktu dan Ekspor">
-            <div role="group" aria-label="Sumber Data">
-              <button type="button" class="chip-btn src-btn" data-src="auto" aria-pressed="true">Otomatis</button>
-              <button type="button" class="chip-btn src-btn" data-src="esp32" aria-pressed="false" style="--chip-color:#4ade80;">ESP32</button>
-              <button type="button" class="chip-btn src-btn" data-src="sitl" aria-pressed="false" style="--chip-color:#38bdf8;">SITL</button>
-            </div>
-            <span role="separator" aria-orientation="vertical"></span>
-            <div role="group" aria-label="Rentang Waktu">
-              <button type="button" class="chip-btn win-btn" data-win="120" aria-pressed="false">120s</button>
-              <button type="button" class="chip-btn win-btn" data-win="300" aria-pressed="true">300s</button>
-              <button type="button" class="chip-btn win-btn" data-win="900" aria-pressed="false">900s</button>
-              <button type="button" class="chip-btn win-btn" data-win="0" aria-pressed="false">Semua</button>
-            </div>
-            <span role="separator" aria-orientation="vertical"></span>
-            <button type="button" class="chip-btn" id="btn-export-png" title="Unduh gambar grafik PNG">⬇ PNG</button>
-            <button type="button" class="chip-btn" id="btn-export-mobile" title="Unduh file JSON konfigurasi siap-import untuk aplikasi HP">📱 Import HP (.json)</button>
-          </div>
-        </div>
-
-        <!-- Overlay Layer Toggles Toolbar -->
-        <div role="toolbar" focusgroup="toolbar wrap" aria-label="Filter Layer Overlay Grafik" id="overlay-toolbar">
-          <div role="group" aria-label="Kurva Utama">
-            <button type="button" class="chip-btn layer-btn" data-layer="fi" aria-pressed="true" style="--chip-color:#f87171;">
-              <span class="chip-dot" aria-hidden="true"></span> Fusion Index (FI)
-            </button>
-            <button type="button" class="chip-btn layer-btn" data-layer="pm" aria-pressed="true" style="--chip-color:#38bdf8;">
-              <span class="chip-dot" aria-hidden="true"></span> PM-proxy Kalman
-            </button>
-            <button type="button" class="chip-btn layer-btn" data-layer="pm_true" aria-pressed="true" style="--chip-color:#4ade80;">
-              <span class="chip-dot" aria-hidden="true"></span> PM Plant (True)
-            </button>
-            <button type="button" class="chip-btn layer-btn" data-layer="pm_raw" aria-pressed="false" style="--chip-color:#94a3b8;">
-              <span class="chip-dot" aria-hidden="true"></span> PM Raw (Median)
-            </button>
-            <button type="button" class="chip-btn layer-btn" data-layer="forecast" aria-pressed="true" style="--chip-color:#fbbf24;">
-              <span class="chip-dot" aria-hidden="true"></span> AI Forecast (t+60s)
-            </button>
-          </div>
-          <span role="separator" aria-orientation="vertical"></span>
-          <div role="group" aria-label="Kurva Gas dan Tegangan">
-            <button type="button" class="chip-btn layer-btn" data-layer="gas_ppm" aria-pressed="false" style="--chip-color:#c084fc;">
-              <span class="chip-dot" aria-hidden="true"></span> Gas MQ-135 (ppm×0.2)
-            </button>
-            <button type="button" class="chip-btn layer-btn" data-layer="g_scaled" aria-pressed="true" style="--chip-color:#a855f7;">
-              <span class="chip-dot" aria-hidden="true"></span> Skor Gas (g×100)
-            </button>
-            <button type="button" class="chip-btn layer-btn" data-layer="voltages" aria-pressed="false" style="--chip-color:#2dd4bf;">
-              <span class="chip-dot" aria-hidden="true"></span> Tegangan Sensor (V×50)
-            </button>
-            <button type="button" class="chip-btn layer-btn" data-layer="thresholds" aria-pressed="true" style="--chip-color:#fb923c;">
-              <span class="chip-dot" aria-hidden="true"></span> Garis Ambang (55 / 150)
-            </button>
-          </div>
-        </div>
-
-        <div class="canvas-wrap" id="main-wrap">
-          <div id="esp-banner" class="offline-banner" role="status" hidden></div>
-          <canvas id="main-chart" class="chart-stage" width="960" height="320" aria-label="Grafik Utama Multi-Overlay"></canvas>
-        </div>
-
-        <div class="canvas-wrap">
-          <canvas id="sub-chart" class="subchart-stage" width="960" height="130" aria-label="Sub-Grafik Sinkron Duty Kipas dan State FSM"></canvas>
-        </div>
+    <div id="safety-callout" class="safety-callout" role="status" hidden>
+      <div class="callout-msg">
+        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span id="safety-callout-text"></span>
       </div>
+      <div id="safety-callout-actions" class="callout-actions"></div>
+    </div>
 
-      <!-- Right: Actuator Override, Embedded SITL Operations, Live MQTT Log -->
-      <aside class="panel-card" aria-label="Panel Kontrol dan Operasi">
-        <div>
-          <h2 class="panel-title">Kontrol Override Aktuator (`karhutla/cmd`)</h2>
-          <p class="brand-sub">Mengirim perintah ke SITL / HILS / ESP32 dan langsung memperbarui kipas</p>
-        </div>
+    <main class="dashboard-shell">
+      <!-- 6 KPI Cards aligned via CSS Subgrid with Domain-Accurate Sensor Grouping & Micro-Instruments -->
+      <section class="kpi-grid" aria-label="Indikator Utama Sensor dan Aktuator">
+        <article class="kpi-card" id="card-state" data-primary="true" data-tone="idle">
+          <header>
+            <span>State FSM &amp; Mode</span>
+            <span class="pill-badge" id="kpi-src-tag">SITL</span>
+          </header>
+          <div id="kpi-state" class="kpi-value" style="color:var(--text-muted);">SIAGA</div>
+          <footer>
+            <span>Mode: <strong id="kpi-mode">--</strong> • t=<span id="kpi-t">0</span>s (#<span id="kpi-seq">0</span>)</span>
+            <span id="kpi-parity-wrap" class="kpi-parity-tag" hidden>Paritas: <strong id="kpi-parity">-</strong></span>
+          </footer>
+        </article>
 
-        <div role="toolbar" focusgroup="toolbar wrap" aria-label="Perintah Override Kipas" class="cmd-grid" id="cmd-toolbar">
-          <button type="button" class="cmd-btn" data-cmd="AUTO" aria-pressed="true">
-            <span aria-hidden="true">🤖</span> AUTO (FSM)
-          </button>
-          <button type="button" class="cmd-btn" data-cmd="FORCE_MAX" aria-pressed="false">
-            <span aria-hidden="true">🚀</span> FORCE MAX (100%)
-          </button>
-          <button type="button" class="cmd-btn" data-cmd="FORCE_OFF" aria-pressed="false">
-            <span aria-hidden="true">⏹</span> FORCE OFF (0%)
-          </button>
-          <button type="button" class="cmd-btn" data-cmd="RESET" data-variant="danger">
-            <span aria-hidden="true">↺</span> RESET SISTEM
-          </button>
-        </div>
-
-        <div style="border-block-start:1px solid var(--border-subtle);padding-block-start:0.75rem;">
-          <div style="display:flex;justify-content:space-between;align-items:safe center;">
-            <div>
-              <h2 class="panel-title">Operasi Simulasi SITL / HILS Terpadu</h2>
-              <p class="brand-sub">Jalankan skenario ke SITL Python maupun HILS ESP32</p>
-            </div>
-            <span id="badge-sim-state" class="pill-badge">IDLE</span>
-          </div>
-        </div>
-
-        <div class="op-list">
-          <div class="op-row">
-            <span>Target Eksekusi</span>
-            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Target Runner Simulasi" id="target-toolbar">
-              <button type="button" class="chip-btn tgt-btn" data-target="sitl" aria-pressed="true">SITL (Python)</button>
-              <button type="button" class="chip-btn tgt-btn" data-target="hils" aria-pressed="false">HILS (ESP32)</button>
-            </div>
-          </div>
-
-          <div class="op-row">
-            <label for="sel-scenario">Skenario Ruang Asap</label>
-            <select id="sel-scenario" class="op-select">
-              <option value="flaming" selected>flaming (Api Cepat)</option>
-              <option value="smolder">smolder (membara Lambat)</option>
-              <option value="clean">clean (Udara Bersih)</option>
-              <option value="fault">fault (Uji Putus Sensor t=200-230s)</option>
-            </select>
-          </div>
-
-          <div class="op-row">
-            <span>Kontrol Eksekusi</span>
-            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Kontrol Runner SITL">
-              <button type="button" class="chip-btn" id="btn-sim-start" style="--chip-color:#4ade80;" aria-pressed="false">▶ Mulai</button>
-              <button type="button" class="chip-btn" id="btn-sim-pause" aria-pressed="false">⏸ Jeda</button>
-              <button type="button" class="chip-btn" id="btn-sim-stop" aria-pressed="false">⏹ Berhenti</button>
-              <button type="button" class="chip-btn" id="btn-sim-clear" aria-pressed="false">🗑 Bersihkan</button>
-            </div>
-          </div>
-
-          <div class="op-row">
-            <span>Kecepatan Simulasi</span>
-            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Kecepatan Simulasi" id="speed-toolbar">
-              <button type="button" class="chip-btn spd-btn" data-speed="1" aria-pressed="true">1x</button>
-              <button type="button" class="chip-btn spd-btn" data-speed="2" aria-pressed="false">2x</button>
-              <button type="button" class="chip-btn spd-btn" data-speed="5" aria-pressed="false">5x</button>
-              <button type="button" class="chip-btn spd-btn" data-speed="10" aria-pressed="false">10x</button>
-              <button type="button" class="chip-btn spd-btn" data-speed="20" aria-pressed="false">20x</button>
-            </div>
-          </div>
-
-          <label class="op-row" for="sw-preempt" style="cursor:pointer;">
-            <span>AI Preempt (`FORCE_MAX` Proaktif Dini)</span>
-            <input id="sw-preempt" type="checkbox" switch>
-          </label>
-
-          <label class="op-row" for="sw-fault" style="cursor:pointer;">
-            <span>Injeksi Putus Kabel Sensor Debu (`FAILSAFE`)</span>
-            <input id="sw-fault" type="checkbox" switch>
-          </label>
-        </div>
-
-        <div style="border-block-start:1px solid var(--border-subtle);padding-block-start:0.75rem;display:flex;justify-content:space-between;align-items:safe center;">
+        <article class="kpi-card" id="card-fi" data-primary="true" data-tone="idle">
+          <header>
+            <span>Fusion Index (FI)</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          </header>
           <div>
-            <h2 class="panel-title">Live MQTT Stream (`:6669`)</h2>
-            <p class="brand-sub">Tercatat otomatis di `logs/mqtt_YYYY-MM-DD.log`</p>
+            <div id="kpi-fi-wrap" class="kpi-value" style="color:var(--text-muted);">
+              <span id="kpi-fi">--</span> <span class="kpi-unit">µg/m³</span>
+            </div>
+            <div class="kpi-meter" aria-hidden="true">
+              <div id="fi-meter-fill" class="kpi-meter-fill"></div>
+              <span class="fi-tick" style="inset-inline-start:22%;"></span>
+              <span class="fi-tick" style="inset-inline-start:60%;"></span>
+            </div>
           </div>
-          <label style="font-size:0.74rem;display:flex;align-items:safe center;gap:0.35rem;cursor:pointer;">
-            <span>Auto-scroll</span>
-            <input id="sw-autoscroll" type="checkbox" switch checked>
-          </label>
+          <footer>
+            <span>Waspada ≥ 55</span>
+            <span>Bahaya ≥ 150</span>
+          </footer>
+        </article>
+
+        <article class="kpi-card">
+          <header>
+            <span>PM-proxy Kalman</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M8 19h8"/><path d="M6 22h10"/></svg>
+          </header>
+          <div class="kpi-value" style="color:var(--accent);">
+            <span id="kpi-pm">--</span> <span class="kpi-unit">µg/m³</span>
+          </div>
+          <footer>
+            <span>Raw:<span id="kpi-pmraw">--</span> • dC/dt:<span id="kpi-dcdt">0.00</span></span>
+            <span>Vd:<span id="kpi-vd">--</span>V (V0:<span id="kpi-v0">--</span>)</span>
+          </footer>
+        </article>
+
+        <article class="kpi-card">
+          <header>
+            <span>Gas MQ-135 &amp; Skor g</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 2v7.527a2 2 0 0 1-.211.896L4.72 20.55a1 1 0 0 0 .9 1.45h12.76a1 1 0 0 0 .9-1.45l-5.069-10.127A2 2 0 0 1 14 9.527V2"/><path d="M8.5 2h7"/></svg>
+          </header>
+          <div class="kpi-value" style="color:var(--teal);">
+            <span id="kpi-ppm">--</span> <span class="kpi-unit">ppm</span>
+          </div>
+          <footer>
+            <span>Skor g: <span id="kpi-g">--</span></span>
+            <span>Vm: <span id="kpi-vm">--</span>V</span>
+          </footer>
+        </article>
+
+        <article class="kpi-card">
+          <header>
+            <span>Prakiraan AI (t+60s)</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+          </header>
+          <div id="kpi-fc-wrap" class="kpi-value" style="color:var(--text-muted);">
+            <span id="kpi-fc">--</span> <span class="kpi-unit">µg/m³</span>
+          </div>
+          <footer>
+            <span>ETA Bahaya: <strong id="kpi-eta">-</strong></span>
+            <span>MAE: <span id="kpi-mae">-</span></span>
+          </footer>
+        </article>
+
+        <article class="kpi-card">
+          <header>
+            <span>Aktuator Kipas PWM</span>
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 12c-2-2.67-6-2.67-6 0a4 4 0 0 0 6 0Zm0 0c2.67-2 2.67-6 0-6a4 4 0 0 0 0 6Zm0 0c2 2.67 6 2.67 6 0a4 4 0 0 0-6 0Zm0 0c-2.67 2-2.67 6 0 6a4 4 0 0 0 0-6Z"/></svg>
+          </header>
+          <div>
+            <div id="kpi-duty-wrap" class="kpi-value" style="color:var(--text-muted);">
+              <span id="kpi-duty">--</span> <span class="kpi-unit">%</span>
+            </div>
+            <div class="kpi-meter" aria-hidden="true">
+              <div id="pwm-meter-fill" class="kpi-meter-fill"></div>
+            </div>
+          </div>
+          <footer>
+            <span>Kendali: <strong id="kpi-fan-ctrl">--</strong></span>
+            <span>Target: <strong id="kpi-fan-src">SITL</strong></span>
+          </footer>
+        </article>
+      </section>
+
+      <section class="workspace">
+        <!-- Left: Multi-Overlay Chart -->
+        <div class="panel-card">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Grafik Multi-Overlay Real-Time</h2>
+              <div class="panel-subtitle-row">
+                <p class="brand-sub">Sumber: <strong id="src-label">SITL (simulasi)</strong></p>
+                <span id="parity-badge" class="pill-badge" data-tone="ok" hidden>Paritas HILS: -</span>
+              </div>
+            </div>
+
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Sumber Data, Rentang Waktu, dan Ekspor">
+              <div role="group" aria-label="Sumber Data">
+                <button type="button" class="chip-btn src-btn" data-src="auto" aria-pressed="true">Otomatis</button>
+                <button type="button" class="chip-btn src-btn" data-src="esp32" aria-pressed="false">ESP32</button>
+                <button type="button" class="chip-btn src-btn" data-src="sitl" aria-pressed="false">SITL</button>
+              </div>
+              <select id="sel-window" class="op-select" aria-label="Rentang Waktu Grafik">
+                <option value="120">120 dtk</option>
+                <option value="300" selected>300 dtk</option>
+                <option value="900">900 dtk</option>
+                <option value="0">Semua</option>
+              </select>
+              <button type="button" class="chip-btn" id="btn-export-png" title="Unduh gambar grafik lengkap PNG" disabled>
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                PNG
+              </button>
+            </div>
+          </div>
+
+          <div class="preset-bar">
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Preset Layer Grafik" id="preset-toolbar">
+              <span class="preset-label">Preset Kurva:</span>
+              <button type="button" class="chip-btn preset-btn" data-preset="demo" aria-pressed="true">Demo Sidang <kbd class="key-hint">1</kbd></button>
+              <button type="button" class="chip-btn preset-btn" data-preset="dsp" aria-pressed="false">Validasi DSP <kbd class="key-hint">2</kbd></button>
+              <button type="button" class="chip-btn preset-btn" data-preset="all" aria-pressed="false">Semua Layer <kbd class="key-hint">3</kbd></button>
+              <span id="badge-preset-custom" class="pill-badge" data-tone="accent" hidden>Kustom</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+              <button type="button" class="chip-btn" id="btn-toggle-layers" aria-expanded="false" aria-controls="layers-drawer">
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+                Atur Kurva
+              </button>
+              <button type="button" class="chip-btn" id="btn-sim-clear" data-variant="danger" title="Bersihkan seluruh kurva pada sumber grafik aktif" disabled>Bersihkan</button>
+            </div>
+          </div>
+
+          <div id="layers-drawer" class="compact-drawer" hidden>
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Filter Layer Overlay Grafik" id="overlay-toolbar">
+              <div role="group" aria-label="Kurva Utama">
+                <button type="button" class="chip-btn layer-btn" data-layer="fi" aria-pressed="true" style="--chip-color:var(--danger);">
+                  <span class="chip-dot" aria-hidden="true"></span> Fusion Index (FI)
+                </button>
+                <button type="button" class="chip-btn layer-btn" data-layer="pm" aria-pressed="true" style="--chip-color:var(--accent);">
+                  <span class="chip-dot" aria-hidden="true"></span> PM-proxy Kalman
+                </button>
+                <button type="button" class="chip-btn layer-btn" data-layer="forecast" aria-pressed="true" style="--chip-color:var(--violet);">
+                  <span class="chip-dot" aria-hidden="true"></span> AI Forecast (+60s)
+                </button>
+                <button type="button" class="chip-btn layer-btn" data-layer="thresholds" aria-pressed="true" style="--chip-color:var(--warn);">
+                  <span class="chip-dot" aria-hidden="true"></span> Ambang 55 / 150
+                </button>
+              </div>
+              <span role="separator" aria-orientation="vertical"></span>
+              <div role="group" aria-label="Validasi DSP">
+                <button type="button" class="chip-btn layer-btn" data-layer="pm_true" aria-pressed="false" style="--chip-color:var(--ok);">
+                  <span class="chip-dot" aria-hidden="true"></span> PM Ruang Asap (True)
+                </button>
+                <button type="button" class="chip-btn layer-btn" data-layer="pm_raw" aria-pressed="false" style="--chip-color:#64748b;">
+                  <span class="chip-dot" aria-hidden="true"></span> PM Raw (Median)
+                </button>
+              </div>
+              <span role="separator" aria-orientation="vertical"></span>
+              <div role="group" aria-label="Gas dan Tegangan">
+                <button type="button" class="chip-btn layer-btn" data-layer="gas_ppm" aria-pressed="false" style="--chip-color:var(--teal);">
+                  <span class="chip-dot" aria-hidden="true"></span> Gas MQ-135 (×0.2)
+                </button>
+                <button type="button" class="chip-btn layer-btn" data-layer="g_scaled" aria-pressed="false" style="--chip-color:var(--brand-ember);">
+                  <span class="chip-dot" aria-hidden="true"></span> Skor g (×100)
+                </button>
+                <button type="button" class="chip-btn layer-btn" data-layer="voltages" aria-pressed="false" style="--chip-color:var(--accent);">
+                  <span class="chip-dot" aria-hidden="true"></span> Tegangan Vd/Vm (×50)
+                </button>
+              </div>
+            </div>
+            <label class="touch-label" for="sw-zoom-y">
+              <input id="sw-zoom-y" type="checkbox" switch>
+              <span>Skala Y Ketat (Auto-zoom untuk skenario udara bersih)</span>
+            </label>
+          </div>
+
+          <div id="chart-legend" class="chart-legend" aria-label="Legenda Kurva Aktif"></div>
+
+          <div class="canvas-wrap" id="main-wrap">
+            <div id="esp-banner" class="offline-banner" hidden>
+              <span id="esp-banner-text"></span>
+              <button type="button" class="chip-btn" id="btn-fallback-sitl">Beralih ke SITL</button>
+            </div>
+            <canvas id="main-chart" class="chart-stage" width="960" height="320" tabindex="0" aria-label="Grafik Utama Multi-Overlay (gunakan panah kiri atau kanan untuk inspeksi titik)" aria-describedby="chart-sr-summary"></canvas>
+            <p id="chart-sr-summary" class="sr-only">Belum ada data telemetri.</p>
+            <div id="chart-live-readout" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+          </div>
+
+          <div class="canvas-wrap">
+            <canvas id="sub-chart" class="subchart-stage" width="960" height="150" aria-label="Sub-Grafik Tangga Duty Kipas dan State FSM"></canvas>
+          </div>
         </div>
 
-        <div id="mqtt-log-box" class="mqtt-stream" role="log" aria-live="polite" aria-label="Aliran Log MQTT"></div>
-      </aside>
-    </section>
-  </main>
+        <!-- Right: Override, Simulation, Collapsible MQTT Log & Mobile Export -->
+        <aside class="control-column" aria-label="Panel Kontrol dan Operasi">
+          <section class="panel-card" aria-label="Kontrol Override Aktuator">
+            <div>
+              <h2 class="panel-title">Kontrol Override Aktuator <code class="topic-tag">karhutla/cmd</code></h2>
+              <p class="brand-sub override-card-sub">Mengirim perintah kendali kipas ke SITL / HILS / ESP32</p>
+            </div>
+
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Perintah Override Kipas" class="cmd-grid" id="cmd-toolbar">
+              <button type="button" class="cmd-btn" data-cmd="AUTO" aria-pressed="true">
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.02 1.4 1.15.2.04.41.06.62.06H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
+                AUTO <kbd class="key-hint">A</kbd>
+              </button>
+              <button type="button" class="cmd-btn" data-cmd="FORCE_MAX" aria-pressed="false">
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                MAX 100% <kbd class="key-hint">M</kbd>
+              </button>
+              <button type="button" class="cmd-btn" data-cmd="FORCE_OFF" aria-pressed="false">
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                OFF 0%
+              </button>
+            </div>
+
+            <div class="reset-zone">
+              <span class="brand-sub">Mengatur ulang Kalman, FSM &amp; histori</span>
+              <button type="button" class="cmd-btn" id="btn-cmd-reset" data-cmd="RESET" data-variant="danger">
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+                Reset Sistem
+              </button>
+            </div>
+          </section>
+
+          <section class="panel-card" aria-label="Operasi Simulasi SITL dan HILS">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+              <div>
+                <h2 class="panel-title">Operasi Simulasi SITL / HILS Terpadu</h2>
+                <p class="brand-sub">Jalankan skenario ke SITL Python atau HILS ESP32</p>
+              </div>
+              <span id="badge-sim-state" class="pill-badge">Siaga</span>
+            </div>
+
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Kontrol Runner Simulasi" class="exec-top">
+              <button type="button" class="cmd-btn btn-primary" id="btn-sim-start">
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                <span id="lbl-sim-start">Mulai</span>
+              </button>
+              <button type="button" class="cmd-btn" id="btn-sim-pause" aria-pressed="false" disabled>
+                <span id="lbl-sim-pause">Jeda</span> <kbd class="key-hint">P</kbd>
+              </button>
+              <button type="button" class="cmd-btn" id="btn-sim-stop" disabled>Berhenti</button>
+            </div>
+
+            <div id="sim-active-bar" class="sim-active-bar" hidden>
+              <span id="sim-active-text">SITL • Api Cepat</span>
+              <button type="button" class="chip-btn" id="btn-toggle-sim-cfg" aria-expanded="false" aria-controls="sim-config-fields">Ubah Target/Skenario</button>
+            </div>
+
+            <div class="sim-zone">
+              <span class="sim-zone-label">Konfigurasi Simulasi</span>
+              <div class="op-list">
+                <div id="sim-config-fields" class="op-list">
+                  <div class="op-row">
+                    <span>Target Eksekusi</span>
+                    <div role="toolbar" focusgroup="toolbar wrap" aria-label="Target Runner Simulasi" id="target-toolbar">
+                      <button type="button" class="chip-btn tgt-btn" data-target="sitl" aria-pressed="true">SITL (Python)</button>
+                      <button type="button" class="chip-btn tgt-btn" data-target="hils" aria-pressed="false">HILS (ESP32)</button>
+                    </div>
+                  </div>
+
+                  <div id="hils-concurrency-hint" class="hils-hint" hidden>
+                    Pastikan ESP32 terhubung dan jangan menjalankan <code class="topic-tag">hils.py</code> di terminal secara bersamaan.
+                  </div>
+
+                  <div class="op-row">
+                    <label for="sel-scenario">Skenario Ruang Asap</label>
+                    <select id="sel-scenario" class="op-select">
+                      <option value="flaming" selected>Api Cepat (flaming)</option>
+                      <option value="smolder">Membara Lambat (smolder)</option>
+                      <option value="clean">Udara Bersih (clean)</option>
+                      <option value="fault">Putus Sensor t=200–230s (fault)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="op-row">
+                  <span>Kecepatan</span>
+                  <div role="toolbar" focusgroup="toolbar wrap" aria-label="Kecepatan Simulasi" id="speed-toolbar">
+                    <button type="button" class="chip-btn spd-btn" data-speed="1" aria-pressed="true">1x</button>
+                    <button type="button" class="chip-btn spd-btn" data-speed="5" aria-pressed="false">5x</button>
+                    <button type="button" class="chip-btn spd-btn" data-speed="10" aria-pressed="false">10x</button>
+                    <button type="button" class="chip-btn spd-btn" data-speed="20" aria-pressed="false">20x</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="sim-zone">
+              <span class="sim-zone-label">Proteksi &amp; Injeksi</span>
+              <div class="op-list">
+                <label class="op-row touch-label" for="sw-preempt">
+                  <span>AI Preempt (FORCE MAX Proaktif Dini)</span>
+                  <input id="sw-preempt" type="checkbox" switch>
+                </label>
+
+                <label class="op-row touch-label" for="sw-fault">
+                  <span>Injeksi Putus Kabel Sensor Debu (FAILSAFE)</span>
+                  <input id="sw-fault" type="checkbox" switch>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <details id="drawer-mqtt" class="panel-card drawer-card">
+            <summary>
+              <span>Aliran Log MQTT <code class="topic-tag">:6669</code></span>
+              <span style="display:inline-flex;align-items:center;gap:6px;">
+                <span id="badge-log-count" class="pill-badge">0 baris</span>
+                <svg class="ico drawer-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+              </span>
+            </summary>
+            <div class="drawer-body">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+                <span class="brand-sub">File log: <code id="txt-logfile" class="topic-tag">logs/mqtt.log</code></span>
+                <label class="touch-label" for="sw-autoscroll">
+                  <span>Auto-scroll</span>
+                  <input id="sw-autoscroll" type="checkbox" switch checked>
+                </label>
+              </div>
+              <div id="mqtt-log-box" class="mqtt-stream" tabindex="0" aria-label="Aliran Log MQTT"></div>
+            </div>
+          </details>
+
+          <details id="drawer-mobile" class="panel-card drawer-card">
+            <summary>
+              <span>Koneksi Aplikasi HP (IoT MQTT Panel)</span>
+              <svg class="ico drawer-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+            </summary>
+            <div class="drawer-body">
+              <button type="button" class="chip-btn" id="btn-export-mobile" style="justify-content:center;">
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+                Unduh Konfigurasi IoT MQTT Panel (.json)
+              </button>
+              <p id="mobile-config-hint" class="brand-sub">Buka aplikasi <strong>IoT MQTT Panel</strong> di HP, pilih menu Backup/Restore, lalu impor file JSON (port 6669).</p>
+            </div>
+          </details>
+        </aside>
+      </section>
+    </main>
+  </div>
+
+  <!-- Sticky Mobile Thumb-Zone Quick Controls -->
+  <nav class="mobile-dock" aria-label="Kendali Cepat Mobile">
+    <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="AUTO" aria-pressed="true">AUTO</button>
+    <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="FORCE_MAX" aria-pressed="false">MAX 100%</button>
+    <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="FORCE_OFF" aria-pressed="false">OFF 0%</button>
+    <button type="button" class="cmd-btn btn-primary" id="mob-btn-playpause">Mulai</button>
+  </nav>
+
+  <!-- Native Confirmation Dialog for Destructive / High-Stakes Actions -->
+  <dialog id="confirm-dialog" class="confirm-modal" aria-labelledby="confirm-title" aria-describedby="confirm-desc">
+    <h2 id="confirm-title" class="panel-title">Konfirmasi Aksi</h2>
+    <p id="confirm-desc" class="brand-sub" style="margin-block-start:8px;font-size:0.875rem;color:var(--text-main);"></p>
+    <div class="modal-actions">
+      <button type="button" class="chip-btn" id="confirm-cancel">Batal</button>
+      <button type="button" class="cmd-btn" id="confirm-ok" data-variant="danger">Ya, Lanjutkan</button>
+    </div>
+  </dialog>
+
+  <!-- Dedicated Glossary, Troubleshooting & Keyboard Shortcuts Help Dialog -->
+  <dialog id="help-dialog" class="confirm-modal help-modal" aria-labelledby="help-title">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+      <h2 id="help-title" class="panel-title">Glosarium, Pemecahan Masalah &amp; Pintasan</h2>
+      <button type="button" class="chip-btn" id="help-close">Tutup</button>
+    </div>
+    <div class="glossary-list">
+      <div><strong>FI (Fusion Index):</strong> Indeks fusi PM Kalman (µg/m³), skor gas MQ-135 (g), dan laju dC/dt; memicu FSM Waspada ≥ 55 dan Bahaya ≥ 150 dengan histeresis pemulihan.</div>
+      <div><strong>PM-proxy Kalman, Raw &amp; dC/dt:</strong> PM tersaring Median3 + Kalman 2-state, laju kenaikan asap (µg/m³/s), tegangan debu Sharp <code class="topic-tag">Vd</code>, serta baseline bersih <code class="topic-tag">V0</code>.</div>
+      <div><strong>Gas MQ-135 (<code class="topic-tag">ppm</code>, Skor <code class="topic-tag">g</code>, <code class="topic-tag">Vm</code>):</strong> Estimasi gas pembakaran, skor ternormalisasi 0.00–1.00, dan tegangan ADC MQ-135.</div>
+      <div><strong>Prakiraan AI (<code class="topic-tag">t+60s</code>, ETA, MAE):</strong> Regresi linear 60 detik ke depan dan pemicu <strong>AI Preempt</strong> (FORCE MAX 100% dini).</div>
+      <div><strong>State FSM &amp; FAILSAFE:</strong> <code class="topic-tag">NORMAL</code>, <code class="topic-tag">WASPADA</code>, <code class="topic-tag">BAHAYA</code>, dan <code class="topic-tag">FAILSAFE</code> (kipas terkunci aman 70% bila kabel debu terputus, kecuali override manual).</div>
+      <div><strong>SITL vs HILS &amp; Paritas (<code class="topic-tag">ΔFI</code>):</strong> SITL memakai firmware virtual Python; HILS menguji ESP32 fisik <em>lock-step</em> via MQTT :6669 dan mengukur selisih paritas terhadap firmware referensi.</div>
+      <div><strong>Skala Kurva &amp; Pemulihan Cepat:</strong> <code class="topic-tag">Gas × 0.2</code>, <code class="topic-tag">g × 100</code>, <code class="topic-tag">Vd/Vm × 50</code>. Bila HILS timeout, cek USB/Wi-Fi ESP32 dan pastikan <code class="topic-tag">hils.py</code> tidak berjalan ganda di terminal.</div>
+    </div>
+    <h3 class="sim-zone-label" style="margin-block-start:14px;">Pintasan Keyboard</h3>
+    <div class="shortcut-grid">
+      <div><kbd class="key-hint">S</kbd> Mulai simulasi (saat siaga)</div>
+      <div><kbd class="key-hint">P</kbd> / <kbd class="key-hint">Space</kbd> Jeda atau lanjutkan</div>
+      <div><kbd class="key-hint">1</kbd> <kbd class="key-hint">2</kbd> <kbd class="key-hint">3</kbd> Pilih preset kurva</div>
+      <div><kbd class="key-hint">A</kbd> Mode AUTO • <kbd class="key-hint">M</kbd> MAX 100%</div>
+      <div><kbd class="key-hint">←</kbd> / <kbd class="key-hint">→</kbd> Geser inspeksi pada grafik</div>
+      <div><kbd class="key-hint">Esc</kbd> Lepas crosshair • <kbd class="key-hint">?</kbd> Bantuan</div>
+    </div>
+  </dialog>
 
   <script>
     (() => {
-      // Roving-tabindex fallback when native focusgroup is unavailable
+      // Accessible roving-tabindex fallback skipping disabled buttons
+      const toolbarSyncFns = [];
+      function syncAllToolbars() {
+        toolbarSyncFns.forEach((fn) => fn());
+      }
       document.querySelectorAll('[role="toolbar"][focusgroup]').forEach((bar) => {
+        const getButtons = () => Array.from(bar.querySelectorAll('button'));
+        const getEnabled = () => getButtons().filter((b) => !b.disabled);
+        function syncBar() {
+          const all = getButtons();
+          const enabled = all.filter((b) => !b.disabled);
+          let current = enabled.find((b) => b === document.activeElement || b.tabIndex === 0);
+          if (!current) current = enabled[0] || null;
+          all.forEach((b) => {
+            b.tabIndex = (!b.disabled && b === current) ? 0 : -1;
+          });
+        }
+        toolbarSyncFns.push(syncBar);
+        syncBar();
         if ('focusGroup' in HTMLElement.prototype) return;
-        const items = Array.from(bar.querySelectorAll('button'));
-        if (!items.length) return;
-        items.forEach((b, i) => (b.tabIndex = i ? -1 : 0));
         bar.addEventListener('focusin', ({ target }) => {
-          if (items.includes(target)) items.forEach((b) => (b.tabIndex = b === target ? 0 : -1));
+          const enabled = getEnabled();
+          if (enabled.includes(target)) {
+            getButtons().forEach((b) => (b.tabIndex = b === target ? 0 : -1));
+          }
         });
         bar.addEventListener('keydown', (e) => {
-          const idx = items.indexOf(document.activeElement);
+          const enabled = getEnabled();
+          if (!enabled.length) return;
+          const idx = enabled.indexOf(document.activeElement);
           if (idx < 0) return;
           let next = idx;
-          if (e.key === 'ArrowRight') next = (idx + 1) % items.length;
-          else if (e.key === 'ArrowLeft') next = (idx - 1 + items.length) % items.length;
+          if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = (idx + 1) % enabled.length;
+          else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = (idx - 1 + enabled.length) % enabled.length;
           else if (e.key === 'Home') next = 0;
-          else if (e.key === 'End') next = items.length - 1;
+          else if (e.key === 'End') next = enabled.length - 1;
           else return;
           e.preventDefault();
-          items[next].focus();
+          enabled[next].focus();
         });
       });
+
+      const PRESETS = {
+        demo: { fi: true, pm: true, pm_true: false, pm_raw: false, forecast: true, gas_ppm: false, g_scaled: false, voltages: false, thresholds: true },
+        dsp: { fi: true, pm: true, pm_true: true, pm_raw: true, forecast: false, gas_ppm: false, g_scaled: true, voltages: false, thresholds: true },
+        all: { fi: true, pm: true, pm_true: true, pm_raw: true, forecast: true, gas_ppm: true, g_scaled: true, voltages: true, thresholds: true },
+      };
+
+      const SCENARIO_LABELS = {
+        flaming: 'Api Cepat',
+        smolder: 'Membara Lambat',
+        clean: 'Udara Bersih',
+        fault: 'Putus Sensor',
+      };
+
+      const defaultLayers = { ...PRESETS.demo };
+      let savedPrefs = null;
+      try {
+        savedPrefs = JSON.parse(localStorage.getItem('karhutla_dash_prefs') || 'null');
+      } catch (e) {}
 
       const state = {
         history: [],
@@ -1707,31 +2834,223 @@ RENDERED_HTML = """<!DOCTYPE html>
           esp32: { history: [], latest: null },
         },
         esp: { online: false, age_s: null, hw_mode: null, lastRx: null },
-        viewMode: 'auto',
+        sseConnected: false,
+        sseHadDisconnect: false,
+        bootError: false,
+        hilsTimeoutInfo: null,
+        wasEspStale: false,
+        cmdBusy: false,
+        simConfigExpanded: false,
+        lastActiveSource: null,
+        lastCalloutText: '',
+        lastCalloutActionKey: '',
+        lastLegendKey: '',
+        hoverFromKey: false,
+        totalLogs: 0,
+        theme: (savedPrefs && (savedPrefs.theme === 'light' || savedPrefs.theme === 'dark')) ? savedPrefs.theme : null,
+        zoomY: !!(savedPrefs && savedPrefs.zoomY),
+        viewMode: (savedPrefs && savedPrefs.viewMode) || 'auto',
+        simTarget: 'sitl',
         latest: {},
         sim: {},
-        windowSec: 300,
+        windowSec: (savedPrefs && typeof savedPrefs.windowSec === 'number') ? savedPrefs.windowSec : 300,
+        preset: (savedPrefs && savedPrefs.preset) || 'demo',
         hoverX: null,
-        layers: {
-          fi: true,
-          pm: true,
-          pm_true: true,
-          pm_raw: false,
-          forecast: true,
-          gas_ppm: false,
-          g_scaled: true,
-          voltages: false,
-          thresholds: true,
-        },
+        hoverIdx: null,
+        lastAnnouncedSafety: '',
+        layers: (savedPrefs && savedPrefs.layers) ? { ...defaultLayers, ...savedPrefs.layers } : defaultLayers,
       };
+
+      function savePrefs() {
+        try {
+          localStorage.setItem('karhutla_dash_prefs', JSON.stringify({
+            viewMode: state.viewMode,
+            windowSec: state.windowSec,
+            preset: state.preset,
+            layers: state.layers,
+            theme: state.theme,
+            zoomY: state.zoomY,
+          }));
+        } catch (e) {}
+      }
 
       const mainCanvas = document.getElementById('main-chart');
       const subCanvas = document.getElementById('sub-chart');
       const mCtx = mainCanvas.getContext('2d');
       const sCtx = subCanvas.getContext('2d');
       const logBox = document.getElementById('mqtt-log-box');
+      const toastRegion = document.getElementById('toast-region');
+      const safetyLive = document.getElementById('safety-live');
 
-      function appendMqttLog(line) {
+      function isDarkTheme() {
+        if (state.theme === 'dark') return true;
+        if (state.theme === 'light') return false;
+        return window.matchMedia('(prefers-color-scheme: dark)').matches;
+      }
+
+      function chartPalette(dark = isDarkTheme()) {
+        return dark ? {
+          grid: 'rgba(156,167,180,0.18)',
+          text: '#cbd5e1',
+          muted: '#9ca7b4',
+          fi: '#f87171',
+          pm: '#38bdf8',
+          pm_true: '#4ade80',
+          pm_raw: '#9ca7b4',
+          forecast: '#e879f9',
+          forecastFill: 'rgba(232,121,249,0.08)',
+          nowLine: 'rgba(232,121,249,0.65)',
+          gas_ppm: '#2dd4bf',
+          g_scaled: '#fb923c',
+          v_dust: '#60a5fa',
+          v_mq: '#a78bfa',
+          waspada: '#fbbf24',
+          bahaya: 'rgba(248,113,113,0.68)',
+          fsm: '#fbbf24',
+          duty: '#4ade80',
+          tipBg: 'rgba(22,26,31,0.96)',
+          tipFg: '#f3f5f7',
+          exportBg: '#161a1f',
+        } : {
+          grid: 'rgba(75,85,99,0.16)',
+          text: '#374151',
+          muted: '#4b5563',
+          fi: '#b91c1c',
+          pm: '#0369a1',
+          pm_true: '#14532d',
+          pm_raw: '#64748b',
+          forecast: '#6d28d9',
+          forecastFill: 'rgba(109,40,217,0.06)',
+          nowLine: 'rgba(109,40,217,0.55)',
+          gas_ppm: '#0f766e',
+          g_scaled: '#c2410c',
+          v_dust: '#2563eb',
+          v_mq: '#7c3aed',
+          waspada: '#92400e',
+          bahaya: 'rgba(185,28,28,0.68)',
+          fsm: '#92400e',
+          duty: '#0369a1',
+          tipBg: 'rgba(255,255,255,0.97)',
+          tipFg: '#111827',
+          exportBg: '#ffffff',
+        };
+      }
+
+      function getLegendSpecs(pal = chartPalette()) {
+        const list = [];
+        if (state.layers.fi) list.push({ label: 'Fusion Index (FI)', color: pal.fi, style: 'solid' });
+        if (state.layers.pm) list.push({ label: 'PM Kalman', color: pal.pm, style: 'solid' });
+        if (state.layers.pm_true && !document.querySelector('.layer-btn[data-layer="pm_true"]').disabled) {
+          list.push({ label: 'PM True (Plant)', color: pal.pm_true, style: 'solid' });
+        }
+        if (state.layers.pm_raw) list.push({ label: 'PM Raw (Median)', color: pal.pm_raw, style: 'solid' });
+        if (state.layers.forecast) list.push({ label: 'AI Forecast (+60s)', color: pal.forecast, style: 'dotted' });
+        if (state.layers.gas_ppm) list.push({ label: 'Gas MQ-135 (×0.2)', color: pal.gas_ppm, style: 'dashed' });
+        if (state.layers.g_scaled) list.push({ label: 'Skor g (×100)', color: pal.g_scaled, style: 'dotted' });
+        if (state.layers.voltages) {
+          list.push({ label: 'Vd Sharp (×50)', color: pal.v_dust, style: 'dashed' });
+          list.push({ label: 'Vm MQ-135 (×50)', color: pal.v_mq, style: 'dashed' });
+        }
+        if (state.layers.thresholds) {
+          list.push({ label: 'Ambang Waspada (55)', color: pal.waspada, style: 'dashed' });
+          list.push({ label: 'Ambang Bahaya (150)', color: pal.bahaya, style: 'dashed' });
+        }
+        return list;
+      }
+
+      function renderChartLegend() {
+        const el = document.getElementById('chart-legend');
+        if (!el) return;
+        const specs = getLegendSpecs();
+        const key = specs.map((s) => `${s.label}|${s.color}|${s.style}`).join(';');
+        if (key === state.lastLegendKey) return;
+        state.lastLegendKey = key;
+        el.innerHTML = '';
+        if (!specs.length) {
+          const empty = document.createElement('span');
+          empty.className = 'brand-sub';
+          empty.textContent = 'Tidak ada kurva aktif — buka Atur Kurva untuk memilih.';
+          el.appendChild(empty);
+          return;
+        }
+        specs.forEach((s) => {
+          const item = document.createElement('span');
+          item.className = 'legend-item';
+          const sw = document.createElement('span');
+          sw.className = 'legend-swatch';
+          sw.setAttribute('data-style', s.style);
+          sw.style.color = s.color;
+          const lbl = document.createElement('span');
+          lbl.textContent = s.label;
+          item.appendChild(sw);
+          item.appendChild(lbl);
+          el.appendChild(item);
+        });
+      }
+
+      function applyTheme(theme, persist = false) {
+        state.theme = theme;
+        if (theme === 'light' || theme === 'dark') {
+          document.documentElement.dataset.theme = theme;
+        } else {
+          delete document.documentElement.dataset.theme;
+        }
+        const darkNow = isDarkTheme();
+        document.querySelectorAll('.theme-btn').forEach((btn) => {
+          const val = btn.getAttribute('data-theme-val');
+          btn.setAttribute('aria-pressed', ((val === 'dark') === darkNow) ? 'true' : 'false');
+        });
+        if (persist) savePrefs();
+        renderChartLegend();
+        scheduleDraw();
+      }
+
+      function showToast(message, tone = 'ok') {
+        if (!message) return;
+        const el = document.createElement('div');
+        el.className = 'toast';
+        el.setAttribute('role', 'status');
+        el.setAttribute('aria-live', tone === 'danger' ? 'assertive' : 'polite');
+        el.setAttribute('data-tone', tone);
+        el.textContent = message;
+        toastRegion.appendChild(el);
+        while (toastRegion.children.length > 4) {
+          toastRegion.removeChild(toastRegion.firstChild);
+        }
+        setTimeout(() => {
+          if (el.parentNode) el.parentNode.removeChild(el);
+        }, 3600);
+      }
+
+      function announceSafety(msg) {
+        if (!msg || msg === state.lastAnnouncedSafety) return;
+        state.lastAnnouncedSafety = msg;
+        safetyLive.textContent = msg;
+      }
+
+      function syncCanvasSize(canvas, fallbackW, fallbackH) {
+        const rect = canvas.getBoundingClientRect();
+        const cw = Math.max(260, Math.round(rect.width || fallbackW));
+        const ch = Math.max(110, Math.round(rect.height || fallbackH));
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const pw = Math.round(cw * dpr);
+        const ph = Math.round(ch * dpr);
+        if (canvas.width !== pw || canvas.height !== ph) {
+          canvas.width = pw;
+          canvas.height = ph;
+        }
+        canvas._cw = cw;
+        canvas._ch = ch;
+        canvas._dpr = dpr;
+      }
+
+      if ('ResizeObserver' in window) {
+        const ro = new ResizeObserver(() => scheduleDraw());
+        ro.observe(mainCanvas);
+        ro.observe(subCanvas);
+      }
+
+      function appendMqttLog(line, countAsLog = true) {
         if (!line) return;
         const div = document.createElement('div');
         div.className = 'log-line';
@@ -1740,6 +3059,10 @@ RENDERED_HTML = """<!DOCTYPE html>
         while (logBox.children.length > 200) {
           logBox.removeChild(logBox.firstChild);
         }
+        if (countAsLog) state.totalLogs += 1;
+        const shown = logBox.children.length;
+        document.getElementById('badge-log-count').textContent =
+          state.totalLogs > shown ? `${state.totalLogs} (${shown} tampil)` : `${state.totalLogs} baris`;
         if (document.getElementById('sw-autoscroll').checked) {
           logBox.scrollTop = logBox.scrollHeight;
         }
@@ -1747,42 +3070,235 @@ RENDERED_HTML = """<!DOCTYPE html>
 
       function activeSource() {
         if (state.viewMode === 'sitl' || state.viewMode === 'esp32') return state.viewMode;
+        if (state.sim && state.sim.running) return state.sim.target === 'hils' ? 'esp32' : 'sitl';
+        if (state.lastActiveSource && state.src[state.lastActiveSource] && state.src[state.lastActiveSource].history.length) {
+          return state.lastActiveSource;
+        }
         if (state.esp.online) return 'esp32';
-        if (state.sim && state.sim.running) return 'sitl';
         if (state.src.esp32.history.length) return 'esp32';
         return 'sitl';
+      }
+
+      function switchFallbackToSitl() {
+        state.hilsTimeoutInfo = null;
+        const finishSwitch = () => {
+          state.simTarget = 'sitl';
+          state.viewMode = 'sitl';
+          state.lastActiveSource = 'sitl';
+          savePrefs();
+          applyView();
+          showToast('Beralih ke mode & sumber grafik SITL.', 'ok');
+        };
+        if (state.sim && state.sim.running && state.sim.target === 'hils') {
+          postSim({ action: 'stop', target: 'sitl' }).then(finishSwitch);
+        } else {
+          finishSwitch();
+        }
+      }
+
+      function updateBrokerBadge() {
+        const bBroker = document.getElementById('badge-broker');
+        const txtBroker = document.getElementById('txt-broker');
+        const sim = state.sim || {};
+        const port = sim.broker_port || 6669;
+        if (!state.sseConnected && Object.keys(sim).length > 0) {
+          bBroker.setAttribute('data-tone', 'danger');
+          txtBroker.textContent = 'Koneksi Server Terputus';
+        } else if (sim.enable_mqtt === false) {
+          bBroker.setAttribute('data-tone', 'warn');
+          txtBroker.textContent = 'MQTT dinonaktifkan';
+        } else if (sim.broker_connected === true) {
+          bBroker.setAttribute('data-tone', 'ok');
+          txtBroker.textContent = `Broker :${port} Terhubung`;
+        } else if (sim.broker_connected === false) {
+          bBroker.setAttribute('data-tone', 'danger');
+          txtBroker.textContent = `Broker :${port} Terputus`;
+        } else {
+          bBroker.setAttribute('data-tone', 'warn');
+          txtBroker.textContent = `Broker :${port}: memeriksa...`;
+        }
       }
 
       function updateEspBadge() {
         const bNode = document.getElementById('badge-node');
         const txt = document.getElementById('txt-node');
-        const ico = document.getElementById('ico-node');
         const mode = state.esp.hw_mode ? ` (${state.esp.hw_mode})` : '';
+        const src = activeSource();
+        const needsEsp = (src === 'esp32') || (state.simTarget === 'hils') || (state.sim && state.sim.target === 'hils');
         if (state.esp.online) {
           txt.textContent = `ESP32: ONLINE${mode}`;
-          ico.textContent = '✓';
           bNode.setAttribute('data-tone', 'ok');
         } else if (state.esp.lastRx) {
-          const age = Math.round((Date.now() - state.esp.lastRx) / 1000);
-          txt.textContent = `ESP32: TERPUTUS (${age} dtk tanpa data)`;
-          ico.textContent = '✕';
+          const age = Math.max(0, Math.round((Date.now() - state.esp.lastRx) / 1000));
+          txt.textContent = `ESP32: TERPUTUS (${age} dtk)`;
           bNode.setAttribute('data-tone', 'danger');
         } else {
-          txt.textContent = 'ESP32: belum terdeteksi';
-          ico.textContent = '○';
-          bNode.setAttribute('data-tone', 'warn');
+          txt.textContent = needsEsp ? 'ESP32: menunggu' : 'ESP32: siaga';
+          if (needsEsp) bNode.setAttribute('data-tone', 'warn');
+          else bNode.removeAttribute('data-tone');
         }
-        const src = activeSource();
         const banner = document.getElementById('esp-banner');
+        const bannerText = document.getElementById('esp-banner-text');
         const wrap = document.getElementById('main-wrap');
+        const hilsTimeoutShown = !!(state.sim && state.sim.target === 'hils' && (state.sim.hils_consec_timeouts > 0 || state.hilsTimeoutInfo));
         const stale = src === 'esp32' && !state.esp.online;
         wrap.classList.toggle('is-stale', stale);
-        banner.hidden = !stale;
+        banner.hidden = !stale || hilsTimeoutShown;
         if (stale) {
-          banner.textContent = state.esp.lastRx
-            ? `⚠ ESP32 TERPUTUS — tidak ada data sejak ${Math.round((Date.now() - state.esp.lastRx) / 1000)} detik lalu (grafik dibekukan)`
-            : '⚠ Menunggu ESP32 — belum ada telemetri/heartbeat diterima dari broker';
+          bannerText.textContent = state.esp.lastRx
+            ? `ESP32 TERPUTUS — tidak ada data sejak ${Math.max(0, Math.round((Date.now() - state.esp.lastRx) / 1000))} detik lalu (grafik dibekukan)`
+            : 'Menunggu ESP32 — belum ada telemetri atau heartbeat dari broker MQTT';
+          if (!state.wasEspStale) {
+            state.wasEspStale = true;
+            announceSafety('ESP32 terputus, grafik dibekukan.');
+          }
+        } else if (state.wasEspStale) {
+          state.wasEspStale = false;
+          if (state.esp.online) announceSafety('ESP32 tersambung kembali.');
         }
+      }
+
+      function makeActionBtn(label, onClick) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'chip-btn';
+        btn.textContent = label;
+        btn.addEventListener('click', onClick);
+        return btn;
+      }
+
+      function updateSafetyCallout(row, sim) {
+        const box = document.getElementById('safety-callout');
+        const txt = document.getElementById('safety-callout-text');
+        const act = document.getElementById('safety-callout-actions');
+
+        let verdict = { hidden: true, tone: 'accent', text: '', actionKey: '', buildActions: null, announce: '' };
+
+        if (state.bootError) {
+          verdict = {
+            hidden: false,
+            tone: 'danger',
+            text: 'Gagal memuat data awal dari server dashboard.',
+            actionKey: 'boot-error',
+            buildActions: (c) => c.appendChild(makeActionBtn('Coba Muat Ulang', () => loadStateSnapshot(false))),
+            announce: '',
+          };
+        } else if (!state.sseConnected && Object.keys(state.sim || {}).length > 0) {
+          verdict = {
+            hidden: false,
+            tone: 'danger',
+            text: 'Koneksi live ke server dashboard terputus. Mencoba menyambung ulang...',
+            actionKey: 'sse-lost',
+            buildActions: (c) => c.appendChild(makeActionBtn('Muat Snapshot', () => loadStateSnapshot(true))),
+            announce: '',
+          };
+        } else if (sim && sim.target === 'hils' && (sim.hils_consec_timeouts > 0 || state.hilsTimeoutInfo)) {
+          const info = state.hilsTimeoutInfo || {};
+          const consec = info.consec || sim.hils_consec_timeouts || 0;
+          const canResume = !!(sim.paused && sim.running);
+          verdict = {
+            hidden: false,
+            tone: sim.paused ? 'danger' : 'warn',
+            text: sim.paused
+              ? `HILS dijeda otomatis: ESP32 timeout ${consec}x beruntun pada langkah #${info.seq ?? sim.step ?? 0}. Periksa kabel/Wi-Fi ESP32.`
+              : `Peringatan HILS: ESP32 belum membalas langkah #${info.seq ?? sim.step ?? 0} (timeout ${sim.hils_timeouts || info.timeouts || consec}x).`,
+            actionKey: canResume ? 'hils-paused-actions' : 'hils-warn-actions',
+            buildActions: (c) => {
+              if (canResume) {
+                c.appendChild(makeActionBtn('Lanjutkan HILS', () => {
+                  state.hilsTimeoutInfo = null;
+                  postSim({ action: 'resume' }, 'Melanjutkan HILS...');
+                }));
+              }
+              c.appendChild(makeActionBtn('Beralih ke SITL', switchFallbackToSitl));
+            },
+            announce: sim.paused ? 'HILS dijeda otomatis karena ESP32 timeout.' : '',
+          };
+        } else if (row && row.state === 'FAILSAFE') {
+          const dutyTxt = (row.duty ?? 0).toFixed(0);
+          const faultOn = !!(sim && sim.fault_inject);
+          const forcedOff = row.mode === 'FORCE_OFF';
+          verdict = {
+            hidden: false,
+            tone: 'danger',
+            text: forcedOff
+              ? `Mode FAILSAFE dengan override FORCE OFF: sensor debu terputus dan kipas dipaksa mati (${dutyTxt}%). Kembalikan ke AUTO untuk pengamanan 70%.`
+              : `Mode FAILSAFE aktif: pembacaan sensor debu tidak valid atau terputus. Kipas dikunci aman pada ${dutyTxt}%.`,
+            actionKey: `failsafe-${forcedOff ? 'off' : 'safe'}-${faultOn ? 'inj' : 'hw'}`,
+            buildActions: (c) => {
+              if (forcedOff) {
+                c.appendChild(makeActionBtn('Kembalikan ke AUTO', () => sendActuatorCmd('AUTO')));
+              }
+              if (faultOn) {
+                c.appendChild(makeActionBtn('Matikan Injeksi Fault', () => {
+                  document.getElementById('sw-fault').checked = false;
+                  postSim({ fault_inject: false }, 'Injeksi fault dimatikan.');
+                }));
+              }
+            },
+            announce: forcedOff
+              ? 'Mode FAILSAFE dengan FORCE OFF, kipas mati 0 persen.'
+              : `Mode FAILSAFE aktif, kipas pada ${dutyTxt} persen.`,
+          };
+        } else if (row && row.mode === 'FORCE_OFF' && (row.state === 'BAHAYA' || row.state === 'WASPADA')) {
+          verdict = {
+            hidden: false,
+            tone: 'warn',
+            text: `Perhatian: Override manual FORCE OFF (0%) menahan kipas mati saat kondisi ${row.state}.`,
+            actionKey: 'force-off-hazard',
+            buildActions: (c) => c.appendChild(makeActionBtn('Kembalikan ke AUTO', () => sendActuatorCmd('AUTO'))),
+            announce: '',
+          };
+        } else if (row && row.state === 'BAHAYA') {
+          const fiVal = row.fi ?? 0;
+          const dcdt = row.dcdt ?? 0;
+          const dutyTxt = (row.duty ?? 0).toFixed(0);
+          const trendTxt = dcdt < -0.15 ? 'tren asap mulai menurun' : (dcdt > 0.15 ? 'tren asap masih naik' : 'laju asap datar');
+          const fiClause = fiVal >= 150
+            ? 'Fusion Index melampaui 150 µg/m³'
+            : `Fusion Index (${fiVal.toFixed(1)} µg/m³) masih tertahan histeresis pemulihan BAHAYA`;
+          const preClause = (sim && sim.ai_preempt_active) ? ' • AI Preempt (FORCE MAX) aktif.' : '';
+          verdict = {
+            hidden: false,
+            tone: 'danger',
+            text: `Kondisi BAHAYA: ${fiClause}. Kipas ${dutyTxt}% aktif (${trendTxt}, dC/dt ${dcdt >= 0 ? '+' : ''}${dcdt.toFixed(2)}/s).${preClause}`,
+            actionKey: 'none',
+            buildActions: null,
+            announce: 'Kondisi BAHAYA aktif.',
+          };
+        } else if (sim && sim.ai_preempt_active) {
+          verdict = {
+            hidden: false,
+            tone: 'accent',
+            text: 'AI Preempt Aktif: Prakiraan t+60s melampaui ambang, kipas dinaikkan proaktif ke FORCE MAX (100%).',
+            actionKey: 'none',
+            buildActions: null,
+            announce: 'AI Preempt aktif, kipas dinaikkan proaktif ke 100 persen.',
+          };
+        }
+
+        box.hidden = verdict.hidden;
+        if (verdict.hidden) {
+          state.lastCalloutText = '';
+          if (state.lastCalloutActionKey !== '') {
+            state.lastCalloutActionKey = '';
+            act.innerHTML = '';
+          }
+          return;
+        }
+        if (box.getAttribute('data-tone') !== verdict.tone) {
+          box.setAttribute('data-tone', verdict.tone);
+        }
+        if (verdict.text !== state.lastCalloutText) {
+          txt.textContent = verdict.text;
+          state.lastCalloutText = verdict.text;
+        }
+        if (verdict.actionKey !== state.lastCalloutActionKey) {
+          state.lastCalloutActionKey = verdict.actionKey;
+          act.innerHTML = '';
+          if (verdict.buildActions) verdict.buildActions(act);
+        }
+        if (verdict.announce) announceSafety(verdict.announce);
       }
 
       let rafPending = false;
@@ -1795,15 +3311,133 @@ RENDERED_HTML = """<!DOCTYPE html>
         });
       }
 
+      function canShowPmTrue() {
+        if (activeSource() === 'sitl') return true;
+        if (state.sim && state.sim.target === 'hils') return true;
+        return state.src.esp32.history.some((r) => r.pm_true != null);
+      }
+
+      function syncLayerButtons() {
+        const allowPmTrue = canShowPmTrue();
+        document.querySelectorAll('.layer-btn').forEach((btn) => {
+          const layer = btn.getAttribute('data-layer');
+          const pressed = !!state.layers[layer];
+          btn.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+          if (layer === 'pm_true') {
+            btn.disabled = !allowPmTrue;
+            btn.title = allowPmTrue ? 'Kurva referensi konsentrasi ruang asap (ground truth)' : 'Hanya tersedia pada simulasi SITL atau HILS';
+          }
+        });
+        document.querySelectorAll('.preset-btn').forEach((b) => {
+          b.setAttribute('aria-pressed', b.getAttribute('data-preset') === state.preset ? 'true' : 'false');
+        });
+        const customBadge = document.getElementById('badge-preset-custom');
+        if (customBadge) customBadge.hidden = state.preset !== 'custom';
+        const selWin = document.getElementById('sel-window');
+        if (selWin) selWin.value = String(state.windowSec);
+        const swZoom = document.getElementById('sw-zoom-y');
+        if (swZoom) swZoom.checked = !!state.zoomY;
+        renderChartLegend();
+        syncAllToolbars();
+      }
+
+      const FSM_ICON_PATHS = {
+        SIAGA: '<circle cx="12" cy="12" r="9"/><line x1="8" y1="12" x2="16" y2="12"/>',
+        NORMAL: '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>',
+        WASPADA: '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+        BAHAYA: '<path d="M12 2c.5 4-3 6-3 10a5 5 0 0 0 10 0c0-3-2-5.5-4-8"/><path d="M9 14a3 3 0 0 0 6 0"/>',
+        FAILSAFE: '<circle cx="12" cy="12" r="9"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>',
+      };
+
+      function setFsmBadge(st, tone) {
+        const badge = document.getElementById('badge-fsm');
+        const svg = document.getElementById('ico-fsm-svg');
+        const txt = document.getElementById('txt-fsm');
+        if (tone) badge.setAttribute('data-tone', tone);
+        else badge.removeAttribute('data-tone');
+        if (svg && FSM_ICON_PATHS[st]) svg.innerHTML = FSM_ICON_PATHS[st];
+        txt.textContent = `FSM: ${st}`;
+      }
+
+      function updateParityUI(sim, row) {
+        const parity = sim && sim.hils_parity;
+        const badge = document.getElementById('parity-badge');
+        const kpiWrap = document.getElementById('kpi-parity-wrap');
+        const kpiParity = document.getElementById('kpi-parity');
+        const showParity = parity && parity.samples > 0 && (activeSource() === 'esp32' || (sim && sim.target === 'hils'));
+        if (showParity && parity.last_delta_fi != null) {
+          const ok = parity.max_delta_fi < 1.0 && parity.state_matches === parity.samples;
+          badge.hidden = false;
+          badge.setAttribute('data-tone', ok ? 'ok' : 'warn');
+          badge.textContent = `Paritas HILS: ΔFI ${parity.last_delta_fi.toFixed(2)} (${parity.state_matches}/${parity.samples} sama)`;
+          kpiWrap.hidden = false;
+          kpiParity.textContent = `Δ${parity.last_delta_fi.toFixed(2)} (${ok ? 'OK' : 'Cek'})`;
+          kpiParity.style.color = ok ? 'var(--ok)' : 'var(--warn)';
+        } else {
+          badge.hidden = true;
+          const waitingHils = !!(sim && sim.running && sim.target === 'hils');
+          kpiWrap.hidden = !waitingHils;
+          kpiParity.textContent = waitingHils ? 'menunggu' : '-';
+          kpiParity.style.color = '';
+        }
+      }
+
+      function resetKpis() {
+        const cardState = document.getElementById('card-state');
+        const cardFi = document.getElementById('card-fi');
+        cardState.setAttribute('data-tone', 'idle');
+        cardFi.setAttribute('data-tone', 'idle');
+        document.getElementById('kpi-state').textContent = 'SIAGA';
+        document.getElementById('kpi-state').style.color = 'var(--text-muted)';
+        document.getElementById('kpi-mode').textContent = '--';
+        document.getElementById('kpi-t').textContent = '0';
+        document.getElementById('kpi-seq').textContent = '0';
+        document.getElementById('kpi-fi').textContent = '--';
+        document.getElementById('kpi-fi-wrap').style.color = 'var(--text-muted)';
+        document.getElementById('fi-meter-fill').style.inlineSize = '0%';
+        document.getElementById('kpi-pm').textContent = '--';
+        document.getElementById('kpi-pmraw').textContent = '--';
+        document.getElementById('kpi-dcdt').textContent = '0.00';
+        document.getElementById('kpi-vd').textContent = '--';
+        document.getElementById('kpi-v0').textContent = '--';
+        document.getElementById('kpi-ppm').textContent = '--';
+        document.getElementById('kpi-g').textContent = '--';
+        document.getElementById('kpi-vm').textContent = '--';
+        document.getElementById('kpi-fc').textContent = '--';
+        document.getElementById('kpi-fc-wrap').style.color = 'var(--text-muted)';
+        document.getElementById('kpi-eta').textContent = '-';
+        document.getElementById('kpi-mae').textContent = '-';
+        document.getElementById('kpi-duty').textContent = '--';
+        document.getElementById('kpi-duty-wrap').style.color = 'var(--text-muted)';
+        document.getElementById('pwm-meter-fill').style.inlineSize = '0%';
+        document.getElementById('kpi-fan-ctrl').textContent = '--';
+        document.getElementById('kpi-fan-src').textContent = activeSource() === 'esp32' ? 'ESP32' : 'SITL';
+        setFsmBadge('SIAGA', null);
+        updateParityUI(state.sim, null);
+        updateSafetyCallout(null, state.sim);
+      }
+
       function applyView() {
         const src = activeSource();
         state.history = state.src[src].history;
-        document.getElementById('src-label').textContent =
-          (src === 'esp32' ? 'ESP32 (hardware)' : 'SITL (simulasi)') + (state.viewMode === 'auto' ? ' — otomatis' : '');
+        const srcTag = src === 'esp32' ? 'ESP32 (hardware)' : 'SITL (simulasi)';
+        document.getElementById('src-label').textContent = srcTag + (state.viewMode === 'auto' ? ' — otomatis' : '');
+        document.getElementById('kpi-src-tag').textContent = src === 'esp32' ? 'ESP32' : 'SITL';
+        document.getElementById('kpi-fan-src').textContent = src === 'esp32' ? 'ESP32' : 'SITL';
         document.querySelectorAll('.src-btn').forEach((b) =>
           b.setAttribute('aria-pressed', b.getAttribute('data-src') === state.viewMode ? 'true' : 'false'));
+        const btnExport = document.getElementById('btn-export-png');
+        const btnClear = document.getElementById('btn-sim-clear');
+        if (btnExport) btnExport.disabled = state.history.length === 0;
+        if (btnClear) btnClear.disabled = state.history.length === 0;
+        syncLayerButtons();
         const lat = state.src[src].latest;
-        if (lat) updateKpis(lat, state.sim);
+        if (lat && (state.history.length > 0 || lat.scenario !== 'idle')) {
+          updateKpis(lat, state.sim);
+        } else {
+          resetKpis();
+        }
+        updateBrokerBadge();
         updateEspBadge();
         scheduleDraw();
       }
@@ -1822,53 +3456,79 @@ RENDERED_HTML = """<!DOCTYPE html>
         }
         if (bucket.history.length > 1800) bucket.history.shift();
         bucket.latest = row;
+        state.lastActiveSource = source;
       }
 
       function updateKpis(row, sim) {
-        if (!row) return;
+        if (!row) {
+          resetKpis();
+          return;
+        }
         const st = row.state || 'NORMAL';
         const toneMap = { NORMAL: 'ok', WASPADA: 'warn', BAHAYA: 'danger', FAILSAFE: 'danger' };
-        const icoMap = { NORMAL: '✓', WASPADA: '⚠', BAHAYA: '🔥', FAILSAFE: '⚡' };
         const colorMap = { NORMAL: 'var(--ok)', WASPADA: 'var(--warn)', BAHAYA: 'var(--danger)', FAILSAFE: 'var(--danger)' };
+        const tone = toneMap[st] || 'ok';
 
+        document.getElementById('card-state').setAttribute('data-tone', tone);
+        document.getElementById('card-fi').setAttribute('data-tone', tone);
         document.getElementById('kpi-state').textContent = st;
         document.getElementById('kpi-state').style.color = colorMap[st] || 'var(--ok)';
-        document.getElementById('kpi-state-ico').textContent = icoMap[st] || '✓';
         document.getElementById('kpi-mode').textContent = row.mode || 'AUTO';
         document.getElementById('kpi-t').textContent = (row.t ?? 0).toFixed(0);
         document.getElementById('kpi-seq').textContent = row.seq ?? 0;
 
-        document.getElementById('kpi-fi').textContent = (row.fi ?? 0).toFixed(1);
+        const fiVal = row.fi ?? 0;
+        const fiColor = fiVal >= 150 ? 'var(--danger)' : (fiVal >= 55 ? 'var(--warn)' : 'var(--ok)');
+        document.getElementById('kpi-fi').textContent = fiVal.toFixed(1);
+        document.getElementById('kpi-fi-wrap').style.color = fiVal >= 55 ? fiColor : 'var(--text-main)';
+        const fiFill = document.getElementById('fi-meter-fill');
+        fiFill.style.inlineSize = `${Math.min(100, Math.max(0, (fiVal / 250) * 100)).toFixed(1)}%`;
+        fiFill.style.backgroundColor = fiColor;
+
         document.getElementById('kpi-pm').textContent = (row.pm ?? 0).toFixed(1);
         document.getElementById('kpi-pmraw').textContent = (row.pm_raw ?? 0).toFixed(1);
         const dcdt = row.dcdt ?? 0;
         document.getElementById('kpi-dcdt').textContent = (dcdt >= 0 ? '+' : '') + dcdt.toFixed(2);
+        document.getElementById('kpi-vd').textContent = (row.v_dust ?? 0).toFixed(2);
+        document.getElementById('kpi-v0').textContent = (row.v0 ?? 0.6).toFixed(3);
 
         document.getElementById('kpi-ppm').textContent = (row.gas_ppm ?? 400).toFixed(0);
         document.getElementById('kpi-g').textContent = (row.g ?? 0).toFixed(2);
-        document.getElementById('kpi-v0').textContent = (row.v0 ?? 0.6).toFixed(3);
+        document.getElementById('kpi-vm').textContent = (row.v_mq ?? 0).toFixed(2);
 
-        document.getElementById('kpi-fc').textContent = row.forecast != null ? row.forecast.toFixed(1) : '-';
+        const fcVal = row.forecast;
+        document.getElementById('kpi-fc').textContent = fcVal != null ? fcVal.toFixed(1) : '-';
+        document.getElementById('kpi-fc-wrap').style.color =
+          fcVal == null ? 'var(--text-muted)'
+          : (fcVal >= 150 ? 'var(--danger)' : (fcVal >= 55 ? 'var(--warn)' : 'var(--violet)'));
         document.getElementById('kpi-eta').textContent = row.eta_bahaya_s != null ? `${row.eta_bahaya_s.toFixed(0)} s` : '-';
         document.getElementById('kpi-mae').textContent = row.mae != null ? row.mae.toFixed(2) : '-';
 
-        document.getElementById('kpi-duty').textContent = (row.duty ?? 0).toFixed(1);
-        document.getElementById('kpi-vd').textContent = (row.v_dust ?? 0).toFixed(2);
-        document.getElementById('kpi-vm').textContent = (row.v_mq ?? 0).toFixed(2);
+        const dutyVal = row.duty ?? 0;
+        const dutyColor = row.mode === 'FORCE_OFF' ? 'var(--warn)'
+          : (st === 'BAHAYA' ? 'var(--danger)' : (st === 'FAILSAFE' ? 'var(--warn)' : (dutyVal > 0 ? 'var(--accent)' : 'var(--ok)')));
+        document.getElementById('kpi-duty').textContent = dutyVal.toFixed(1);
+        document.getElementById('kpi-duty-wrap').style.color = dutyColor;
+        const pwmFill = document.getElementById('pwm-meter-fill');
+        pwmFill.style.inlineSize = `${Math.min(100, Math.max(0, dutyVal)).toFixed(1)}%`;
+        pwmFill.style.backgroundColor = dutyColor;
 
-        const badgeFsm = document.getElementById('badge-fsm');
-        badgeFsm.setAttribute('data-tone', toneMap[st] || 'ok');
-        document.getElementById('ico-fsm').textContent = icoMap[st] || '✓';
-        document.getElementById('txt-fsm').textContent = `FSM: ${st}`;
+        const activeSim = sim || state.sim;
+        const ctrlLabel = (activeSim && activeSim.ai_preempt_active && row.mode === 'FORCE_MAX') ? 'AI PREEMPT' : (row.mode || 'AUTO');
+        document.getElementById('kpi-fan-ctrl').textContent = ctrlLabel;
+        document.getElementById('kpi-fan-src').textContent = activeSource() === 'esp32' ? 'ESP32' : 'SITL';
 
-        // Sync active mode button aria-pressed
-        document.querySelectorAll('#cmd-toolbar .cmd-btn[data-cmd]').forEach((btn) => {
+        setFsmBadge(st, tone);
+
+        document.querySelectorAll('#cmd-toolbar .cmd-btn[data-cmd], .mob-cmd-btn[data-cmd]').forEach((btn) => {
           const c = btn.getAttribute('data-cmd');
           if (c !== 'RESET') {
             btn.setAttribute('aria-pressed', c === row.mode ? 'true' : 'false');
           }
         });
 
+        updateParityUI(activeSim, row);
+        updateSafetyCallout(row, activeSim);
         if (sim) updateSimBadges(sim);
       }
 
@@ -1880,115 +3540,291 @@ RENDERED_HTML = """<!DOCTYPE html>
           document.querySelectorAll('.tgt-btn').forEach((b) => {
             b.setAttribute('aria-pressed', b.getAttribute('data-target') === sim.target ? 'true' : 'false');
           });
+          document.getElementById('hils-concurrency-hint').hidden = sim.target !== 'hils';
         }
+        if (sim.scenario && (!dlg || !dlg.open)) {
+          document.getElementById('sel-scenario').value = sim.scenario;
+        }
+        if (sim.speed != null) {
+          document.querySelectorAll('.spd-btn').forEach((b) => {
+            b.setAttribute('aria-pressed', Number(b.getAttribute('data-speed')) === Number(sim.speed) ? 'true' : 'false');
+          });
+        }
+        if (typeof sim.ai_preempt === 'boolean') {
+          document.getElementById('sw-preempt').checked = sim.ai_preempt;
+        }
+        if (typeof sim.fault_inject === 'boolean') {
+          document.getElementById('sw-fault').checked = sim.fault_inject;
+        }
+        if (sim.running && sim.hils_consec_timeouts === 0) {
+          state.hilsTimeoutInfo = null;
+        }
+
         const tgtLabel = (sim.target || 'sitl').toUpperCase();
         const bSim = document.getElementById('badge-sim-state');
         if (sim.running) {
-          bSim.textContent = sim.paused ? `${tgtLabel} PAUSED (${sim.scenario})` : `${tgtLabel}: ${sim.scenario} (${sim.speed}x)`;
-          bSim.setAttribute('data-tone', sim.paused ? 'warn' : 'ok');
+          if (sim.target === 'hils' && !state.esp.online) {
+            bSim.textContent = 'HILS MENUNGGU ESP32';
+            bSim.setAttribute('data-tone', 'danger');
+          } else {
+            bSim.textContent = sim.paused ? `${tgtLabel} Jeda (${sim.scenario})` : `${tgtLabel}: ${sim.scenario} (${sim.speed}x)`;
+            bSim.setAttribute('data-tone', sim.paused ? 'warn' : 'ok');
+          }
         } else {
-          bSim.textContent = 'IDLE / MQTT MONITOR';
+          bSim.textContent = 'Siaga';
           bSim.removeAttribute('data-tone');
         }
-        document.getElementById('btn-sim-start').setAttribute('aria-pressed', sim.running && !sim.paused ? 'true' : 'false');
-        document.getElementById('btn-sim-pause').setAttribute('aria-pressed', sim.paused ? 'true' : 'false');
+
+        const btnStart = document.getElementById('btn-sim-start');
+        const lblStart = document.getElementById('lbl-sim-start');
+        const btnPause = document.getElementById('btn-sim-pause');
+        const lblPause = document.getElementById('lbl-sim-pause');
+        const btnStop = document.getElementById('btn-sim-stop');
+        const mobPlay = document.getElementById('mob-btn-playpause');
+        btnStart.classList.toggle('btn-primary', !sim.running);
+        lblStart.textContent = sim.running ? 'Ulang' : 'Mulai';
+        btnPause.disabled = !sim.running;
+        btnPause.setAttribute('aria-pressed', sim.paused ? 'true' : 'false');
+        lblPause.textContent = sim.paused ? 'Lanjut' : 'Jeda';
+        btnStop.disabled = !sim.running;
+        if (mobPlay) {
+          mobPlay.classList.toggle('btn-primary', !sim.running);
+          mobPlay.textContent = !sim.running ? 'Mulai' : (sim.paused ? 'Lanjut' : 'Jeda');
+        }
+
+        const activeBar = document.getElementById('sim-active-bar');
+        const activeTxt = document.getElementById('sim-active-text');
+        const cfgFields = document.getElementById('sim-config-fields');
+        const toggleBtn = document.getElementById('btn-toggle-sim-cfg');
+        if (sim.running) {
+          activeBar.hidden = false;
+          activeTxt.textContent = `${tgtLabel} • ${SCENARIO_LABELS[sim.scenario] || sim.scenario} (${sim.speed || 1}x)`;
+          cfgFields.hidden = !state.simConfigExpanded;
+          toggleBtn.setAttribute('aria-expanded', state.simConfigExpanded ? 'true' : 'false');
+        } else {
+          state.simConfigExpanded = false;
+          activeBar.hidden = true;
+          cfgFields.hidden = false;
+          toggleBtn.setAttribute('aria-expanded', 'false');
+        }
+
         if (sim.log_file) {
           document.getElementById('txt-logfile').textContent = sim.log_file;
         }
+        updateBrokerBadge();
+        syncAllToolbars();
+      }
+
+      function niceStep(rawStep) {
+        if (rawStep <= 0) return 50;
+        const pow = Math.pow(10, Math.floor(Math.log10(rawStep)));
+        const frac = rawStep / pow;
+        let nice = 1;
+        if (frac <= 1) nice = 1;
+        else if (frac <= 2) nice = 2;
+        else if (frac <= 2.5) nice = 2.5;
+        else if (frac <= 5) nice = 5;
+        else nice = 10;
+        return nice * pow;
       }
 
       function drawCharts() {
-        const rows = state.history;
-        const w = mainCanvas.width;
-        const h = mainCanvas.height;
-        const sw = subCanvas.width;
-        const sh = subCanvas.height;
+        syncCanvasSize(mainCanvas, 960, 320);
+        syncCanvasSize(subCanvas, 960, 150);
 
-        const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-        const gridColor = isDark ? 'rgba(148,163,184,0.18)' : 'rgba(71,85,105,0.16)';
-        const textColor = isDark ? '#94a3b8' : '#475569';
+        const w = mainCanvas._cw;
+        const h = mainCanvas._ch;
+        const dpr = mainCanvas._dpr || 1;
+        const sw = subCanvas._cw;
+        const sh = subCanvas._ch;
+        const sdpr = subCanvas._dpr || 1;
 
+        mCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        sCtx.setTransform(sdpr, 0, 0, sdpr, 0, 0);
         mCtx.clearRect(0, 0, w, h);
         sCtx.clearRect(0, 0, sw, sh);
 
-        const padL = 52, padR = 24, padT = 22, padB = 28;
-        const plotW = w - padL - padR;
-        const plotH = h - padT - padB;
+        const palette = chartPalette();
+        const monoFont = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+
+        const rows = state.history;
+        const compact = w < 520;
+        const padL = compact ? 42 : 52;
+        const padR = compact ? 44 : 68;
+        const padT = 26;
+        const padB = 28;
+        const plotW = Math.max(40, w - padL - padR);
+        const plotH = Math.max(40, h - padT - padB);
+
+        const sPadT = 24, sPadB = 18;
+        const sPlotH = Math.max(30, sh - sPadT - sPadB);
+        const syOf = (v) => sPadT + sPlotH - (Math.max(0, Math.min(100, v)) / 100) * sPlotH;
+
+        function drawSubBase() {
+          sCtx.strokeStyle = palette.grid;
+          sCtx.fillStyle = palette.text;
+          sCtx.font = `11px ${monoFont}`;
+          sCtx.lineWidth = 1;
+          for (const pct of [0, 50, 100]) {
+            const y = syOf(pct);
+            sCtx.beginPath(); sCtx.moveTo(padL, y); sCtx.lineTo(sw - padR, y); sCtx.stroke();
+            sCtx.fillText(`${pct}%`, 6, y + 4);
+          }
+
+          sCtx.font = `600 10px ${monoFont}`;
+          sCtx.fillStyle = palette.fsm;
+          const fsmLabels = compact
+            ? [['NRM', 0], ['WSP', 33], ['BHY', 66], ['FLS', 100]]
+            : [['NORMAL', 0], ['WASPADA', 33], ['BAHAYA', 66], ['FAILSAFE', 100]];
+          for (const [label, val] of fsmLabels) {
+            sCtx.fillText(label, sw - padR + 5, syOf(val) + 3);
+          }
+
+          sCtx.font = '700 11px system-ui, sans-serif';
+          sCtx.fillStyle = palette.duty;
+          sCtx.fillRect(padL, 9, 14, 3);
+          sCtx.fillStyle = palette.text;
+          sCtx.fillText('Duty Kipas (%)', padL + 18, 14);
+
+          const fsmLegX = padL + 118;
+          sCtx.fillStyle = palette.fsm;
+          sCtx.fillRect(fsmLegX, 9, 14, 3);
+          sCtx.fillStyle = palette.text;
+          sCtx.fillText('State FSM', fsmLegX + 18, 14);
+        }
+
+        drawSubBase();
 
         if (!rows.length) {
-          mCtx.fillStyle = textColor;
-          mCtx.font = '600 14px system-ui, sans-serif';
-          mCtx.fillText(activeSource() === 'esp32'
-            ? 'Menunggu telemetri ESP32 dari broker MQTT (:6669) ...'
-            : 'Belum ada data SITL — klik "▶ Mulai" pada panel Operasi Simulasi SITL ...', padL + 20, h / 2);
+          mCtx.fillStyle = palette.text;
+          mCtx.font = '600 13px system-ui, sans-serif';
+          const msg = activeSource() === 'esp32'
+            ? 'Menunggu telemetri ESP32 dari broker MQTT (:6669)...'
+            : 'Belum ada data SITL — tekan "Mulai" di panel kanan atau di bawah.';
+          mCtx.fillText(msg, Math.min(padL + 10, 24), h / 2, w - 36);
+
+          sCtx.fillStyle = palette.muted;
+          sCtx.font = '600 12px system-ui, sans-serif';
+          sCtx.fillText('Belum ada histori duty kipas & state FSM.', Math.min(padL + 10, 24), sh / 2 + 8, sw - padL - padR - 12);
+          document.getElementById('chart-sr-summary').textContent = msg;
           return;
         }
 
-        const maxT = rows[rows.length - 1].t ?? 0;
-        const minT = state.windowSec > 0 ? Math.max(0, maxT - state.windowSec) : (rows[0].t ?? 0);
-        const spanT = Math.max(60, (maxT + (state.layers.forecast ? 60 : 5)) - minT);
-
-        // Hanya ambil segmen waktu monoton terakhir agar tidak pernah ada garis miring balik ke kiri
         const monotonic = [];
         for (const r of rows) {
           const rt = r.t ?? 0;
-          if (monotonic.length && rt < (monotonic[monotonic.length - 1].t ?? 0)) {
-            monotonic.length = 0;
-          }
-          if (monotonic.length && rt === (monotonic[monotonic.length - 1].t ?? -1)) {
-            monotonic[monotonic.length - 1] = r;
-          } else {
-            monotonic.push(r);
-          }
+          if (monotonic.length && rt < (monotonic[monotonic.length - 1].t ?? 0)) monotonic.length = 0;
+          if (monotonic.length && rt === (monotonic[monotonic.length - 1].t ?? -1)) monotonic[monotonic.length - 1] = r;
+          else monotonic.push(r);
         }
+
+        const maxT = monotonic[monotonic.length - 1].t ?? 0;
+        const minT = state.windowSec > 0 ? Math.max(0, maxT - state.windowSec) : (monotonic[0].t ?? 0);
+        const spanT = Math.max(60, (maxT + (state.layers.forecast ? 60 : 5)) - minT);
         const visible = monotonic.filter((r) => (r.t ?? 0) >= minT);
-        let maxY = 180;
+
+        let dataMax = 0;
         visible.forEach((r) => {
-          if (state.layers.fi && r.fi != null) maxY = Math.max(maxY, r.fi * 1.1);
-          if (state.layers.pm && r.pm != null) maxY = Math.max(maxY, r.pm * 1.1);
-          if (state.layers.pm_true && r.pm_true != null) maxY = Math.max(maxY, r.pm_true * 1.1);
-          if (state.layers.pm_raw && r.pm_raw != null) maxY = Math.max(maxY, r.pm_raw * 1.1);
-          if (state.layers.forecast && r.forecast != null) maxY = Math.max(maxY, r.forecast * 1.1);
-          if (state.layers.gas_ppm && r.gas_ppm != null) maxY = Math.max(maxY, r.gas_ppm * 0.22);
+          if (state.layers.fi && r.fi != null) dataMax = Math.max(dataMax, r.fi * 1.12);
+          if (state.layers.pm && r.pm != null) dataMax = Math.max(dataMax, r.pm * 1.12);
+          if (state.layers.pm_true && r.pm_true != null) dataMax = Math.max(dataMax, r.pm_true * 1.12);
+          if (state.layers.pm_raw && r.pm_raw != null) dataMax = Math.max(dataMax, r.pm_raw * 1.12);
+          if (state.layers.forecast && r.forecast != null) dataMax = Math.max(dataMax, r.forecast * 1.12);
+          if (state.layers.gas_ppm && r.gas_ppm != null) dataMax = Math.max(dataMax, r.gas_ppm * 0.22);
+          if (state.layers.g_scaled && r.g != null) dataMax = Math.max(dataMax, r.g * 105);
+          if (state.layers.voltages) {
+            dataMax = Math.max(dataMax, (r.v_dust ?? 0) * 55, (r.v_mq ?? 0) * 55);
+          }
         });
+
+        const baseFloor = state.zoomY ? Math.max(20, dataMax) : (state.layers.thresholds ? 170 : Math.max(40, dataMax));
+        const rawMaxY = Math.max(baseFloor, dataMax);
+        const yStep = niceStep(rawMaxY / 4);
+        const maxY = Math.ceil(rawMaxY / yStep) * yStep;
 
         const xOf = (t) => padL + ((t - minT) / spanT) * plotW;
         const yOf = (v) => padT + plotH - (Math.max(0, Math.min(maxY, v)) / maxY) * plotH;
 
-        // Grid & Y labels
-        mCtx.strokeStyle = gridColor;
-        mCtx.fillStyle = textColor;
-        mCtx.font = '11px system-ui, sans-serif';
+        // Future +60s horizon shading & vertical "SEKARANG" boundary when forecast active
+        if (state.layers.forecast) {
+          const xNow = xOf(maxT);
+          const xRight = w - padR;
+          if (xNow < xRight) {
+            mCtx.save();
+            mCtx.fillStyle = palette.forecastFill;
+            mCtx.fillRect(xNow, padT, xRight - xNow, plotH);
+            mCtx.strokeStyle = palette.nowLine;
+            mCtx.lineWidth = 1.25;
+            mCtx.setLineDash([4, 3]);
+            mCtx.beginPath();
+            mCtx.moveTo(xNow, padT);
+            mCtx.lineTo(xNow, h - padB);
+            mCtx.stroke();
+            mCtx.fillStyle = palette.forecast;
+            mCtx.font = `700 10px ${monoFont}`;
+            const nowLbl = compact ? 'NOW' : 'SEKARANG -> +60s';
+            const txtW = mCtx.measureText(nowLbl).width;
+            mCtx.fillText(nowLbl, Math.min(xRight - txtW - 4, xNow + 5), padT + 12);
+            mCtx.restore();
+          }
+        }
+
+        // Horizontal Y grid + rounded labels
+        mCtx.strokeStyle = palette.grid;
+        mCtx.fillStyle = palette.text;
+        mCtx.font = `11px ${monoFont}`;
         mCtx.lineWidth = 1;
-        for (let i = 0; i <= 4; i++) {
-          const val = (maxY / 4) * i;
+        for (let val = 0; val <= maxY + 0.001; val += yStep) {
           const y = yOf(val);
           mCtx.beginPath();
           mCtx.moveTo(padL, y);
           mCtx.lineTo(w - padR, y);
           mCtx.stroke();
-          mCtx.fillText(val.toFixed(0), 10, y + 4);
+          mCtx.fillText(Math.round(val).toString(), 6, y + 4);
+        }
+        mCtx.font = '700 11px system-ui, sans-serif';
+        mCtx.fillText('µg/m³ / FI', 6, 15);
+
+        const xStep = niceStep(spanT / (compact ? 4 : 6));
+        const firstTick = Math.ceil(minT / xStep) * xStep;
+        mCtx.font = `10.5px ${monoFont}`;
+        let lastTickX = -Infinity;
+        for (let tv = firstTick; tv <= minT + spanT + 0.001; tv += xStep) {
+          const x = xOf(tv);
+          mCtx.beginPath();
+          mCtx.moveTo(x, padT);
+          mCtx.lineTo(x, h - padB);
+          mCtx.stroke();
+          const tx = Math.max(padL, Math.min(w - padR - 26, x - 10));
+          if (tx - lastTickX >= 38) {
+            mCtx.fillText(`${Math.round(tv)}s`, tx, h - 9);
+            lastTickX = tx;
+          }
         }
 
-        // Thresholds
+        // Threshold lines (when within current Y range)
         if (state.layers.thresholds) {
-          const yW = yOf(55);
-          const yB = yOf(150);
           mCtx.save();
-          mCtx.setLineDash([6, 4]);
-          mCtx.strokeStyle = '#fbbf24';
-          mCtx.beginPath(); mCtx.moveTo(padL, yW); mCtx.lineTo(w - padR, yW); mCtx.stroke();
-          mCtx.fillStyle = '#fbbf24';
-          mCtx.fillText('WASPADA (55)', padL + 6, yW - 5);
-
-          mCtx.strokeStyle = '#f87171';
-          mCtx.beginPath(); mCtx.moveTo(padL, yB); mCtx.lineTo(w - padR, yB); mCtx.stroke();
-          mCtx.fillStyle = '#f87171';
-          mCtx.fillText('BAHAYA (150)', padL + 6, yB - 5);
+          mCtx.font = '700 10.5px system-ui, sans-serif';
+          mCtx.setLineDash([7, 5]);
+          if (55 <= maxY) {
+            const yW = yOf(55);
+            mCtx.strokeStyle = palette.waspada;
+            mCtx.beginPath(); mCtx.moveTo(padL, yW); mCtx.lineTo(w - padR, yW); mCtx.stroke();
+            mCtx.fillStyle = palette.waspada;
+            mCtx.fillText('WASPADA (55)', padL + 6, yW - 5);
+          }
+          if (150 <= maxY) {
+            const yB = yOf(150);
+            mCtx.strokeStyle = palette.bahaya;
+            mCtx.beginPath(); mCtx.moveTo(padL, yB); mCtx.lineTo(w - padR, yB); mCtx.stroke();
+            mCtx.fillStyle = palette.bahaya;
+            mCtx.fillText('BAHAYA (150)', padL + 6, yB - 5);
+          }
           mCtx.restore();
         }
 
-        function plotSeries(extractFn, color, width = 2, dash = [], xOffset = 0) {
+        function plotSeries(extractFn, color, width = 2, dash = [], xOffset = 0, drawTipDot = false) {
           mCtx.save();
           mCtx.strokeStyle = color;
           mCtx.lineWidth = width;
@@ -1996,6 +3832,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           mCtx.beginPath();
           let started = false;
           let prevT = -Infinity;
+          let lastX = null, lastY = null;
           for (const r of visible) {
             const v = extractFn(r);
             if (v == null || Number.isNaN(v)) continue;
@@ -2005,135 +3842,329 @@ RENDERED_HTML = """<!DOCTYPE html>
             if (!started || rt <= prevT) { mCtx.moveTo(x, y); started = true; }
             else mCtx.lineTo(x, y);
             prevT = rt;
+            lastX = x;
+            lastY = y;
           }
           mCtx.stroke();
+          if (drawTipDot && lastX != null) {
+            mCtx.setLineDash([]);
+            mCtx.fillStyle = color;
+            mCtx.beginPath();
+            mCtx.arc(lastX, lastY, 3.5, 0, Math.PI * 2);
+            mCtx.fill();
+          }
           mCtx.restore();
         }
 
-        if (state.layers.pm_raw) plotSeries((r) => r.pm_raw, '#94a3b8', 1.4);
-        if (state.layers.pm_true) plotSeries((r) => r.pm_true, '#4ade80', 1.8);
+        if (state.layers.pm_raw) plotSeries((r) => r.pm_raw, palette.pm_raw, 1.4);
+        if (state.layers.pm_true) plotSeries((r) => r.pm_true, palette.pm_true, 2.0);
         if (state.layers.voltages) {
-          plotSeries((r) => (r.v_dust ?? 0) * 50, '#2dd4bf', 1.5, [2, 2]);
-          plotSeries((r) => (r.v_mq ?? 0) * 50, '#14b8a6', 1.5, [4, 2]);
+          plotSeries((r) => (r.v_dust ?? 0) * 50, palette.v_dust, 1.6, [4, 3]);
+          plotSeries((r) => (r.v_mq ?? 0) * 50, palette.v_mq, 1.6, [6, 3]);
         }
-        if (state.layers.gas_ppm) plotSeries((r) => (r.gas_ppm ?? 400) * 0.2, '#c084fc', 1.8, [3, 3]);
-        if (state.layers.g_scaled) plotSeries((r) => (r.g ?? 0) * 100, '#a855f7', 1.8);
-        if (state.layers.pm) plotSeries((r) => r.pm, '#38bdf8', 2.4);
-        if (state.layers.fi) plotSeries((r) => r.fi, '#f87171', 2.8);
-        if (state.layers.forecast) plotSeries((r) => r.forecast, '#fbbf24', 2.2, [6, 4], 60);
+        if (state.layers.gas_ppm) plotSeries((r) => (r.gas_ppm ?? 400) * 0.2, palette.gas_ppm, 1.8, [4, 3]);
+        if (state.layers.g_scaled) plotSeries((r) => (r.g ?? 0) * 100, palette.g_scaled, 1.8, [2, 3]);
+        if (state.layers.pm) plotSeries((r) => r.pm, palette.pm, 2.4);
+        if (state.layers.fi) plotSeries((r) => r.fi, palette.fi, 2.8);
+        if (state.layers.forecast) plotSeries((r) => r.forecast, palette.forecast, 2.4, [3, 3], 60, true);
 
-        // Hover crosshair inspection
-        if (state.hoverX != null && state.hoverX >= padL && state.hoverX <= w - padR) {
+        // Sub-chart Step Functions for discrete State FSM & Duty %
+        const stateCode = { NORMAL: 0, WASPADA: 33, BAHAYA: 66, FAILSAFE: 100 };
+        function plotStepSub(extractYFn, color, width, dash = []) {
+          sCtx.save();
+          sCtx.strokeStyle = color;
+          sCtx.lineWidth = width;
+          sCtx.setLineDash(dash);
+          sCtx.beginPath();
+          let prevT = -Infinity;
+          let prevY = null;
+          visible.forEach((r, idx) => {
+            const rt = r.t ?? 0;
+            const x = xOf(rt);
+            const y = extractYFn(r);
+            if (idx === 0 || rt <= prevT || prevY === null) {
+              sCtx.moveTo(x, y);
+            } else {
+              sCtx.lineTo(x, prevY);
+              sCtx.lineTo(x, y);
+            }
+            prevT = rt;
+            prevY = y;
+          });
+          sCtx.stroke();
+          sCtx.restore();
+        }
+        plotStepSub((r) => syOf(r.duty ?? 0), palette.duty, 2.5);
+        plotStepSub((r) => {
+          const stPct = stateCode[r.state] ?? 0;
+          return syOf(stPct) - (stPct === 0 ? 1.5 : 0);
+        }, palette.fsm, 2.0, [6, 3]);
+
+        const lastVisible = visible[visible.length - 1];
+        if (lastVisible) {
+          document.getElementById('chart-sr-summary').textContent =
+            `Sampel terbaru t=${(lastVisible.t ?? 0).toFixed(0)}s, State ${lastVisible.state}, FI ${(lastVisible.fi ?? 0).toFixed(1)}, PM ${(lastVisible.pm ?? 0).toFixed(1)}, Kipas ${(lastVisible.duty ?? 0).toFixed(0)}%.`;
+        }
+
+        // Synchronized Crosshair + Tooltip across both canvases
+        if (state.hoverX != null && state.hoverX >= padL && state.hoverX <= w - padR && visible.length) {
           const targetT = minT + ((state.hoverX - padL) / plotW) * spanT;
-          let nearest = visible[0];
-          for (const r of visible) {
-            if (Math.abs((r.t ?? 0) - targetT) < Math.abs((nearest.t ?? 0) - targetT)) nearest = r;
+          let nearestIdx = 0;
+          for (let i = 1; i < visible.length; i++) {
+            if (Math.abs((visible[i].t ?? 0) - targetT) < Math.abs((visible[nearestIdx].t ?? 0) - targetT)) {
+              nearestIdx = i;
+            }
           }
+          state.hoverIdx = nearestIdx;
+          const nearest = visible[nearestIdx];
           if (nearest) {
+            if (state.hoverFromKey) {
+              state.hoverFromKey = false;
+              const lr = document.getElementById('chart-live-readout');
+              if (lr) {
+                lr.textContent = `Inspeksi t=${(nearest.t ?? 0).toFixed(0)} detik, ${nearest.state}, FI ${(nearest.fi ?? 0).toFixed(1)}, PM ${(nearest.pm ?? 0).toFixed(1)}, Kipas ${(nearest.duty ?? 0).toFixed(0)} persen.`;
+              }
+            }
             const cx = xOf(nearest.t ?? 0);
+            const lines = [
+              { font: `700 11px ${monoFont}`, text: `t=${(nearest.t ?? 0).toFixed(0)}s | FSM:${nearest.state}` },
+              { font: `11px ${monoFont}`, text: `FI:${(nearest.fi ?? 0).toFixed(1)} | PM:${(nearest.pm ?? 0).toFixed(1)}` },
+              { font: `11px ${monoFont}`, text: `Gas:${(nearest.gas_ppm ?? 400).toFixed(0)}ppm (g=${(nearest.g ?? 0).toFixed(2)})` },
+              { font: `11px ${monoFont}`, text: `Duty:${(nearest.duty ?? 0).toFixed(0)}% | Fc:${nearest.forecast != null ? nearest.forecast.toFixed(1) : '-'}` },
+            ];
+            if (state.layers.pm_true || state.layers.pm_raw) {
+              const pt = nearest.pm_true != null ? nearest.pm_true.toFixed(1) : '-';
+              lines.push({ font: `11px ${monoFont}`, text: `True:${pt} | Raw:${(nearest.pm_raw ?? 0).toFixed(1)} | dC:${(nearest.dcdt ?? 0).toFixed(2)}` });
+            }
+            if (state.layers.voltages) {
+              lines.push({ font: `11px ${monoFont}`, text: `Vd:${(nearest.v_dust ?? 0).toFixed(2)}V | Vm:${(nearest.v_mq ?? 0).toFixed(2)}V` });
+            }
+            if (nearest.parity_delta_fi != null && nearest.ref_fi != null) {
+              lines.push({ font: `11px ${monoFont}`, text: `RefFI:${nearest.ref_fi.toFixed(1)} | dFI:${nearest.parity_delta_fi.toFixed(2)}` });
+            }
+
+            const tipW = Math.min(238, w - 16);
+            const tipH = 14 + lines.length * 17;
+            let boxX = cx + 10;
+            if (boxX + tipW > w - padR - 4) boxX = cx - tipW - 10;
+            boxX = Math.max(padL + 4, Math.min(w - tipW - 6, boxX));
+
             mCtx.save();
-            mCtx.strokeStyle = textColor;
+            mCtx.strokeStyle = palette.text;
             mCtx.setLineDash([3, 3]);
             mCtx.beginPath(); mCtx.moveTo(cx, padT); mCtx.lineTo(cx, h - padB); mCtx.stroke();
-            const boxX = Math.min(w - 205, Math.max(padL + 8, cx + 10));
-            mCtx.fillStyle = isDark ? 'rgba(15,23,42,0.92)' : 'rgba(255,255,255,0.94)';
-            mCtx.strokeStyle = gridColor;
+            mCtx.fillStyle = palette.tipBg;
+            mCtx.strokeStyle = palette.grid;
             mCtx.setLineDash([]);
-            mCtx.fillRect(boxX, padT + 6, 190, 88);
-            mCtx.strokeRect(boxX, padT + 6, 190, 88);
-            mCtx.fillStyle = isDark ? '#f8fafc' : '#0f172a';
-            mCtx.font = '600 11px system-ui, sans-serif';
-            mCtx.fillText(`t = ${(nearest.t ?? 0).toFixed(0)}s | FSM: ${nearest.state}`, boxX + 8, padT + 22);
-            mCtx.font = '11px system-ui, sans-serif';
-            mCtx.fillText(`FI: ${(nearest.fi ?? 0).toFixed(1)} | PM: ${(nearest.pm ?? 0).toFixed(1)} µg/m³`, boxX + 8, padT + 40);
-            mCtx.fillText(`Gas: ${(nearest.gas_ppm ?? 400).toFixed(0)} ppm (g=${(nearest.g ?? 0).toFixed(2)})`, boxX + 8, padT + 58);
-            mCtx.fillText(`Duty: ${(nearest.duty ?? 0).toFixed(0)}% | Fc+60s: ${(nearest.forecast ?? 0).toFixed(1)}`, boxX + 8, padT + 76);
+            mCtx.fillRect(boxX, padT + 4, tipW, tipH);
+            mCtx.strokeRect(boxX, padT + 4, tipW, tipH);
+            mCtx.fillStyle = palette.tipFg;
+            lines.forEach((ln, idx) => {
+              mCtx.font = ln.font;
+              mCtx.fillText(ln.text, boxX + 8, padT + 20 + idx * 17, tipW - 14);
+            });
             mCtx.restore();
+
+            sCtx.save();
+            sCtx.strokeStyle = palette.text;
+            sCtx.setLineDash([3, 3]);
+            sCtx.beginPath(); sCtx.moveTo(cx, sPadT); sCtx.lineTo(cx, sh - sPadB); sCtx.stroke();
+            sCtx.restore();
           }
         }
-
-        // Sub-chart: Duty % (0-100) and State FSM (0, 25, 50, 75)
-        const sPadT = 18, sPadB = 20;
-        const sPlotH = sh - sPadT - sPadB;
-        const syOf = (v) => sPadT + sPlotH - (Math.max(0, Math.min(100, v)) / 100) * sPlotH;
-
-        sCtx.strokeStyle = gridColor;
-        sCtx.fillStyle = textColor;
-        sCtx.font = '10.5px system-ui, sans-serif';
-        for (const pct of [0, 50, 100]) {
-          const y = syOf(pct);
-          sCtx.beginPath(); sCtx.moveTo(padL, y); sCtx.lineTo(sw - padR, y); sCtx.stroke();
-          sCtx.fillText(`${pct}%`, 12, y + 3);
-        }
-
-        const stateCode = { NORMAL: 0, WASPADA: 33, BAHAYA: 66, FAILSAFE: 100 };
-        sCtx.strokeStyle = '#fbbf24';
-        sCtx.lineWidth = 1.8;
-        sCtx.beginPath();
-        let prevStT = -Infinity;
-        visible.forEach((r, idx) => {
-          const rt = r.t ?? 0;
-          const x = xOf(rt);
-          const y = syOf(stateCode[r.state] ?? 0);
-          if (idx === 0 || rt <= prevStT) sCtx.moveTo(x, y);
-          else sCtx.lineTo(x, y);
-          prevStT = rt;
-        });
-        sCtx.stroke();
-
-        sCtx.strokeStyle = '#4ade80';
-        sCtx.lineWidth = 2.3;
-        sCtx.beginPath();
-        let prevDuT = -Infinity;
-        visible.forEach((r, idx) => {
-          const rt = r.t ?? 0;
-          const x = xOf(rt);
-          const y = syOf(r.duty ?? 0);
-          if (idx === 0 || rt <= prevDuT) sCtx.moveTo(x, y);
-          else sCtx.lineTo(x, y);
-          prevDuT = rt;
-        });
-        sCtx.stroke();
       }
+
+      function applyPreset(name) {
+        if (!PRESETS[name]) return;
+        state.preset = name;
+        state.layers = { ...PRESETS[name] };
+        savePrefs();
+        syncLayerButtons();
+        scheduleDraw();
+      }
+
+      document.querySelectorAll('.theme-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          applyTheme(btn.getAttribute('data-theme-val'), true);
+        });
+      });
+
+      document.getElementById('btn-toggle-layers').addEventListener('click', () => {
+        const drawer = document.getElementById('layers-drawer');
+        const btn = document.getElementById('btn-toggle-layers');
+        const willOpen = drawer.hidden;
+        drawer.hidden = !willOpen;
+        btn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+        syncAllToolbars();
+      });
+
+      document.getElementById('btn-toggle-sim-cfg').addEventListener('click', () => {
+        state.simConfigExpanded = !state.simConfigExpanded;
+        document.getElementById('sim-config-fields').hidden = !state.simConfigExpanded;
+        document.getElementById('btn-toggle-sim-cfg').setAttribute('aria-expanded', state.simConfigExpanded ? 'true' : 'false');
+        syncAllToolbars();
+      });
+
+      document.getElementById('sw-zoom-y').addEventListener('change', (e) => {
+        state.zoomY = !!e.target.checked;
+        savePrefs();
+        scheduleDraw();
+      });
+
+      document.querySelectorAll('.preset-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          applyPreset(btn.getAttribute('data-preset'));
+        });
+      });
 
       // Wire layer toggle buttons
       document.querySelectorAll('.layer-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
+          if (btn.disabled) return;
           const layer = btn.getAttribute('data-layer');
-          const next = btn.getAttribute('aria-pressed') !== 'true';
-          btn.setAttribute('aria-pressed', next ? 'true' : 'false');
-          state.layers[layer] = next;
-          drawCharts();
+          state.layers[layer] = !state.layers[layer];
+          state.preset = 'custom';
+          savePrefs();
+          syncLayerButtons();
+          scheduleDraw();
         });
       });
 
-      // Wire time window buttons
-      document.querySelectorAll('.win-btn').forEach((btn) => {
-        btn.addEventListener('click', () => {
-          document.querySelectorAll('.win-btn').forEach((b) => b.setAttribute('aria-pressed', 'false'));
-          btn.setAttribute('aria-pressed', 'true');
-          state.windowSec = Number(btn.getAttribute('data-win') || 0);
-          drawCharts();
+      document.getElementById('sel-window').addEventListener('change', (e) => {
+        state.windowSec = Number(e.target.value || 0);
+        savePrefs();
+        scheduleDraw();
+      });
+
+      // Synchronized Pointer/Touch & Keyboard crosshair inspection
+      function updateHoverFromPointer(e, canvas) {
+        const rect = canvas.getBoundingClientRect();
+        if (!rect.width) return;
+        state.hoverFromKey = false;
+        state.hoverX = e.clientX - rect.left;
+        scheduleDraw();
+      }
+      [mainCanvas, subCanvas].forEach((cvs) => {
+        cvs.addEventListener('pointermove', (e) => updateHoverFromPointer(e, cvs));
+        cvs.addEventListener('pointerdown', (e) => updateHoverFromPointer(e, cvs));
+        cvs.addEventListener('pointerleave', (e) => {
+          if (e.pointerType === 'mouse') {
+            state.hoverX = null;
+            scheduleDraw();
+          }
         });
       });
-
-      // Hover crosshair
-      mainCanvas.addEventListener('mousemove', (e) => {
-        const rect = mainCanvas.getBoundingClientRect();
-        state.hoverX = ((e.clientX - rect.left) / rect.width) * mainCanvas.width;
-        drawCharts();
-      });
-      mainCanvas.addEventListener('mouseleave', () => {
-        state.hoverX = null;
-        drawCharts();
+      document.addEventListener('pointerdown', (e) => {
+        if (state.hoverX != null && e.target !== mainCanvas && e.target !== subCanvas) {
+          state.hoverX = null;
+          scheduleDraw();
+        }
       });
 
-      // Export PNG & Mobile JSON
+      mainCanvas.addEventListener('keydown', (e) => {
+        if (!state.history.length) return;
+        const w = mainCanvas._cw || 960;
+        const compact = w < 520;
+        const padL = compact ? 42 : 52;
+        const padR = compact ? 44 : 68;
+        const plotW = Math.max(40, w - padL - padR);
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+          e.preventDefault();
+          const cur = state.hoverX != null ? state.hoverX : (padL + plotW);
+          const stepPx = Math.max(8, plotW / 24);
+          state.hoverX = e.key === 'ArrowLeft'
+            ? Math.max(padL, cur - stepPx)
+            : Math.min(padL + plotW, cur + stepPx);
+          state.hoverFromKey = true;
+          scheduleDraw();
+        } else if (e.key === 'Escape') {
+          state.hoverX = null;
+          scheduleDraw();
+        }
+      });
+
+      // Composite opaque PNG export with multi-row wrapped legend
       document.getElementById('btn-export-png').addEventListener('click', () => {
+        if (!state.history.length) {
+          showToast('Belum ada data grafik untuk diekspor.', 'warn');
+          return;
+        }
+        drawCharts();
+        const dark = isDarkTheme();
+        const pal = chartPalette(dark);
+        const specs = getLegendSpecs(pal);
+        const cw = mainCanvas._cw || 960;
+        const mh = mainCanvas._ch || 320;
+        const sh = subCanvas._ch || 150;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+        const tmpCanvas = document.createElement('canvas');
+        const tCtx = tmpCanvas.getContext('2d');
+        tCtx.font = '600 11px system-ui, sans-serif';
+        const legendRows = [];
+        let curRow = [];
+        let curW = 0;
+        const maxRowW = Math.max(220, cw - 8);
+        for (const s of specs) {
+          const itemW = 30 + Math.ceil(tCtx.measureText(s.label).width);
+          if (curRow.length && curW + itemW > maxRowW) {
+            legendRows.push(curRow);
+            curRow = [s];
+            curW = itemW;
+          } else {
+            curRow.push(s);
+            curW += itemW;
+          }
+        }
+        if (curRow.length) legendRows.push(curRow);
+
+        const headerH = specs.length ? (48 + legendRows.length * 18) : 44;
+        const gap = 10;
+        const out = document.createElement('canvas');
+        out.width = Math.round((cw + 24) * dpr);
+        out.height = Math.round((headerH + mh + gap + sh + 16) * dpr);
+        const ctx = out.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.fillStyle = pal.exportBg;
+        ctx.fillRect(0, 0, cw + 24, headerH + mh + gap + sh + 16);
+        ctx.fillStyle = pal.tipFg;
+        ctx.font = '700 14px system-ui, sans-serif';
+        const srcText = document.getElementById('src-label').textContent;
+        ctx.fillText(`Karhutla Edge-IoT — ${srcText}`, 14, 22);
+        ctx.fillStyle = pal.muted;
+        ctx.font = '11px system-ui, sans-serif';
+        const parityStr = document.getElementById('parity-badge').hidden ? '' : ` • ${document.getElementById('parity-badge').textContent}`;
+        ctx.fillText(`Diekspor: ${new Date().toLocaleString('id-ID')} • Preset: ${state.preset}${parityStr}`, 14, 38);
+
+        if (legendRows.length) {
+          ctx.font = '600 11px system-ui, sans-serif';
+          legendRows.forEach((rSpecs, rIdx) => {
+            let lx = 14;
+            const ly = 58 + rIdx * 18;
+            for (const s of rSpecs) {
+              const tw = ctx.measureText(s.label).width;
+              ctx.save();
+              ctx.strokeStyle = s.color;
+              ctx.lineWidth = 2.5;
+              if (s.style === 'dashed') ctx.setLineDash([5, 3]);
+              else if (s.style === 'dotted') ctx.setLineDash([2, 3]);
+              ctx.beginPath(); ctx.moveTo(lx, ly - 4); ctx.lineTo(lx + 16, ly - 4); ctx.stroke();
+              ctx.restore();
+              ctx.fillStyle = pal.tipFg;
+              ctx.fillText(s.label, lx + 20, ly);
+              lx += 30 + tw;
+            }
+          });
+        }
+
+        ctx.drawImage(mainCanvas, 12, headerH, cw, mh);
+        ctx.drawImage(subCanvas, 12, headerH + mh + gap, cw, sh);
+
         const a = document.createElement('a');
-        a.download = `karhutla_dashboard_${Date.now()}.png`;
-        a.href = mainCanvas.toDataURL('image/png');
+        a.download = `karhutla_${activeSource()}_${Date.now()}.png`;
+        a.href = out.toDataURL('image/png');
         a.click();
+        showToast('Grafik PNG berlegenda lengkap berhasil diunduh.', 'ok');
       });
 
       document.getElementById('btn-export-mobile').addEventListener('click', () => {
@@ -2141,74 +4172,298 @@ RENDERED_HTML = """<!DOCTYPE html>
         a.download = 'karhutla_iot_mqtt_panel.json';
         a.href = '/api/mobile-config';
         a.click();
+        showToast('File konfigurasi HP (.json) diunduh.', 'ok');
       });
 
-      // Wire Actuator Override Commands
-      document.querySelectorAll('#cmd-toolbar .cmd-btn').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          const cmd = btn.getAttribute('data-cmd');
-          await fetch('/api/cmd', {
+      document.getElementById('btn-fallback-sitl').addEventListener('click', switchFallbackToSitl);
+
+      // Native <dialog> confirmation & help handlers
+      const dlg = document.getElementById('confirm-dialog');
+      const dlgTitle = document.getElementById('confirm-title');
+      const dlgDesc = document.getElementById('confirm-desc');
+      const dlgOk = document.getElementById('confirm-ok');
+      const dlgCancel = document.getElementById('confirm-cancel');
+      const helpDlg = document.getElementById('help-dialog');
+      let pendingConfirm = null;
+      let pendingCancel = null;
+
+      function askConfirm(title, desc, okLabel, onConfirm, tone = 'danger', onCancel = null) {
+        if (typeof dlg.showModal !== 'function') {
+          onConfirm();
+          return;
+        }
+        dlgTitle.textContent = title;
+        dlgDesc.textContent = desc;
+        dlgOk.textContent = okLabel;
+        if (tone === 'danger') dlgOk.setAttribute('data-variant', 'danger');
+        else dlgOk.removeAttribute('data-variant');
+        pendingConfirm = onConfirm;
+        pendingCancel = onCancel;
+        dlg.showModal();
+      }
+
+      function dismissConfirm() {
+        const cancelFn = pendingCancel;
+        pendingConfirm = null;
+        pendingCancel = null;
+        if (dlg.open) dlg.close();
+        if (cancelFn) cancelFn();
+      }
+
+      dlgCancel.addEventListener('click', dismissConfirm);
+      dlg.addEventListener('cancel', (e) => {
+        e.preventDefault();
+        dismissConfirm();
+      });
+      dlg.addEventListener('click', (e) => {
+        if (e.target === dlg) dismissConfirm();
+      });
+      dlg.addEventListener('close', () => {
+        if (pendingCancel) {
+          const fn = pendingCancel;
+          pendingConfirm = null;
+          pendingCancel = null;
+          fn();
+        } else {
+          pendingConfirm = null;
+        }
+      });
+      dlgOk.addEventListener('click', () => {
+        const fn = pendingConfirm;
+        pendingConfirm = null;
+        pendingCancel = null;
+        dlg.close();
+        if (fn) fn();
+      });
+
+      document.getElementById('btn-open-help').addEventListener('click', () => {
+        if (typeof helpDlg.showModal === 'function') helpDlg.showModal();
+      });
+      document.getElementById('help-close').addEventListener('click', () => helpDlg.close());
+      helpDlg.addEventListener('click', (e) => {
+        if (e.target === helpDlg) helpDlg.close();
+      });
+
+      function setCmdButtonsBusy(busy) {
+        state.cmdBusy = busy;
+        document.querySelectorAll('#cmd-toolbar .cmd-btn, .mob-cmd-btn, #btn-cmd-reset').forEach((b) => {
+          b.setAttribute('aria-busy', busy ? 'true' : 'false');
+        });
+      }
+
+      async function sendActuatorCmd(cmd) {
+        if (state.cmdBusy) return;
+        setCmdButtonsBusy(true);
+        try {
+          const r = await fetch('/api/cmd', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ cmd }),
           });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const res = await r.json();
+          if (!res.ok) {
+            showToast(res.reason || `Perintah ${cmd} ditolak.`, 'danger');
+            return;
+          }
+          showToast(`Perintah ${cmd} dikirim.`, 'ok');
+        } catch (err) {
+          showToast(`Gagal mengirim ${cmd}: server tidak merespons.`, 'danger');
+        } finally {
+          setCmdButtonsBusy(false);
+        }
+      }
+
+      function requestActuatorCmd(cmd) {
+        const activeRow = state.src[activeSource()].latest;
+        if (cmd === 'FORCE_OFF' && activeRow && (activeRow.state === 'BAHAYA' || activeRow.state === 'WASPADA' || activeRow.state === 'FAILSAFE')) {
+          askConfirm(
+            'Matikan Kipas Saat Kondisi Kritis?',
+            `Sistem sedang berada pada status ${activeRow.state} (FI ${(activeRow.fi ?? 0).toFixed(1)} µg/m³). Menyetel FORCE OFF (0%) akan memutus ventilasi pengaman.`,
+            'Tetap Matikan (OFF 0%)',
+            () => sendActuatorCmd('FORCE_OFF'),
+            'danger',
+          );
+          return;
+        }
+        sendActuatorCmd(cmd);
+      }
+
+      async function postSim(payload, label = '') {
+        try {
+          const r = await fetch('/api/sim', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (!r.ok) throw new Error('Server simulasi menolak permintaan');
+          const res = await r.json();
+          if (res.sim) {
+            updateSimBadges(res.sim);
+            updateSafetyCallout(state.src[activeSource()].latest, res.sim);
+          }
+          if (!res.ok) throw new Error('Operasi simulasi ditolak');
+          if (label) showToast(label, 'ok');
+          return res;
+        } catch (err) {
+          showToast('Perintah simulasi gagal diproses — menyinkronkan ulang status.', 'danger');
+          loadStateSnapshot(true, true);
+          return null;
+        }
+      }
+
+      // Wire Actuator Override Commands (Desktop + Mobile Dock)
+      document.querySelectorAll('#cmd-toolbar .cmd-btn, .mob-cmd-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          requestActuatorCmd(btn.getAttribute('data-cmd'));
         });
       });
 
-      // Wire Simulation Operations
-      async function postSim(payload) {
-        await fetch('/api/sim', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
+      document.getElementById('btn-cmd-reset').addEventListener('click', () => {
+        askConfirm(
+          'Reset Sistem & Filter?',
+          'Aksi ini mengatur ulang estimator Kalman, state FSM menjadi NORMAL, mode AUTO, serta menghapus histori kurva yang sedang berjalan.',
+          'Ya, Reset Sistem',
+          () => sendActuatorCmd('RESET'),
+          'danger',
+        );
+      });
+
+      async function launchSim(tgt, overrideScenario = null) {
+        const bucket = tgt === 'hils' ? 'esp32' : 'sitl';
+        const scenario = overrideScenario || document.getElementById('sel-scenario').value;
+        const ai_preempt = document.getElementById('sw-preempt').checked;
+        const fault_inject = document.getElementById('sw-fault').checked;
+        const speedBtn = document.querySelector('.spd-btn[aria-pressed="true"]');
+        const speed = speedBtn ? Number(speedBtn.getAttribute('data-speed') || 1) : 1;
+
+        const res = await postSim(
+          { action: 'start', target: tgt, scenario, speed, ai_preempt, fault_inject },
+          `Simulasi ${tgt.toUpperCase()} (${scenario}) dimulai.`,
+        );
+        if (!res) return;
+
+        state.src[bucket].history = [];
+        state.src[bucket].latest = null;
+        state.simTarget = tgt;
+        state.lastActiveSource = bucket;
+        if (tgt === 'hils' && state.viewMode === 'sitl') state.viewMode = 'esp32';
+        else if (tgt === 'sitl' && state.viewMode === 'esp32') state.viewMode = 'sitl';
+        document.getElementById('sel-scenario').value = scenario;
+        state.hilsTimeoutInfo = null;
+        savePrefs();
+        applyView();
+      }
+
+      function startTargetWithCheck(tgt, overrideScenario = null) {
+        if (tgt === 'hils' && !state.esp.online) {
+          askConfirm(
+            'ESP32 Belum Terdeteksi',
+            'Node ESP32 saat ini sedang offline di broker :6669. Menjalankan HILS tanpa ESP32 akan mengalami timeout dan jeda otomatis setelah 3x gagal. Tetap mulai?',
+            'Tetap Mulai HILS',
+            () => launchSim('hils', overrideScenario),
+            'warn',
+            () => updateSimBadges(state.sim),
+          );
+          return;
+        }
+        launchSim(tgt, overrideScenario);
       }
 
       document.querySelectorAll('.tgt-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
           const tgt = btn.getAttribute('data-target');
+          if (tgt === state.simTarget) return;
+          if (state.sim && state.sim.running) {
+            askConfirm(
+              `Beralih ke Target ${tgt.toUpperCase()}?`,
+              `Simulasi ${state.simTarget.toUpperCase()} sedang berjalan. Beralih ke ${tgt.toUpperCase()} akan memulai ulang simulasi dari t=0s.`,
+              `Mulai Ulang di ${tgt.toUpperCase()}`,
+              () => startTargetWithCheck(tgt),
+              'warn',
+              () => updateSimBadges(state.sim),
+            );
+            return;
+          }
           state.simTarget = tgt;
           document.querySelectorAll('.tgt-btn').forEach((b) => {
             b.setAttribute('aria-pressed', b.getAttribute('data-target') === tgt ? 'true' : 'false');
           });
+          document.getElementById('hils-concurrency-hint').hidden = tgt !== 'hils';
           postSim({ target: tgt });
         });
       });
 
       document.getElementById('btn-sim-start').addEventListener('click', () => {
         const tgt = state.simTarget || 'sitl';
-        if (tgt === 'hils') {
-          state.src.esp32.history = [];
-          if (state.viewMode === 'sitl') state.viewMode = 'esp32';
-        } else {
-          state.src.sitl.history = [];
+        if (state.sim && state.sim.running && state.history.length > 0) {
+          askConfirm(
+            'Mulai Ulang Simulasi?',
+            `Simulasi ${tgt.toUpperCase()} sedang berjalan (${state.history.length} sampel). Mengulang akan menghapus histori kurva berjalan dan memulai dari t=0s.`,
+            'Ya, Mulai Ulang',
+            () => startTargetWithCheck(tgt),
+            'warn',
+          );
+          return;
         }
-        applyView();
-        const scenario = document.getElementById('sel-scenario').value;
-        const ai_preempt = document.getElementById('sw-preempt').checked;
-        const fault_inject = document.getElementById('sw-fault').checked;
-        postSim({ action: 'start', target: tgt, scenario, ai_preempt, fault_inject });
+        startTargetWithCheck(tgt);
       });
 
-      document.getElementById('btn-sim-pause').addEventListener('click', () => {
-        const paused = state.sim && state.sim.paused;
-        postSim({ action: paused ? 'resume' : 'pause' });
+      function togglePauseResume() {
+        if (!state.sim || !state.sim.running) return;
+        const paused = state.sim.paused;
+        if (paused) state.hilsTimeoutInfo = null;
+        postSim({ action: paused ? 'resume' : 'pause' }, paused ? 'Simulasi dilanjutkan.' : 'Simulasi dijeda.');
+      }
+
+      document.getElementById('btn-sim-pause').addEventListener('click', togglePauseResume);
+
+      document.getElementById('mob-btn-playpause').addEventListener('click', () => {
+        if (state.sim && state.sim.running) togglePauseResume();
+        else document.getElementById('btn-sim-start').click();
       });
 
       document.getElementById('btn-sim-stop').addEventListener('click', () => {
-        postSim({ action: 'stop' });
+        if (state.history.length > 0) {
+          askConfirm(
+            'Hentikan Simulasi?',
+            `Simulasi ${state.simTarget.toUpperCase()} yang sedang berjalan akan dihentikan (data grafik terekam tetap dipertahankan).`,
+            'Ya, Hentikan',
+            () => postSim({ action: 'stop' }, 'Simulasi dihentikan.'),
+            'warn',
+          );
+          return;
+        }
+        postSim({ action: 'stop' }, 'Simulasi dihentikan.');
       });
 
       document.getElementById('btn-sim-clear').addEventListener('click', () => {
         const src = activeSource();
-        state.src[src].history = [];
-        postSim({ action: 'clear', source: src });
-        applyView();
+        askConfirm(
+          `Bersihkan Grafik ${src.toUpperCase()}?`,
+          `Seluruh histori kurva dan KPI sumber ${src.toUpperCase()} akan dikosongkan dari layar saat ini.`,
+          'Ya, Bersihkan',
+          () => {
+            postSim({ action: 'clear', source: src }, `Grafik ${src.toUpperCase()} dibersihkan.`).then((res) => {
+              if (!res) return;
+              state.src[src].history = [];
+              state.src[src].latest = null;
+              state.hoverX = null;
+              applyView();
+            });
+          },
+          'danger',
+        );
       });
 
       document.querySelectorAll('.src-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
           state.viewMode = btn.getAttribute('data-src');
+          if (state.viewMode === 'sitl' || state.viewMode === 'esp32') {
+            state.lastActiveSource = state.viewMode;
+          }
+          state.hoverX = null;
+          savePrefs();
           applyView();
         });
       });
@@ -2216,7 +4471,19 @@ RENDERED_HTML = """<!DOCTYPE html>
       setInterval(updateEspBadge, 1000);
 
       document.getElementById('sel-scenario').addEventListener('change', (e) => {
-        postSim({ scenario: e.target.value });
+        const newScen = e.target.value;
+        if (state.sim && state.sim.running) {
+          askConfirm(
+            'Ganti Skenario & Mulai Ulang?',
+            `Simulasi sedang menjalankan "${state.sim.scenario}". Mengganti skenario ke "${newScen}" perlu memulai ulang ruang asap dari t=0s.`,
+            'Mulai Ulang dengan Skenario Ini',
+            () => launchSim(state.simTarget || 'sitl', newScen),
+            'warn',
+            () => { document.getElementById('sel-scenario').value = state.sim.scenario || 'flaming'; },
+          );
+          return;
+        }
+        postSim({ scenario: newScen });
       });
 
       document.querySelectorAll('.spd-btn').forEach((btn) => {
@@ -2235,38 +4502,115 @@ RENDERED_HTML = """<!DOCTYPE html>
         postSim({ fault_inject: e.target.checked });
       });
 
-      // Initial snapshot load + SSE subscription
-      fetch('/api/state')
-        .then((r) => r.json())
-        .then((d) => {
-          if (d.sources) {
-            state.src.sitl.history = (d.sources.sitl && d.sources.sitl.history) || [];
-            state.src.sitl.latest = (d.sources.sitl && d.sources.sitl.latest) || null;
-            state.src.esp32.history = (d.sources.esp32 && d.sources.esp32.history) || [];
-            state.src.esp32.latest = (d.sources.esp32 && d.sources.esp32.latest) || null;
-          } else {
-            state.src.sitl.history = d.history || [];
-            state.src.sitl.latest = d.latest || null;
-          }
-          if (d.esp) {
-            state.esp.online = !!d.esp.online;
-            state.esp.hw_mode = d.esp.hw_mode || null;
-            state.esp.lastRx = d.esp.age_s != null ? Date.now() - d.esp.age_s * 1000 : null;
-          }
-          state.latest = d.latest || {};
-          (d.mqtt_logs || []).forEach(appendMqttLog);
-          updateSimBadges(d.sim);
-          applyView();
-        })
-        .catch(() => {});
+      // Global keyboard shortcuts (S start idle, 1/2/3 presets, P/Space pause, A AUTO, M FORCE_MAX, ? Help)
+      document.addEventListener('keydown', (e) => {
+        if (helpDlg.open) {
+          if (e.key === '?') helpDlg.close();
+          return;
+        }
+        if (dlg.open || e.metaKey || e.ctrlKey || e.altKey) return;
+        const tag = (e.target && e.target.tagName) || '';
+        if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+
+        if (e.key === '?') {
+          e.preventDefault();
+          if (typeof helpDlg.showModal === 'function') helpDlg.showModal();
+        } else if ((e.key === 's' || e.key === 'S') && (!state.sim || !state.sim.running)) {
+          e.preventDefault();
+          document.getElementById('btn-sim-start').click();
+        } else if (e.key === '1') {
+          applyPreset('demo');
+        } else if (e.key === '2') {
+          applyPreset('dsp');
+        } else if (e.key === '3') {
+          applyPreset('all');
+        } else if ((e.key === 'p' || e.key === 'P') && state.sim && state.sim.running) {
+          e.preventDefault();
+          togglePauseResume();
+        } else if (e.code === 'Space' && tag !== 'BUTTON' && tag !== 'A' && tag !== 'SUMMARY' && state.sim && state.sim.running) {
+          e.preventDefault();
+          togglePauseResume();
+        } else if (e.key === 'a' || e.key === 'A') {
+          requestActuatorCmd('AUTO');
+        } else if (e.key === 'm' || e.key === 'M') {
+          requestActuatorCmd('FORCE_MAX');
+        }
+      });
+
+      function loadStateSnapshot(isReconnect = false, silent = false) {
+        return fetch('/api/state')
+          .then((r) => {
+            if (!r.ok) throw new Error('Server status tidak merespons');
+            return r.json();
+          })
+          .then((d) => {
+            state.bootError = false;
+            if (d.sources) {
+              state.src.sitl.history = (d.sources.sitl && d.sources.sitl.history) || [];
+              state.src.sitl.latest = (d.sources.sitl && d.sources.sitl.latest) || null;
+              state.src.esp32.history = (d.sources.esp32 && d.sources.esp32.history) || [];
+              state.src.esp32.latest = (d.sources.esp32 && d.sources.esp32.latest) || null;
+            } else {
+              state.src.sitl.history = d.history || [];
+              state.src.sitl.latest = d.latest || null;
+            }
+            if (d.esp) {
+              state.esp.online = !!d.esp.online;
+              state.esp.hw_mode = d.esp.hw_mode || null;
+              state.esp.lastRx = d.esp.age_s != null ? Date.now() - d.esp.age_s * 1000 : null;
+            }
+            if (d.mobile && d.mobile.ip_is_fallback) {
+              const hint = document.getElementById('mobile-config-hint');
+              if (hint) {
+                hint.textContent = 'Hotspot/LAN offline terdeteksi: pastikan alamat host pada file JSON yang diunduh sesuai IP laptop Anda (port 6669).';
+              }
+            }
+            state.latest = d.latest || {};
+            if (!isReconnect) {
+              (d.mqtt_logs || []).forEach((ln) => appendMqttLog(ln, true));
+            } else if (!silent) {
+              appendMqttLog('--- Koneksi live ke server tersambung kembali ---', false);
+            }
+            updateSimBadges(d.sim);
+            applyView();
+            if (isReconnect && !silent) showToast('Koneksi live tersambung kembali & data disinkronkan.', 'ok');
+          })
+          .catch(() => {
+            state.bootError = true;
+            updateSafetyCallout(null, state.sim);
+            if (!silent) showToast('Gagal memuat status dari server.', 'danger');
+          });
+      }
+
+      applyTheme(state.theme, false);
+      loadStateSnapshot(false, false);
 
       const es = new EventSource('/api/stream');
+      es.onopen = () => {
+        const reconnected = state.sseHadDisconnect;
+        state.sseConnected = true;
+        state.sseHadDisconnect = false;
+        updateBrokerBadge();
+        if (reconnected) {
+          loadStateSnapshot(true, false);
+        } else {
+          updateSafetyCallout(state.src[activeSource()].latest, state.sim);
+        }
+      };
+      es.onerror = () => {
+        state.sseConnected = false;
+        state.sseHadDisconnect = true;
+        updateBrokerBadge();
+        updateSafetyCallout(state.src[activeSource()].latest, state.sim);
+      };
       es.onmessage = (ev) => {
+        state.sseConnected = true;
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === 'clear') {
             const src = msg.source === 'esp32' ? 'esp32' : 'sitl';
             state.src[src].history = [];
+            state.src[src].latest = null;
             applyView();
           } else if (msg.type === 'telemetry' && msg.row) {
             const src = msg.source === 'esp32' ? 'esp32' : 'sitl';
@@ -2286,8 +4630,24 @@ RENDERED_HTML = """<!DOCTYPE html>
               state.esp.lastRx = Date.now() - msg.age_s * 1000;
             }
             applyView();
+          } else if (msg.type === 'hils_timeout') {
+            state.hilsTimeoutInfo = msg;
+            if (msg.sim) updateSimBadges(msg.sim);
+            updateSafetyCallout(state.src[activeSource()].latest, state.sim);
+            if (msg.auto_paused) {
+              showToast(`HILS dijeda otomatis setelah ${msg.consec}x timeout ESP32.`, 'danger');
+            }
+          } else if (msg.type === 'sim_complete' && msg.summary) {
+            const s = msg.summary;
+            if (s.source) state.lastActiveSource = s.source;
+            if (msg.sim) updateSimBadges(msg.sim);
+            applyView();
+            const parNote = (s.hils_parity && s.hils_parity.samples > 0)
+              ? `, paritas ΔFI maks ${s.hils_parity.max_delta_fi.toFixed(2)}`
+              : '';
+            showToast(`Simulasi ${s.scenario} selesai (${s.samples} sampel, FI puncak ${Number(s.peak_fi || 0).toFixed(1)} µg/m³${parNote}).`, 'ok');
           } else if (msg.type === 'mqtt_log') {
-            appendMqttLog(msg.line);
+            appendMqttLog(msg.line, true);
           } else if (msg.type === 'sim') {
             updateSimBadges(msg.sim);
             applyView();
@@ -2301,7 +4661,9 @@ RENDERED_HTML = """<!DOCTYPE html>
         } catch (e) {}
       };
 
-      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', drawCharts);
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+        if (!state.theme) applyTheme(null, false);
+      });
     })();
   </script>
 </body>
@@ -2386,7 +4748,7 @@ def start_dashboard_server(engine, host="0.0.0.0", port=8080):
                 data = {}
             if parsed.path == "/api/cmd":
                 ok = engine.send_cmd(data.get("cmd"))
-                self._send_json({"ok": ok})
+                self._send_json({"ok": ok, "reason": None if ok else getattr(engine, "_last_cmd_error", "Perintah ditolak.")})
                 return
             if parsed.path == "/api/sim":
                 ok = engine.control_sim(data)

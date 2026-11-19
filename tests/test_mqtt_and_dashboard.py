@@ -400,6 +400,140 @@ class TestModernWebDashboard(unittest.TestCase):
             mqtt_io.disconnect(esp)
             eng.shutdown()
 
+    def test_send_cmd_returns_false_when_idle_and_offline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            try:
+                self.assertFalse(eng.send_cmd("AUTO"))
+                self.assertIsNotNone(eng._last_cmd_error)
+            finally:
+                eng.shutdown()
+
+    def test_ai_preempt_active_resets_when_disabled_and_mid_run_scenario_locked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            try:
+                eng.control_sim({"action": "start", "scenario": "flaming", "speed": 10, "ai_preempt": True})
+                time.sleep(0.1)
+                with eng.lock:
+                    self.assertTrue(eng.sim_running)
+                    self.assertIsNotNone(eng.sim_pre)
+                    eng.sim_pre.active = True
+                self.assertTrue(eng.get_sim_status()["ai_preempt_active"])
+
+                eng.control_sim({"ai_preempt": False})
+                self.assertFalse(eng.get_sim_status()["ai_preempt_active"])
+
+                # Changing scenario/target without action="start" while running must not mutate metadata
+                eng.control_sim({"scenario": "clean", "target": "hils"})
+                st = eng.get_sim_status()
+                self.assertEqual(st["scenario"], "flaming")
+                self.assertEqual(st["target"], "sitl")
+            finally:
+                eng.shutdown()
+
+    def test_hils_preserves_pm_true_and_computes_zero_parity_delta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(
+                broker_host="127.0.0.1",
+                broker_port=self.broker_port,
+                out_dir=tmp,
+                enable_mqtt=True,
+            )
+            fw = Firmware()
+
+            def on_msg(c, u, msg):
+                if msg.topic == K.T_HILS_IN:
+                    parts = msg.payload.decode("utf-8").strip().split(",")
+                    seq = int(parts[0])
+                    vd, vm = float(parts[1]), float(parts[2])
+                    tel = fw.step(vd, vm, seq=seq)
+                    tel["src"] = "esp32"
+                    c.publish(K.T_TELEM, json.dumps(tel))
+                elif msg.topic == K.T_CMD and msg.payload.decode("utf-8").strip() == "RESET":
+                    fw.reset()
+
+            def on_conn(c, u, f, rc, p=None):
+                c.subscribe([(K.T_HILS_IN, 0), (K.T_CMD, 0)])
+
+            esp = mqtt_io.make_client("fake-esp32-parity", on_connect=on_conn, on_message=on_msg)
+            try:
+                mqtt_io.connect(esp, "127.0.0.1", self.broker_port)
+                time.sleep(0.4)
+                eng.control_sim({"action": "start", "target": "hils", "scenario": "clean", "speed": 20})
+
+                deadline = time.time() + 2.5
+                snap = None
+                while time.time() < deadline:
+                    snap = eng.get_state_snapshot()
+                    if len(snap["sources"]["esp32"]["history"]) >= 3:
+                        break
+                    time.sleep(0.1)
+
+                rows = snap["sources"]["esp32"]["history"]
+                self.assertGreaterEqual(len(rows), 3)
+                self.assertTrue(all(r.get("pm_true") is not None for r in rows))
+                self.assertTrue(all(r.get("ref_fi") is not None for r in rows))
+                self.assertTrue(all(r.get("parity_delta_fi") == 0.0 for r in rows))
+                self.assertTrue(all(r.get("parity_match") is True for r in rows))
+                self.assertGreaterEqual(snap["sim"]["hils_parity"]["samples"], 3)
+            finally:
+                mqtt_io.disconnect(esp)
+                eng.shutdown()
+
+    def test_sitl_clear_resets_latest_to_idle_and_snapshot_has_mobile_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            try:
+                snap0 = eng.get_state_snapshot()
+                self.assertIn("mobile", snap0)
+                self.assertIn("ip_is_fallback", snap0["mobile"])
+                self.assertIsInstance(snap0["mobile"]["ip_is_fallback"], bool)
+
+                eng.control_sim({"action": "start", "target": "sitl", "scenario": "flaming", "speed": 20})
+                time.sleep(0.35)
+                eng.control_sim({"action": "stop"})
+                self.assertGreater(len(eng.history), 0)
+
+                eng.control_sim({"action": "clear"})
+                snap1 = eng.get_state_snapshot()
+                self.assertEqual(len(snap1["history"]), 0)
+                self.assertEqual(snap1["latest"]["seq"], 0)
+                self.assertEqual(snap1["latest"]["state"], "NORMAL")
+                self.assertEqual(snap1["latest"]["fi"], 0.0)
+            finally:
+                eng.shutdown()
+
+    def test_sim_complete_event_broadcast_on_short_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            q = eng.register_sse()
+            try:
+                eng.control_sim({
+                    "action": "start",
+                    "target": "sitl",
+                    "scenario": "clean",
+                    "speed": 20,
+                    "duration": 1.0,
+                })
+                got_complete = False
+                deadline = time.time() + 2.0
+                while time.time() < deadline and not got_complete:
+                    while q:
+                        raw = q.popleft().decode("utf-8", errors="ignore").strip()
+                        if raw.startswith("data: "):
+                            msg = json.loads(raw[6:])
+                            if msg.get("type") == "sim_complete":
+                                got_complete = True
+                                self.assertEqual(msg["summary"]["scenario"], "clean")
+                                break
+                    if not got_complete:
+                        time.sleep(0.05)
+                self.assertTrue(got_complete, "Expected sim_complete SSE event when simulation finishes naturally")
+            finally:
+                eng.unregister_sse(q)
+                eng.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
