@@ -534,6 +534,194 @@ class TestModernWebDashboard(unittest.TestCase):
                 eng.unregister_sse(q)
                 eng.shutdown()
 
+    def test_sim_status_exposes_command_target_flags_and_invalid_sim_action_returns_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            srv = dashboard.start_dashboard_server(eng, host="127.0.0.1", port=0)
+            port = srv.server_address[1]
+            base = f"http://127.0.0.1:{port}"
+            try:
+                st0 = eng.get_sim_status()
+                self.assertFalse(st0["has_sitl"])
+                self.assertFalse(st0["has_broker"])
+                self.assertFalse(st0["can_send_cmd"])
+                self.assertIn("last_summary", st0)
+
+                eng.control_sim({"action": "start", "target": "sitl", "scenario": "clean", "speed": 20})
+                time.sleep(0.1)
+                st1 = eng.get_sim_status()
+                self.assertTrue(st1["has_sitl"])
+                self.assertTrue(st1["can_send_cmd"])
+
+                req = urllib.request.Request(
+                    f"{base}/api/sim",
+                    data=json.dumps({"action": "bogus"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                res = json.loads(urllib.request.urlopen(req, timeout=3).read().decode("utf-8"))
+                self.assertFalse(res["ok"])
+                self.assertTrue(bool(res.get("reason")))
+            finally:
+                eng.shutdown()
+                srv.shutdown()
+                srv.server_close()
+
+    def test_dashboard_html_round4_clarity_and_a11y_invariants(self):
+        html = dashboard.RENDERED_HTML
+        self.assertNotIn("siaga", html.lower())
+        self.assertIn('id="safety-live" class="sr-only" role="alert" aria-live="assertive"', html)
+        self.assertIn('id="toast-live"', html)
+        self.assertIn('id="override-target-line"', html)
+        self.assertIn('id="run-summary-card"', html)
+        self.assertIn('data-theme-val="system"', html)
+        self.assertIn('id="mob-dock-context"', html)
+        self.assertIn('id="mob-btn-stop"', html)
+        self.assertIn('id="mob-dock-tray"', html)
+        self.assertIn('id="btn-mob-reset"', html)
+        self.assertIn("@media (max-height: 820px) and (min-width: 1280px)", html)
+
+    def test_send_cmd_target_scope_isolates_sitl_and_esp32(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(
+                broker_host="127.0.0.1",
+                broker_port=self.broker_port,
+                out_dir=tmp,
+                enable_mqtt=True,
+            )
+            received_cmds = []
+
+            def on_conn(c, u, flags, rc, props=None):
+                c.subscribe(K.T_CMD)
+
+            def on_msg(c, u, msg):
+                if msg.topic == K.T_CMD:
+                    received_cmds.append(msg.payload.decode("utf-8", errors="ignore").strip())
+
+            sub = mqtt_io.make_client("test-cmd-scope-sub", on_connect=on_conn, on_message=on_msg)
+            try:
+                mqtt_io.connect(sub, "127.0.0.1", self.broker_port)
+                time.sleep(0.3)
+
+                # SITL not running: target="sitl" must fail cleanly without publishing to broker
+                self.assertFalse(eng.send_cmd("FORCE_MAX", target="sitl"))
+                self.assertIn("SITL", eng._last_cmd_error or "")
+                time.sleep(0.15)
+                self.assertEqual(received_cmds, [])
+
+                # Start SITL
+                eng.control_sim({"action": "start", "target": "sitl", "scenario": "clean", "speed": 20})
+                time.sleep(0.2)
+
+                # target="sitl" mutates SITL firmware only, does not publish to broker
+                self.assertTrue(eng.send_cmd("FORCE_MAX", target="sitl"))
+                self.assertEqual(eng.get_state_snapshot()["sources"]["sitl"]["latest"]["mode"], "FORCE_MAX")
+                time.sleep(0.15)
+                self.assertEqual(received_cmds, [])
+
+                # target="esp32" publishes to broker without mutating running SITL firmware directly
+                with eng.lock:
+                    eng.sim_fw.apply_command("AUTO")
+                    eng.latest["mode"] = "AUTO"
+                self.assertTrue(eng.send_cmd("FORCE_OFF", target="esp32"))
+                self.assertEqual(eng.sim_fw.mode, "AUTO")
+                time.sleep(0.2)
+                self.assertIn("FORCE_OFF", received_cmds)
+            finally:
+                mqtt_io.disconnect(sub)
+                eng.shutdown()
+
+    def test_send_cmd_reset_clears_stale_latest_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            try:
+                eng.control_sim({"action": "start", "target": "sitl", "scenario": "flaming", "speed": 50})
+                time.sleep(0.25)
+                eng.control_sim({"action": "pause"})
+                with eng.lock:
+                    eng.latest["pm_true"] = 222.5
+                    eng.latest["forecast"] = 188.0
+                    eng.latest["eta_bahaya_s"] = 14.0
+                    eng.latest["mae"] = 3.5
+                    eng.latest["gas_ppm"] = 980.0
+                    eng._run_t_bahaya = 42.0
+                    eng._run_preempt_used = True
+                    eng._last_run_summary = {"scenario": "flaming"}
+
+                self.assertTrue(eng.send_cmd("RESET", target="sitl"))
+                lat = eng.get_state_snapshot()["sources"]["sitl"]["latest"]
+                self.assertEqual(lat["t"], 0.0)
+                self.assertEqual(lat["seq"], 0)
+                self.assertEqual(lat["state"], "NORMAL")
+                self.assertEqual(lat["mode"], "AUTO")
+                self.assertEqual(lat["duty"], 0.0)
+                self.assertEqual(lat["pm"], 0.0)
+                self.assertEqual(lat["fi"], 0.0)
+                self.assertEqual(lat["gas_ppm"], K.MQ_ATM_PPM)
+                self.assertIsNone(lat["pm_true"])
+                self.assertEqual(lat["forecast"], 0.0)
+                self.assertIsNone(lat["eta_bahaya_s"])
+                self.assertIsNone(lat["mae"])
+                self.assertEqual(lat["scenario"], "flaming")
+                self.assertIsNone(eng.get_sim_status()["last_summary"])
+            finally:
+                eng.shutdown()
+
+    def test_export_csv_and_export_log_endpoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            srv = dashboard.start_dashboard_server(eng, host="127.0.0.1", port=0)
+            port = srv.server_address[1]
+            base = f"http://127.0.0.1:{port}"
+            try:
+                eng.control_sim({"action": "start", "target": "sitl", "scenario": "clean", "speed": 50})
+                time.sleep(0.25)
+                eng.control_sim({"action": "stop"})
+                eng._record_mqtt_log("2026-11-20T12:00:00.000 [test] PUBLISH karhutla/cmd AUTO")
+
+                with urllib.request.urlopen(f"{base}/api/export-csv?source=sitl", timeout=3) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertIn("text/csv", resp.headers.get("Content-Type", ""))
+                    self.assertIn("attachment;", resp.headers.get("Content-Disposition", ""))
+                    csv_body = resp.read().decode("utf-8")
+                lines = [ln for ln in csv_body.strip().splitlines() if ln.strip()]
+                self.assertGreaterEqual(len(lines), 2)
+                self.assertIn("t_s,seq,source,scenario,pm_true", lines[0])
+                self.assertIn(",sitl,clean,", lines[1])
+
+                with urllib.request.urlopen(f"{base}/api/export-log", timeout=3) as lresp:
+                    self.assertEqual(lresp.status, 200)
+                    self.assertIn("text/plain", lresp.headers.get("Content-Type", ""))
+                    self.assertIn("attachment;", lresp.headers.get("Content-Disposition", ""))
+                    log_body = lresp.read().decode("utf-8")
+                self.assertIn("PUBLISH karhutla/cmd AUTO", log_body)
+            finally:
+                eng.shutdown()
+                srv.shutdown()
+                srv.server_close()
+
+    def test_dashboard_html_round5_ergonomics_and_a11y_invariants(self):
+        html = dashboard.RENDERED_HTML
+        self.assertIn('id="sim-advanced-drawer"', html)
+        self.assertIn('id="sim-adv-summary"', html)
+        self.assertIn('id="kpi-t-dur"', html)
+        self.assertIn('id="mob-btn-more"', html)
+        self.assertIn('id="mob-dock-tray"', html)
+        self.assertNotIn('id="mobile-reset-row"', html)
+        self.assertIn('id="sw-shortcuts"', html)
+        self.assertIn('class="kpi-abbr-btn"', html)
+        self.assertNotIn('<span class="kpi-abbr"', html)
+        self.assertIn('id="subchart-sr-summary"', html)
+        self.assertIn('id="sel-cmd-target"', html)
+        self.assertIn('id="btn-clear-hover"', html)
+        self.assertIn('id="btn-export-csv"', html)
+        self.assertIn('id="rs-export-csv"', html)
+        self.assertIn('id="btn-export-log"', html)
+        self.assertIn("Ambang 55/150 di luar skala ketat", html)
+        self.assertIn("Pita State FSM", html)
+        self.assertIn("#475569", html)
+        self.assertIn("#854d0e", html)
+
 
 if __name__ == "__main__":
     unittest.main()

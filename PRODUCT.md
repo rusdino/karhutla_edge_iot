@@ -42,7 +42,7 @@ Satu basis algoritma DSP dan kontrol yang 100% identik antara Python (`core.py`)
 
 - Grafik validasi SITL 3-panel aktual: `sitl_flaming.png`, `sitl_fault.png`, `sitl_smolder.png`, `sitl_clean.png`.
 - Screenshot dashboard & klien mobile aktual: `logs/dashboard_ss_terbaru.png`, `logs/another_dashboard_ss_terbaru.png`, `logs/mqtt_dashboard_ss.jpeg`.
-- Pengujian otomatis: `tests/test_mqtt_and_dashboard.py` (15/15 unit test lulus).
+- Pengujian otomatis: `tests/test_mqtt_and_dashboard.py` (26/26 unit test lulus).
 - Firmware & konfigurasi aktual: `firmware/karhutla_esp32/src/main.cpp`, `README.md`, `karhutla_iot_mqtt_panel.json`.
 - **Ketiadaan Bukti (jangan difabrikasi):** Belum ada data pengujian lapangan hutan karhutla skala penuh, testimoni pengguna eksternal, maupun sertifikasi industri.
 
