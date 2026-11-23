@@ -446,6 +446,7 @@ class DashboardEngine:
         t_val = float(tel.get("seq", t_rel))
         did_reset_history = False
         hils_meta = None
+        prev_row = None
         with self.lock:
             if hist and t_val <= hist[-1].get("t", -1.0):
                 # Skenario/run baru dimulai dari seq=0 atau re-publish pada detik yang sama
@@ -456,13 +457,24 @@ class DashboardEngine:
                     else:
                         self._external_fc = LinearTrendForecaster()
                     did_reset_history = True
+            prev_row = hist[-1] if hist else None
             if is_esp:
                 hils_meta = self._hils_meta.pop(seq_val, None)
             fc = self._esp_fc if is_esp else self._external_fc
-        f = fc.update(t_val, float(tel.get("pm", 0.0)))
         tel_pm = float(tel.get("pm", 0.0))
         tel_fi = float(tel.get("fi", 0.0))
         tel_state = str(tel.get("state", "NORMAL"))
+        if tel_state == "FAILSAFE":
+            prev_fc = prev_row.get("forecast") if isinstance(prev_row, dict) else None
+            prev_mae = prev_row.get("mae") if isinstance(prev_row, dict) else None
+            f = {
+                "pm_forecast": float(prev_fc) if prev_fc is not None else tel_pm,
+                "slope": 0.0,
+                "eta_bahaya_s": None,
+                "mae": prev_mae,
+            }
+        else:
+            f = fc.update(t_val, tel_pm)
         delta_fi = round(abs(tel_fi - float(hils_meta["ref_fi"])), 3) if hils_meta else None
         delta_pm = round(abs(tel_pm - float(hils_meta["ref_pm"])), 3) if hils_meta else None
         parity_match = (tel_state == hils_meta["ref_state"] and abs(tel_fi - float(hils_meta["ref_fi"])) < 1.0) if hils_meta else None
@@ -1055,9 +1067,20 @@ class DashboardEngine:
             if tel is not None:
                 with self.lock:
                     self.hils_consec_timeouts = 0
-                    f = self.sim_fc.update(t, float(tel.get("pm", 0.0)))
+                    tel_state_hils = str(tel.get("state", "NORMAL"))
+                    if tel_state_hils == "FAILSAFE":
+                        prev_fc = self.esp_latest.get("forecast") if isinstance(self.esp_latest, dict) else None
+                        prev_mae = self.esp_latest.get("mae") if isinstance(self.esp_latest, dict) else None
+                        f = {
+                            "pm_forecast": float(prev_fc) if prev_fc is not None else float(tel.get("pm", 0.0)),
+                            "slope": 0.0,
+                            "eta_bahaya_s": None,
+                            "mae": prev_mae,
+                        }
+                    else:
+                        f = self.sim_fc.update(t, float(tel.get("pm", 0.0)))
                     pre_cmd = None
-                    if self.sim_ai_preempt and self.sim_pre is not None:
+                    if self.sim_ai_preempt and self.sim_pre is not None and tel_state_hils != "FAILSAFE":
                         pre_cmd = self.sim_pre.decide(t, str(tel.get("mode", "AUTO")), f["pm_forecast"])
                     if pre_cmd and self.sim_ref_fw is not None:
                         self.sim_ref_fw.apply_command(pre_cmd)
@@ -2703,9 +2726,8 @@ RENDERED_HTML = """<!DOCTYPE html>
       min-inline-size: 0;
     }
 
-    @media (min-width: 768px) {
-      #badge-fsm { display: none; }
-    }
+    /* State FSM aktif sudah tampil di kartu KPI, pita sub-chart, dan dock seluler */
+    #badge-fsm { display: none; }
 
     /* Projector 1280x768 fit: compact vertical rhythm without scrolling */
     @media (max-height: 820px) and (min-width: 1280px) {
@@ -2717,34 +2739,41 @@ RENDERED_HTML = """<!DOCTYPE html>
       .brand-title { font-size: 1.3rem; line-height: 1.15; white-space: nowrap; }
       .topbar .pill-badge { padding: 3px 9px; white-space: nowrap; }
       .topbar-actions { flex-wrap: nowrap; gap: 6px; }
-      .safety-callout { padding: 6px 12px; font-size: 0.8125rem; }
-      .kpi-grid { gap: 8px; }
-      article.kpi-card { padding: 7px 10px; gap: 3px; }
-      .kpi-value { font-size: clamp(1.1rem, 8cqi, 1.45rem); line-height: 1.2; }
+      .safety-callout { padding: 5px 11px; font-size: 0.8125rem; }
+      .kpi-grid { gap: 6px; }
+      article.kpi-card { padding: 6px 9px; gap: 2px; }
+      .kpi-value { font-size: clamp(1.05rem, 7.6cqi, 1.38rem); line-height: 1.18; }
       #card-state[data-tone="ok"] .kpi-state-wrap,
       #card-state[data-tone="warn"] .kpi-state-wrap,
       #card-state[data-tone="danger"] .kpi-state-wrap,
-      #card-state[data-tone="fault"] .kpi-state-wrap { font-size: clamp(1.3rem, 10cqi, 1.8rem); }
+      #card-state[data-tone="fault"] .kpi-state-wrap { font-size: clamp(1.25rem, 9.4cqi, 1.72rem); }
       .kpi-meter { margin-block-start: 2px; }
-      article.kpi-card > footer { padding-block-start: 4px; }
-      .control-column { gap: 8px; }
-      .panel-card { padding: 8px 11px; gap: 5px; }
-      .panel-subtitle-row { margin-block-start: 0; }
-      .preset-bar { padding: 4px 0; }
-      .chip-btn { min-block-size: 30px; padding: 4px 10px; }
-      .cmd-btn { min-block-size: 34px; padding: 5px 8px; }
-      .reset-zone { padding-block-start: 6px; }
-      .sim-zone, .sim-adv-drawer { padding: 5px 0 0; gap: 3px; }
-      .op-list, .sim-adv-body { gap: 4px; }
-      .op-row, .override-scope-row { padding: 4px 0; }
-      .op-select { min-block-size: 30px; padding: 4px 8px; }
+      .kpi-frozen-note { margin-block-start: 0; line-height: 1.2; }
+      article.kpi-card > footer { padding-block-start: 3px; }
+      .control-column { gap: 6px; }
+      .panel-card { padding: 6px 10px; gap: 4px; }
+      .control-column .panel-subtitle-row {
+        margin-block-start: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .preset-bar { padding: 3px 0; }
+      .chip-btn { min-block-size: 28px; padding: 3px 9px; }
+      .cmd-btn { min-block-size: 32px; padding: 4px 8px; }
+      .reset-zone { padding-block-start: 5px; }
+      .sim-zone, .sim-adv-drawer { padding: 4px 0 0; gap: 3px; }
+      .op-list, .sim-adv-body { gap: 3px; }
+      .op-row, .override-scope-row { padding: 3px 0; }
+      .op-select { min-block-size: 28px; padding: 3px 8px; }
       details.drawer-card > summary, .sim-adv-drawer > summary { font-size: 0.8125rem; }
       .theme-switch .theme-btn { min-block-size: 28px; }
+      .chart-head { padding: 5px 10px 4px; gap: 6px; }
       .chart-legend { padding: 0; gap: 4px 12px; }
-      .run-summary { padding: 6px 10px; gap: 4px; }
+      .run-summary { padding: 5px 10px; gap: 3px; }
       .run-summary-grid { grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 4px 10px; }
-      canvas.chart-stage { block-size: clamp(188px, 28dvh, 224px); }
-      canvas.subchart-stage { block-size: clamp(112px, 15.5dvh, 124px); }
+      canvas.chart-stage { block-size: clamp(174px, 25.5dvh, 206px); }
+      canvas.subchart-stage { block-size: clamp(106px, 14.5dvh, 118px); }
     }
 
     @media (max-width: 1279px) {
@@ -2763,28 +2792,38 @@ RENDERED_HTML = """<!DOCTYPE html>
 
     @media (max-width: 767px) {
       body {
-        padding-block-end: calc(116px + env(safe-area-inset-bottom));
+        padding-block-end: calc(108px + env(safe-area-inset-bottom));
+      }
+      .page-frame, .dashboard-shell {
+        gap: 10px;
       }
       .topbar {
-        padding: 7px 9px;
-        gap: 5px 6px;
+        padding: 6px 9px;
+        gap: 4px 6px;
       }
       .topbar .pill-badge {
         padding: 3px 8px;
-        font-size: 0.7rem;
+        font-size: 0.75rem;
       }
       .topbar-actions {
-        gap: 5px;
+        gap: 4px;
       }
       .theme-switch .theme-btn {
         padding: 4px 7px;
-        font-size: 0.7rem;
+        font-size: 0.75rem;
       }
       #btn-open-help {
         padding: 4px 8px;
-        font-size: 0.7rem;
+        font-size: 0.75rem;
       }
       .topbar .brand-sub, .brand-title-ext, #override-panel {
+        display: none;
+      }
+      .safety-callout {
+        padding: 8px 10px;
+        gap: 6px;
+      }
+      .safety-callout-desc {
         display: none;
       }
       .brand-badge {
@@ -2794,12 +2833,20 @@ RENDERED_HTML = """<!DOCTYPE html>
       .status-cluster {
         margin-inline-start: 0;
       }
+      #mob-dock-context {
+        font-weight: 700;
+      }
+      #mob-dock-context[data-tone="ok"] { color: var(--ok); }
+      #mob-dock-context[data-tone="warn"] { color: var(--warn); }
+      #mob-dock-context[data-tone="danger"] { color: var(--danger); }
+      #mob-dock-context[data-tone="fault"] { color: var(--fault); }
       .kpi-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 8px;
+        gap: 7px;
       }
       article.kpi-card {
-        padding: 10px 11px;
+        padding: 9px 10px;
+        gap: 3px;
       }
       .cmd-grid {
         grid-template-columns: 1fr;
@@ -3566,6 +3613,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         if (row.mode === 'FORCE_MAX') return 'Dipaksa Aktif 100%';
         if (row.mode === 'FORCE_OFF') return 'Dipaksa Mati 0%';
         if (row.state === 'FAILSAFE') return 'Terkunci Aman 70%';
+        if (row.state === 'BAHAYA' || (row.duty ?? 0) >= 99.5) return 'Ekstraksi Penuh 100%';
         if ((row.duty ?? 0) > 0.5) return 'Modulasi PWM';
         return 'Diam';
       }
@@ -4182,32 +4230,42 @@ RENDERED_HTML = """<!DOCTYPE html>
         const viewedSrc = activeSource();
         let tone = 'ok';
         let dest = '';
+        let mobDest = '';
         if (!canSend) {
           tone = 'idle';
           if (targetLock === 'sitl') {
             dest = 'Perintah nonaktif — mulai simulasi SITL';
+            mobDest = 'Nonaktif — mulai SITL';
           } else if (targetLock === 'esp32') {
             dest = `Perintah nonaktif — broker\u00A0:${port} belum terhubung`;
+            mobDest = `Nonaktif — broker\u00A0:${port} putus`;
           } else {
             dest = `Perintah nonaktif — mulai SITL atau sambungkan broker\u00A0:${port}`;
+            mobDest = `Nonaktif — SITL / broker\u00A0:${port}`;
           }
         } else {
           if (hitsSitl && hitsEsp) {
-            dest = `Perintah → SITL + ESP32 :${port}`;
+            dest = `Perintah → SITL + ESP32\u00A0:${port}`;
+            mobDest = `Target: SITL + ESP32\u00A0:${port}`;
           } else if (hitsSitl) {
             dest = 'Perintah → Hanya SITL (Python)';
+            mobDest = 'Target: Hanya SITL';
           } else if (hasHilsRef) {
-            dest = `Perintah → HILS (ESP32 + Ref :${port})`;
+            dest = `Perintah → HILS (ESP32 + Ref\u00A0:${port})`;
+            mobDest = `Target: HILS\u00A0:${port}`;
           } else {
             dest = `Perintah → Hanya ESP32 (:${port})`;
+            mobDest = `Target: ESP32\u00A0:${port}`;
           }
           let mismatch = false;
           if ((viewedSrc === 'sitl' && !hitsSitl) || (viewedSrc === 'esp32' && !hitsEsp)) {
             mismatch = true;
             dest += ` — ⚠ tidak mencakup grafik ${viewedSrc.toUpperCase()}`;
+            mobDest += ` ⚠ grafik ${viewedSrc.toUpperCase()}`;
           } else if (targetLock === 'auto' && viewedSrc === 'esp32' && hitsSitl) {
             mismatch = true;
             dest += ' — ⚠ SITL juga terpengaruh';
+            mobDest += ' ⚠ SITL ikut kena';
           }
           tone = mismatch ? 'warn' : 'ok';
         }
@@ -4218,7 +4276,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         }
         const mobCmdLine = document.getElementById('mob-dock-cmd-status');
         if (mobCmdLine) {
-          mobCmdLine.textContent = dest;
+          mobCmdLine.textContent = mobDest;
           mobCmdLine.setAttribute('data-tone', tone);
         }
         document.querySelectorAll('#cmd-toolbar .cmd-btn[data-cmd], #btn-cmd-reset, #btn-mob-reset, .mob-cmd-btn[data-cmd]').forEach((btn) => {
@@ -4258,8 +4316,21 @@ RENDERED_HTML = """<!DOCTYPE html>
         const scenLabel = SCENARIO_LABELS[scenKey] || scenKey;
         const spdBtn = document.querySelector('.spd-btn[aria-pressed="true"]');
         const spd = sim.speed || (spdBtn ? Number(spdBtn.getAttribute('data-speed') || 1) : 1);
-        const statusSuffix = sim.running ? (sim.paused ? ' • Jeda' : ' • Berjalan') : '';
-        el.textContent = `${tgt} • ${scenLabel} • ${spd}x${statusSuffix}`;
+        const statusSuffix = sim.running ? (sim.paused ? ' • Jeda' : ' • Jalan') : '';
+        const lat = state.history.length ? state.history[state.history.length - 1] : null;
+        const hasLive = !!(lat && (state.history.length > 0 || lat.scenario !== 'idle'));
+        if (hasLive) {
+          const st = lat.state || 'NORMAL';
+          const fsmTag = st === 'FAILSAFE'
+            ? `FAILSAFE (${(lat.duty ?? 0).toFixed(0)}%)`
+            : `${st} (FI ${(lat.fi ?? 0).toFixed(0)})`;
+          el.textContent = `${fsmTag} • ${tgt} • ${scenLabel} • ${spd}x${statusSuffix}`;
+          const dockTone = st === 'BAHAYA' ? 'danger' : (st === 'FAILSAFE' ? 'fault' : (st === 'WASPADA' ? 'warn' : 'ok'));
+          el.setAttribute('data-tone', dockTone);
+        } else {
+          el.textContent = `IDLE • ${tgt} • ${scenLabel} • ${spd}x${statusSuffix}`;
+          el.removeAttribute('data-tone');
+        }
       }
 
       function updateParityUI(sim, row) {
@@ -4344,6 +4415,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         setFsmBadge('IDLE', null);
         updateParityUI(state.sim, null);
         updateSafetyCallout(null, state.sim);
+        updateMobileDockContext();
       }
 
       function applyView() {
@@ -4431,7 +4503,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           document.getElementById('kpi-fi-wrap').style.color = 'var(--fault)';
           fiFill.style.inlineSize = '0%';
           fiFill.style.backgroundColor = 'var(--fault)';
-          if (fiFootL) fiFootL.textContent = 'FI tidak valid (sensor debu)';
+          if (fiFootL) fiFootL.textContent = 'Sensor debu putus';
           if (fiFootR) fiFootR.textContent = 'Kipas 70%';
         } else {
           const fiVal = row.fi ?? 0;
@@ -4469,9 +4541,9 @@ RENDERED_HTML = """<!DOCTYPE html>
             pmFrozEl.textContent = '';
           }
         }
-        document.getElementById('kpi-pmraw').textContent = (row.pm_raw ?? 0).toFixed(1);
+        document.getElementById('kpi-pmraw').textContent = isFault ? '--' : (row.pm_raw ?? 0).toFixed(1);
         const dcdt = row.dcdt ?? 0;
-        document.getElementById('kpi-dcdt').textContent = (dcdt >= 0 ? '+' : '') + dcdt.toFixed(2);
+        document.getElementById('kpi-dcdt').textContent = isFault ? '-- (beku)' : ((dcdt >= 0 ? '+' : '') + dcdt.toFixed(2));
         document.getElementById('kpi-vd').textContent = (row.v_dust ?? 0).toFixed(2);
         document.getElementById('kpi-v0').textContent = row.v0 != null ? Number(row.v0).toFixed(3) : '--';
 
@@ -4532,6 +4604,7 @@ RENDERED_HTML = """<!DOCTYPE html>
 
         updateParityUI(activeSim, row);
         updateSafetyCallout(row, activeSim);
+        updateMobileDockContext();
         if (sim) updateSimBadges(sim);
       }
 
@@ -4821,24 +4894,29 @@ RENDERED_HTML = """<!DOCTYPE html>
         const xOf = (t) => padL + ((t - minT) / spanT) * plotW;
         const yOf = (v) => padT + plotH - (Math.max(0, Math.min(maxY, v)) / maxY) * plotH;
 
+        const latestVisible = visible.length ? visible[visible.length - 1] : null;
+        const latestIsFault = !!(latestVisible && (latestVisible.state === 'FAILSAFE' || latestVisible.sensor_fault));
+
         // Future +60s horizon shading & vertical "SEKARANG" boundary when forecast active
         if (state.layers.forecast) {
           const xNow = xOf(maxT);
           const xRight = w - padR;
           if (xNow < xRight) {
             mCtx.save();
-            mCtx.fillStyle = palette.forecastFill;
+            mCtx.fillStyle = latestIsFault ? palette.faultFill : palette.forecastFill;
             mCtx.fillRect(xNow, padT, xRight - xNow, plotH);
-            mCtx.strokeStyle = palette.nowLine;
+            mCtx.strokeStyle = latestIsFault ? palette.fault : palette.nowLine;
             mCtx.lineWidth = 1.25;
             mCtx.setLineDash([4, 3]);
             mCtx.beginPath();
             mCtx.moveTo(xNow, padT);
             mCtx.lineTo(xNow, h - padB);
             mCtx.stroke();
-            mCtx.fillStyle = palette.forecast;
+            mCtx.fillStyle = latestIsFault ? palette.fault : palette.forecast;
             mCtx.font = `700 ${fs(12)}px ${monoFont}`;
-            const nowLbl = compact ? 'KINI' : 'SEKARANG → +60s';
+            const nowLbl = latestIsFault
+              ? (compact ? 'PRAKIRAAN JEDA' : 'PRAKIRAAN DITANGGUHKAN')
+              : (compact ? 'KINI' : 'SEKARANG → +60s');
             const txtW = mCtx.measureText(nowLbl).width;
             mCtx.fillText(nowLbl, Math.min(xRight - txtW - 4, xNow + 5), padT + 14);
             mCtx.restore();
@@ -4950,7 +5028,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           let lastX = null, lastY = null;
           for (const r of visible) {
             const v = extractFn(r);
-            if (v == null || Number.isNaN(v)) continue;
+            if (v == null || Number.isNaN(v)) { started = false; continue; }
             const rt = (r.t ?? 0) + xOffset;
             const x = xOf(rt);
             const y = yOf(v);
@@ -5001,10 +5079,17 @@ RENDERED_HTML = """<!DOCTYPE html>
             mCtx.moveTo(x2, padT); mCtx.lineTo(x2, h - padB);
             mCtx.stroke();
             if (segW >= 42) {
-              mCtx.fillStyle = palette.fault;
               mCtx.font = `700 ${fs(12)}px ${monoFont}`;
-              const lbl = segW >= 120 ? 'FAILSAFE (Vd=0V)' : 'FAILSAFE';
-              mCtx.fillText(lbl, x1 + 5, padT + 14, segW - 10);
+              const lbl = segW >= 120 ? 'FAILSAFE (Vd=0V)' : (segW >= 64 ? 'FAILSAFE' : 'FAIL');
+              const lblW = Math.min(segW - 10, mCtx.measureText(lbl).width);
+              const lblY = h - padB - 12;
+              mCtx.save();
+              mCtx.fillStyle = palette.exportBg;
+              mCtx.globalAlpha = 0.92;
+              mCtx.fillRect(x1 + 3, lblY - 11, lblW + 6, 15);
+              mCtx.restore();
+              mCtx.fillStyle = palette.fault;
+              mCtx.fillText(lbl, x1 + 6, lblY, segW - 12);
             }
           });
           mCtx.restore();
@@ -5019,8 +5104,13 @@ RENDERED_HTML = """<!DOCTYPE html>
         if (state.layers.gas_ppm) plotSeries((r) => (r.gas_ppm ?? 400) * 0.2, palette.gas_ppm, lw(1.8), [4, 3]);
         if (state.layers.g_scaled) plotSeries((r) => (r.g ?? 0) * 100, palette.g_scaled, lw(1.8), [2, 3]);
         if (state.layers.pm) plotSeries((r) => r.pm, palette.pm, lw(2.4));
-        if (state.layers.fi) plotSeries((r) => r.fi, palette.fi, lw(2.8));
-        if (state.layers.forecast) plotSeries((r) => r.forecast, palette.forecast, lw(2.4), [3, 3], 60, true);
+        if (state.layers.fi) {
+          plotSeries((r) => (r.state === 'FAILSAFE' || r.sensor_fault) ? null : r.fi, palette.fi, lw(2.8));
+          if (faultSegs.length) {
+            plotSeries((r) => (r.state === 'FAILSAFE' || r.sensor_fault) ? r.fi : null, palette.fault, lw(1.8), [5, 4]);
+          }
+        }
+        if (state.layers.forecast && !latestIsFault) plotSeries((r) => r.forecast, palette.forecast, lw(2.4), [3, 3], 60, true);
 
         // Sub-chart Lane 1 (Upper): Duty Kipas (%) step function
         function plotStepSub(extractYFn, color, width, dash = []) {
@@ -5087,11 +5177,14 @@ RENDERED_HTML = """<!DOCTYPE html>
             }
           }
           sCtx.save();
-          segments.forEach((seg) => {
+          let lastSegLabeled = false;
+          let lastSegX2 = padL;
+          segments.forEach((seg, segIdx) => {
             const stStyle = ribbonStyles[seg.state] || ribbonStyles.NORMAL;
             const x1 = Math.max(padL, xOf(seg.startT));
             const x2 = Math.min(sw - padR, Math.max(x1 + 3, xOf(seg.endT)));
             const segW = Math.max(2, x2 - x1);
+            if (segIdx === segments.length - 1) lastSegX2 = x2;
             sCtx.fillStyle = stStyle.fill;
             sCtx.fillRect(x1, ribbonTop, segW, ribbonH);
             if (stStyle.hatch) {
@@ -5127,22 +5220,28 @@ RENDERED_HTML = """<!DOCTYPE html>
               }
               sCtx.fillStyle = palette.tipFg;
               sCtx.fillText(lbl, tx, ribbonTop + ribbonH / 2 + 4);
+              if (segIdx === segments.length - 1) lastSegLabeled = true;
             }
           });
           const lastSeg = segments[segments.length - 1];
-          if (lastSeg) {
+          if (lastSeg && !lastSegLabeled) {
             const stStyle = ribbonStyles[lastSeg.state] || ribbonStyles.NORMAL;
+            const tailLbl = fsmCompact ? stStyle.short : lastSeg.state;
             sCtx.fillStyle = stStyle.stroke;
             sCtx.font = `700 ${fs(12)}px ${monoFont}`;
-            sCtx.fillText(fsmCompact ? stStyle.short : lastSeg.state, sw - padR + 5, ribbonTop + ribbonH / 2 + 4, padR - 6);
+            const tailW = sCtx.measureText(tailLbl).width;
+            const tailX = Math.min(sw - tailW - 4, lastSegX2 + 6);
+            sCtx.fillText(tailLbl, tailX, ribbonTop + ribbonH / 2 + 4);
           }
           sCtx.restore();
         }
 
         const lastVisible = visible[visible.length - 1];
         if (lastVisible) {
-          document.getElementById('chart-sr-summary').textContent =
-            `Sampel terbaru t=${(lastVisible.t ?? 0).toFixed(0)}s, State ${lastVisible.state}, FI ${(lastVisible.fi ?? 0).toFixed(1)}, PM ${(lastVisible.pm ?? 0).toFixed(1)}, Kipas ${(lastVisible.duty ?? 0).toFixed(0)}%.`;
+          const lastIsFault = lastVisible.state === 'FAILSAFE' || !!lastVisible.sensor_fault;
+          document.getElementById('chart-sr-summary').textContent = lastIsFault
+            ? `Sampel terbaru t=${(lastVisible.t ?? 0).toFixed(0)}s, State FAILSAFE, FI tidak valid (sensor debu putus), PM beku ${(lastVisible.pm ?? 0).toFixed(1)}, Kipas ${(lastVisible.duty ?? 0).toFixed(0)}%.`
+            : `Sampel terbaru t=${(lastVisible.t ?? 0).toFixed(0)}s, State ${lastVisible.state}, FI ${(lastVisible.fi ?? 0).toFixed(1)}, PM ${(lastVisible.pm ?? 0).toFixed(1)}, Kipas ${(lastVisible.duty ?? 0).toFixed(0)}%.`;
           const subSr = document.getElementById('subchart-sr-summary');
           if (subSr) {
             subSr.textContent =

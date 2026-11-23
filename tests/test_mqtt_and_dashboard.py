@@ -827,6 +827,31 @@ class TestModernWebDashboard(unittest.TestCase):
             finally:
                 eng.shutdown()
 
+    def test_dashboard_round8_hils_failsafe_parity_and_polish_invariants(self):
+        html = dashboard.RENDERED_HTML
+        self.assertIn("PRAKIRAAN DITANGGUHKAN", html)
+        self.assertIn("Ekstraksi Penuh 100%", html)
+        self.assertIn("-- (beku)", html)
+        self.assertIn("FI tidak valid (sensor debu putus)", html)
+        self.assertIn("#badge-fsm { display: none; }", html)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            try:
+                eng._ingest_external({"seq": 0, "pm": 65.0, "fi": 65.0, "state": "WASPADA"}, "esp32")
+                eng._ingest_external({"seq": 1, "pm": 92.0, "fi": 92.0, "state": "WASPADA"}, "esp32")
+                eng._ingest_external({"seq": 2, "pm": 92.0, "fi": 92.0, "state": "FAILSAFE", "v_dust": 0.0, "duty": 70.0}, "esp32")
+                snap = eng.get_state_snapshot()
+                esp_hist = snap["sources"]["esp32"]["history"]
+                self.assertEqual(len(esp_hist), 3)
+                last = esp_hist[-1]
+                self.assertEqual(last["state"], "FAILSAFE")
+                self.assertEqual(last["slope"], 0.0)
+                self.assertIsNone(last.get("eta_bahaya_s"))
+                self.assertEqual(last["forecast"], esp_hist[1]["forecast"])
+            finally:
+                eng.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
