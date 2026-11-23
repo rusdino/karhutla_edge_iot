@@ -641,6 +641,7 @@ class DashboardEngine:
         }
 
     def send_cmd(self, cmd, target="auto"):
+        self._last_cmd_paths = {"sitl": False, "esp32": False}
         clean_cmd = (cmd or "").strip().upper()
         if clean_cmd not in ("AUTO", "FORCE_MAX", "FORCE_OFF", "RESET"):
             self._last_cmd_error = "Perintah tidak dikenali."
@@ -711,10 +712,14 @@ class DashboardEngine:
                 if tel_now is not None:
                     mqtt_io.publish_telemetry(self.client, tel_now)
             except Exception as exc:
+                self._record_mqtt_log(f"[error] PUBLISH {K.T_CMD} {clean_cmd} gagal: {type(exc).__name__}")
                 if tel_now is None and not apply_hils_ref:
-                    self._last_cmd_error = f"Gagal mengirim ke broker MQTT: {exc}"
+                    self._last_cmd_error = (
+                        f"Broker MQTT :{self.broker_port} tidak dapat dijangkau — periksa layanan Mosquitto dan jaringan."
+                    )
                     return False
         self._last_cmd_error = None
+        self._last_cmd_paths = {"sitl": bool(apply_sitl), "esp32": bool(publish_needed or apply_hils_ref)}
         if did_clear:
             self._broadcast({"type": "clear", "source": "sitl"})
         if snap is not None:
@@ -871,8 +876,18 @@ class DashboardEngine:
                     if self.sim_fault_inject:
                         vd = 0.0
                     tel = self.sim_fw.step(vd, vm, seq=k)
-                    f = self.sim_fc.update(t, tel["pm"])
-                    if self.sim_ai_preempt and self.sim_pre is not None:
+                    if str(tel.get("state")) == "FAILSAFE":
+                        prev_fc = self.latest.get("forecast") if isinstance(self.latest, dict) else None
+                        prev_mae = self.latest.get("mae") if isinstance(self.latest, dict) else None
+                        f = {
+                            "pm_forecast": float(prev_fc) if prev_fc is not None else float(tel["pm"]),
+                            "slope": 0.0,
+                            "eta_bahaya_s": None,
+                            "mae": prev_mae,
+                        }
+                    else:
+                        f = self.sim_fc.update(t, tel["pm"])
+                    if self.sim_ai_preempt and self.sim_pre is not None and str(tel.get("state")) != "FAILSAFE":
                         cmd = self.sim_pre.decide(t, self.sim_fw.mode, f["pm_forecast"])
                         if cmd:
                             self.sim_fw.apply_command(cmd)
@@ -1184,6 +1199,8 @@ RENDERED_HTML = """<!DOCTYPE html>
       --warn-dark: #fbbf24;
       --danger-light: #b91c1c;
       --danger-dark: #f87171;
+      --fault-light: #9d174d;
+      --fault-dark: #f472b6;
       --violet-light: #6d28d9;
       --violet-dark: #e879f9;
       --teal-light: #0f766e;
@@ -1202,6 +1219,7 @@ RENDERED_HTML = """<!DOCTYPE html>
       --ok: var(--ok-light);
       --warn: var(--warn-light);
       --danger: var(--danger-light);
+      --fault: var(--fault-light);
       --violet: var(--violet-light);
       --teal: var(--teal-light);
 
@@ -1222,6 +1240,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         --ok: var(--ok-dark);
         --warn: var(--warn-dark);
         --danger: var(--danger-dark);
+        --fault: var(--fault-dark);
         --violet: var(--violet-dark);
         --teal: var(--teal-dark);
         --scrollbar-thumb: #9ca7b4;
@@ -1242,6 +1261,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         --ok: light-dark(var(--ok-light), var(--ok-dark));
         --warn: light-dark(var(--warn-light), var(--warn-dark));
         --danger: light-dark(var(--danger-light), var(--danger-dark));
+        --fault: light-dark(var(--fault-light), var(--fault-dark));
         --violet: light-dark(var(--violet-light), var(--violet-dark));
         --teal: light-dark(var(--teal-light), var(--teal-dark));
         --scrollbar-thumb: light-dark(#64748b, #9ca7b4);
@@ -1267,6 +1287,7 @@ RENDERED_HTML = """<!DOCTYPE html>
       --ok: var(--ok-light);
       --warn: var(--warn-light);
       --danger: var(--danger-light);
+      --fault: var(--fault-light);
       --violet: var(--violet-light);
       --teal: var(--teal-light);
       --scrollbar-thumb: #64748b;
@@ -1288,6 +1309,7 @@ RENDERED_HTML = """<!DOCTYPE html>
       --ok: var(--ok-dark);
       --warn: var(--warn-dark);
       --danger: var(--danger-dark);
+      --fault: var(--fault-dark);
       --violet: var(--violet-dark);
       --teal: var(--teal-dark);
       --scrollbar-thumb: #9ca7b4;
@@ -1328,6 +1350,25 @@ RENDERED_HTML = """<!DOCTYPE html>
       white-space: nowrap;
     }
 
+    .skip-link {
+      position: fixed;
+      inset-block-start: -100px;
+      inset-inline-start: 12px;
+      z-index: 60;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: var(--accent);
+      color: var(--accent-fg);
+      font-size: 0.8125rem;
+      font-weight: 700;
+      text-decoration: none;
+      box-shadow: 0 6px 18px -4px rgba(0, 0, 0, 0.35);
+    }
+
+    .skip-link:focus-visible {
+      inset-block-start: 10px;
+    }
+
     svg.ico {
       inline-size: 16px;
       block-size: 16px;
@@ -1360,12 +1401,12 @@ RENDERED_HTML = """<!DOCTYPE html>
 
     kbd.key-hint[hidden] { display: none; }
 
-    .src-btn[aria-pressed="true"] kbd.key-hint,
-    .preset-btn[aria-pressed="true"] kbd.key-hint,
-    .cmd-btn[aria-pressed="true"]:not(#btn-sim-pause) kbd.key-hint {
-      color: var(--accent-fg);
-      background: color-mix(in oklab, var(--accent-fg), transparent 85%);
-      border-color: color-mix(in oklab, var(--accent-fg), transparent 65%);
+    .src-btn[aria-pressed="true"]:not(:disabled) kbd.key-hint,
+    .preset-btn[aria-pressed="true"]:not(:disabled) kbd.key-hint,
+    .cmd-btn[aria-pressed="true"]:not(:disabled):not(#btn-sim-pause) kbd.key-hint {
+      color: var(--text-main);
+      background: var(--bg-surface);
+      border-color: color-mix(in oklab, var(--accent), transparent 35%);
     }
 
     #btn-sim-pause[aria-pressed="true"] kbd.key-hint {
@@ -1508,6 +1549,12 @@ RENDERED_HTML = """<!DOCTYPE html>
       color: var(--accent);
     }
 
+    .pill-badge[data-tone="fault"] {
+      background: color-mix(in oklab, var(--fault), transparent 86%);
+      border: 1px dashed color-mix(in oklab, var(--fault), transparent 25%);
+      color: var(--fault);
+    }
+
     .safety-callout {
       border-radius: 12px;
       padding: 10px 14px;
@@ -1541,6 +1588,12 @@ RENDERED_HTML = """<!DOCTYPE html>
       background: color-mix(in oklab, var(--bg-surface), var(--accent) 12%);
       border-color: color-mix(in oklab, var(--accent), transparent 30%);
       color: var(--accent);
+    }
+
+    .safety-callout[data-tone="fault"] {
+      background: color-mix(in oklab, var(--bg-surface), var(--fault) 11%);
+      border: 1.5px dashed color-mix(in oklab, var(--fault), transparent 20%);
+      color: var(--fault);
     }
 
     .callout-msg {
@@ -1606,6 +1659,30 @@ RENDERED_HTML = """<!DOCTYPE html>
       background: var(--bg-surface);
       border-color: var(--border-subtle);
     }
+
+    article.kpi-card#card-fi[data-tone="fault"],
+    article.kpi-card#card-pm[data-tone="fault"],
+    article.kpi-card#card-fc[data-tone="fault"] {
+      background: var(--bg-surface);
+      border: 1px dashed color-mix(in oklab, var(--fault), transparent 35%);
+    }
+
+    #card-fi[data-tone="fault"] #kpi-fi,
+    #card-pm[data-tone="fault"] #kpi-pm,
+    #card-fc[data-tone="fault"] #kpi-fc {
+      font-size: clamp(0.9rem, 6.2cqi, 1.12rem);
+      letter-spacing: 0;
+    }
+
+    .kpi-frozen-note {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-block-start: 2px;
+    }
+
+    .kpi-frozen-note[hidden] { display: none; }
 
     article.kpi-card > header {
       display: flex;
@@ -1742,10 +1819,9 @@ RENDERED_HTML = """<!DOCTYPE html>
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      padding: 7px 10px;
-      border-radius: 10px;
-      background: var(--bg-elevated);
-      border: 1px solid color-mix(in oklab, var(--border-subtle), transparent 25%);
+      padding: 6px 0;
+      border-block: 1px solid color-mix(in oklab, var(--border-subtle), transparent 35%);
+      background: transparent;
     }
 
     .preset-label {
@@ -1829,7 +1905,10 @@ RENDERED_HTML = """<!DOCTYPE html>
     .chip-btn[hidden], .cmd-btn[hidden] { display: none; }
 
     .chip-btn[disabled], .cmd-btn[disabled] {
-      opacity: 0.45;
+      opacity: 0.72;
+      border-style: dashed;
+      color: var(--text-muted);
+      background: var(--bg-canvas);
       cursor: not-allowed;
     }
 
@@ -1843,21 +1922,21 @@ RENDERED_HTML = """<!DOCTYPE html>
       outline-offset: 2px;
     }
 
-    .src-btn[aria-pressed="true"],
-    .spd-btn[aria-pressed="true"],
-    .tgt-btn[aria-pressed="true"],
-    .preset-btn[aria-pressed="true"],
-    .theme-btn[aria-pressed="true"],
-    .win-btn[aria-pressed="true"] {
+    .src-btn[aria-pressed="true"]:not(:disabled),
+    .spd-btn[aria-pressed="true"]:not(:disabled),
+    .tgt-btn[aria-pressed="true"]:not(:disabled),
+    .preset-btn[aria-pressed="true"]:not(:disabled),
+    .theme-btn[aria-pressed="true"]:not(:disabled),
+    .win-btn[aria-pressed="true"]:not(:disabled) {
       background: var(--accent);
       border-color: var(--accent);
       color: var(--accent-fg);
       font-weight: 700;
     }
 
-    .layer-btn[aria-pressed="true"],
+    .layer-btn[aria-pressed="true"]:not(:disabled),
     #btn-toggle-layers[aria-expanded="true"],
-    #btn-sim-pause[aria-pressed="true"] {
+    #btn-sim-pause[aria-pressed="true"]:not(:disabled) {
       background: color-mix(in oklab, var(--chip-color, var(--accent)), transparent 74%);
       border-color: var(--chip-color, var(--accent));
       color: var(--text-main);
@@ -1871,6 +1950,16 @@ RENDERED_HTML = """<!DOCTYPE html>
       border-radius: 50%;
       background: var(--chip-color, var(--accent));
       flex-shrink: 0;
+    }
+
+    .drawer-source-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding-block-start: 6px;
+      border-block-start: 1px dashed color-mix(in oklab, var(--border-subtle), transparent 35%);
     }
 
     .compact-drawer {
@@ -1977,12 +2066,20 @@ RENDERED_HTML = """<!DOCTYPE html>
 
     .cmd-btn {
       border-radius: 10px;
+      min-inline-size: 0;
       min-block-size: 40px;
       padding: 8px 10px;
       font-size: 0.75rem;
+      overflow: hidden;
     }
 
-    .cmd-btn[aria-pressed="true"] {
+    @container (max-width: 440px) {
+      #cmd-toolbar kbd.key-hint {
+        display: none;
+      }
+    }
+
+    .cmd-btn[aria-pressed="true"]:not(:disabled) {
       background: var(--accent);
       border-color: var(--accent);
       color: var(--accent-fg);
@@ -2022,10 +2119,9 @@ RENDERED_HTML = """<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       gap: 6px;
-      padding: 8px 10px;
-      border-radius: 10px;
-      background: var(--bg-elevated);
-      border: 1px solid color-mix(in oklab, var(--border-subtle), transparent 20%);
+      padding: 8px 0 2px;
+      border-block-start: 1px dashed var(--border-subtle);
+      background: transparent;
     }
 
     .sim-active-bar {
@@ -2034,15 +2130,14 @@ RENDERED_HTML = """<!DOCTYPE html>
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      padding: 6px 8px;
-      border-radius: 8px;
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
+      padding: 6px 0;
+      border-block: 1px dashed var(--border-subtle);
+      background: transparent;
       font-size: 0.8125rem;
       font-weight: 600;
     }
 
-    .sim-active-bar[hidden], #sim-config-fields[hidden] { display: none; }
+    .sim-zone[hidden], .sim-active-bar[hidden], #sim-config-fields[hidden] { display: none; }
 
     .shortcut-grid {
       display: grid;
@@ -2077,11 +2172,14 @@ RENDERED_HTML = """<!DOCTYPE html>
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      padding: 6px 8px;
-      border-radius: 8px;
-      background: var(--bg-surface);
-      border: 1px solid color-mix(in oklab, var(--border-subtle), transparent 35%);
+      padding: 5px 0;
+      border-block-end: 1px solid color-mix(in oklab, var(--border-subtle), transparent 45%);
+      background: transparent;
       font-size: 0.8125rem;
+    }
+
+    .op-row:last-child {
+      border-block-end: none;
     }
 
     .op-select {
@@ -2279,6 +2377,18 @@ RENDERED_HTML = """<!DOCTYPE html>
       color: var(--warn);
     }
 
+    .toast[data-tone="accent"] {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .toast-with-action {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
     .mobile-dock {
       display: none;
     }
@@ -2305,10 +2415,9 @@ RENDERED_HTML = """<!DOCTYPE html>
     }
 
     .sim-adv-drawer {
-      padding: 8px 10px;
-      border-radius: 10px;
-      background: var(--bg-elevated);
-      border: 1px solid color-mix(in oklab, var(--border-subtle), transparent 20%);
+      padding: 8px 0 0;
+      border-block-start: 1px dashed var(--border-subtle);
+      background: transparent;
     }
 
     .sim-adv-drawer > summary {
@@ -2377,7 +2486,8 @@ RENDERED_HTML = """<!DOCTYPE html>
 
     #card-state[data-tone="ok"] .kpi-state-wrap,
     #card-state[data-tone="warn"] .kpi-state-wrap,
-    #card-state[data-tone="danger"] .kpi-state-wrap {
+    #card-state[data-tone="danger"] .kpi-state-wrap,
+    #card-state[data-tone="fault"] .kpi-state-wrap {
       font-size: clamp(1.45rem, 11.5cqi, 2.05rem);
     }
 
@@ -2394,6 +2504,11 @@ RENDERED_HTML = """<!DOCTYPE html>
     article.kpi-card#card-state[data-tone="danger"] {
       background: color-mix(in oklab, var(--bg-surface), var(--danger) 16%);
       border-color: color-mix(in oklab, var(--danger), transparent 10%);
+    }
+
+    article.kpi-card#card-state[data-tone="fault"] {
+      background: color-mix(in oklab, var(--bg-surface), var(--fault) 13%);
+      border: 2px dashed color-mix(in oklab, var(--fault), transparent 15%);
     }
 
     .preset-actions {
@@ -2435,8 +2550,27 @@ RENDERED_HTML = """<!DOCTYPE html>
     .help-subhead { margin-block-start: 14px; }
 
     .override-target-line {
-      font-weight: 600;
+      padding: 3px 0 3px 10px;
+      border-inline-start: 3px solid var(--border-subtle);
+      background: transparent;
+      font-size: 0.75rem;
+      font-weight: 700;
       color: var(--text-main);
+      text-wrap: pretty;
+    }
+
+    .override-target-line[data-tone="ok"] {
+      border-inline-start-color: var(--ok);
+    }
+
+    .override-target-line[data-tone="warn"] {
+      color: var(--warn);
+      border-inline-start-color: var(--warn);
+    }
+
+    .override-target-line[data-tone="idle"] {
+      color: var(--text-muted);
+      border-inline-start-style: dashed;
     }
 
     /* Layer chip swatches mirror chart series colors (JS syncs exact palette per theme) */
@@ -2512,16 +2646,49 @@ RENDERED_HTML = """<!DOCTYPE html>
       text-overflow: ellipsis;
     }
 
+    .mob-dock-cmd-status {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--text-main);
+    }
+
+    .mob-dock-cmd-status[data-tone="warn"] { color: var(--warn); }
+    .mob-dock-cmd-status[data-tone="idle"] { color: var(--text-muted); }
+
     .mob-dock-tray {
       display: flex;
+      flex-direction: column;
       gap: 6px;
-      padding-block-end: 4px;
+      padding-block-end: 6px;
       border-block-end: 1px dashed var(--border-subtle);
     }
 
     .mob-dock-tray[hidden] { display: none; }
 
-    .mob-dock-tray > .cmd-btn {
+    .mob-cmd-scope {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+
+    .mob-cmd-scope .op-select {
+      flex: 1 1 auto;
+      min-inline-size: 0;
+    }
+
+    .mob-tray-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    .mob-tray-actions > .cmd-btn {
       flex: 1 1 0;
       min-inline-size: 0;
     }
@@ -2542,36 +2709,42 @@ RENDERED_HTML = """<!DOCTYPE html>
 
     /* Projector 1280x768 fit: compact vertical rhythm without scrolling */
     @media (max-height: 820px) and (min-width: 1280px) {
-      body { padding-block: 8px; }
-      .page-frame, .dashboard-shell { gap: 8px; }
-      .topbar { padding: 6px 14px; gap: 6px 12px; }
-      .topbar .brand-sub { display: none; }
-      .brand-badge { inline-size: 32px; block-size: 32px; }
-      .brand-title { font-size: 1.35rem; line-height: 1.15; }
+      body { padding-block: 6px; }
+      .page-frame, .dashboard-shell { gap: 6px; }
+      .topbar { padding: 5px 12px; gap: 8px; flex-wrap: nowrap; }
+      .topbar .brand-sub, .topbar .brand-title-ext { display: none; }
+      .brand-badge { inline-size: 30px; block-size: 30px; }
+      .brand-title { font-size: 1.3rem; line-height: 1.15; white-space: nowrap; }
+      .topbar .pill-badge { padding: 3px 9px; white-space: nowrap; }
+      .topbar-actions { flex-wrap: nowrap; gap: 6px; }
+      .safety-callout { padding: 6px 12px; font-size: 0.8125rem; }
       .kpi-grid { gap: 8px; }
       article.kpi-card { padding: 7px 10px; gap: 3px; }
-      .kpi-value { font-size: clamp(1.15rem, 8cqi, 1.5rem); line-height: 1.2; }
+      .kpi-value { font-size: clamp(1.1rem, 8cqi, 1.45rem); line-height: 1.2; }
       #card-state[data-tone="ok"] .kpi-state-wrap,
       #card-state[data-tone="warn"] .kpi-state-wrap,
-      #card-state[data-tone="danger"] .kpi-state-wrap { font-size: clamp(1.35rem, 10.5cqi, 1.85rem); }
+      #card-state[data-tone="danger"] .kpi-state-wrap,
+      #card-state[data-tone="fault"] .kpi-state-wrap { font-size: clamp(1.3rem, 10cqi, 1.8rem); }
       .kpi-meter { margin-block-start: 2px; }
       article.kpi-card > footer { padding-block-start: 4px; }
       .control-column { gap: 8px; }
       .panel-card { padding: 8px 11px; gap: 5px; }
       .panel-subtitle-row { margin-block-start: 0; }
-      .preset-bar { padding: 4px 8px; }
+      .preset-bar { padding: 4px 0; }
       .chip-btn { min-block-size: 30px; padding: 4px 10px; }
       .cmd-btn { min-block-size: 34px; padding: 5px 8px; }
       .reset-zone { padding-block-start: 6px; }
-      .sim-zone, .sim-adv-drawer { padding: 6px 8px; gap: 4px; }
-      .op-list, .sim-adv-body { gap: 5px; }
-      .op-row, .override-scope-row { padding: 4px 7px; }
+      .sim-zone, .sim-adv-drawer { padding: 5px 0 0; gap: 3px; }
+      .op-list, .sim-adv-body { gap: 4px; }
+      .op-row, .override-scope-row { padding: 4px 0; }
       .op-select { min-block-size: 30px; padding: 4px 8px; }
       details.drawer-card > summary, .sim-adv-drawer > summary { font-size: 0.8125rem; }
       .theme-switch .theme-btn { min-block-size: 28px; }
       .chart-legend { padding: 0; gap: 4px 12px; }
-      canvas.chart-stage { block-size: clamp(205px, 34dvh, 260px); }
-      canvas.subchart-stage { block-size: clamp(108px, 16dvh, 128px); }
+      .run-summary { padding: 6px 10px; gap: 4px; }
+      .run-summary-grid { grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 4px 10px; }
+      canvas.chart-stage { block-size: clamp(188px, 28dvh, 224px); }
+      canvas.subchart-stage { block-size: clamp(112px, 15.5dvh, 124px); }
     }
 
     @media (max-width: 1279px) {
@@ -2590,11 +2763,26 @@ RENDERED_HTML = """<!DOCTYPE html>
 
     @media (max-width: 767px) {
       body {
-        padding-block-end: calc(98px + env(safe-area-inset-bottom));
+        padding-block-end: calc(116px + env(safe-area-inset-bottom));
       }
       .topbar {
-        padding: 8px 10px;
-        gap: 6px 8px;
+        padding: 7px 9px;
+        gap: 5px 6px;
+      }
+      .topbar .pill-badge {
+        padding: 3px 8px;
+        font-size: 0.7rem;
+      }
+      .topbar-actions {
+        gap: 5px;
+      }
+      .theme-switch .theme-btn {
+        padding: 4px 7px;
+        font-size: 0.7rem;
+      }
+      #btn-open-help {
+        padding: 4px 8px;
+        font-size: 0.7rem;
       }
       .topbar .brand-sub, .brand-title-ext, #override-panel {
         display: none;
@@ -2647,7 +2835,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         font-size: 0.75rem;
       }
       .toast-region {
-        inset-block-end: calc(102px + env(safe-area-inset-bottom));
+        inset-block-end: calc(120px + env(safe-area-inset-bottom));
       }
     }
 
@@ -2660,6 +2848,13 @@ RENDERED_HTML = """<!DOCTYPE html>
     @media (pointer: coarse) {
       .chip-btn, .cmd-btn, .op-select, .touch-label, .theme-switch .theme-btn, details.drawer-card > summary, .sim-adv-drawer > summary {
         min-block-size: 44px;
+      }
+      .kpi-abbr-btn {
+        min-block-size: 44px;
+        display: inline-flex;
+        align-items: center;
+        padding-inline: 3px;
+        margin-block: -10px;
       }
       .chip-btn {
         padding: 8px 12px;
@@ -2677,6 +2872,7 @@ RENDERED_HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
+  <a href="#control-panel" class="skip-link">Lompat ke Panel Kontrol</a>
   <div id="safety-live" class="sr-only" role="alert" aria-live="assertive" aria-atomic="true"></div>
   <div id="toast-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
   <div id="toast-region" class="toast-region"></div>
@@ -2712,7 +2908,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         <div class="theme-switch" role="group" aria-label="Pilih Tema Tampilan">
           <button type="button" class="chip-btn theme-btn" data-theme-val="light" aria-pressed="false" title="Tema Proyektor Terang">
             <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
-            Terang
+            Proyektor
           </button>
           <button type="button" class="chip-btn theme-btn" data-theme-val="dark" aria-pressed="false" title="Tema Gelap Laboratorium">
             <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
@@ -2752,7 +2948,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           </div>
           <footer>
             <span>Mode: <strong id="kpi-mode">--</strong> • t=<span id="kpi-t">0s</span><span id="kpi-t-dur" hidden></span> (#<span id="kpi-seq">0</span>)</span>
-            <span id="kpi-parity-wrap" class="kpi-parity-tag" hidden>Paritas: <strong id="kpi-parity">-</strong></span>
+            <span id="kpi-parity-wrap" class="kpi-parity-tag" title="Kriteria paritas OK: |ΔFI| maks &lt; 1,0 dan 100% state cocok" hidden>Paritas: <strong id="kpi-parity">-</strong></span>
           </footer>
         </article>
 
@@ -2763,7 +2959,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           </header>
           <div>
             <div id="kpi-fi-wrap" class="kpi-value tone-muted">
-              <span id="kpi-fi">--</span> <span class="kpi-unit">µg/m³</span>
+              <span id="kpi-fi">--</span> <span id="kpi-fi-unit" class="kpi-unit">µg/m³</span>
             </div>
             <div class="kpi-meter" aria-hidden="true">
               <div id="fi-meter-fill" class="kpi-meter-fill"></div>
@@ -2772,18 +2968,21 @@ RENDERED_HTML = """<!DOCTYPE html>
             </div>
           </div>
           <footer>
-            <span>Waspada ≥ 55</span>
-            <span>Bahaya ≥ 150</span>
+            <span id="kpi-fi-foot-left">Waspada ≥ 55</span>
+            <span id="kpi-fi-foot-right">Bahaya ≥ 150</span>
           </footer>
         </article>
 
-        <article class="kpi-card">
+        <article class="kpi-card" id="card-pm">
           <header>
             <span>PM-proxy Kalman</span>
             <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M8 19h8"/><path d="M6 22h10"/></svg>
           </header>
-          <div class="kpi-value tone-accent">
-            <span id="kpi-pm">--</span> <span class="kpi-unit">µg/m³</span>
+          <div>
+            <div id="kpi-pm-wrap" class="kpi-value tone-accent">
+              <span id="kpi-pm">--</span> <span id="kpi-pm-unit" class="kpi-unit">µg/m³</span>
+            </div>
+            <div id="kpi-pm-frozen" class="kpi-frozen-note" hidden></div>
           </div>
           <footer>
             <span><button type="button" class="kpi-abbr-btn" data-abbr-help="Mentah: PM setelah filter Median3, sebelum Kalman (µg/m³)" title="Mentah: PM setelah filter Median3, sebelum Kalman (µg/m³)">Mentah:</button><span id="kpi-pmraw">--</span> • <button type="button" class="kpi-abbr-btn" data-abbr-help="dC/dt: laju kenaikan konsentrasi asap (µg/m³ per detik)" title="dC/dt: laju kenaikan konsentrasi asap (µg/m³ per detik)">dC/dt:</button><span id="kpi-dcdt">0.00</span></span>
@@ -2805,13 +3004,16 @@ RENDERED_HTML = """<!DOCTYPE html>
           </footer>
         </article>
 
-        <article class="kpi-card">
+        <article class="kpi-card" id="card-fc">
           <header>
             <span>Prakiraan AI (t+60s)</span>
             <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
           </header>
-          <div id="kpi-fc-wrap" class="kpi-value tone-muted">
-            <span id="kpi-fc">--</span> <span class="kpi-unit">µg/m³</span>
+          <div>
+            <div id="kpi-fc-wrap" class="kpi-value tone-muted">
+              <span id="kpi-fc">--</span> <span id="kpi-fc-unit" class="kpi-unit">µg/m³</span>
+            </div>
+            <div id="kpi-fc-frozen" class="kpi-frozen-note" hidden></div>
           </div>
           <footer>
             <span><button type="button" class="kpi-abbr-btn" data-abbr-help="ETA: perkiraan waktu tersisa sampai FI mencapai ambang BAHAYA (150)" title="ETA: perkiraan waktu tersisa sampai FI mencapai ambang BAHAYA (150)">ETA Bahaya:</button> <strong id="kpi-eta">-</strong></span>
@@ -2846,17 +3048,12 @@ RENDERED_HTML = """<!DOCTYPE html>
             <div>
               <h2 class="panel-title">Grafik Multi-Overlay Real-Time</h2>
               <div class="panel-subtitle-row">
-                <p class="brand-sub">Sumber: <strong id="src-label">SITL (simulasi)</strong></p>
-                <span id="parity-badge" class="pill-badge" data-tone="ok" hidden>Paritas HILS: -</span>
+                <p class="brand-sub">Sumber: <strong id="src-label">SITL (Python) — mengikuti target</strong></p>
+                <span id="parity-badge" class="pill-badge" data-tone="ok" title="Kriteria paritas OK: |ΔFI| maks &lt; 1,0 dan 100% state cocok" hidden>Paritas HILS: -</span>
               </div>
             </div>
 
-            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Sumber Data, Rentang Waktu, dan Ekspor">
-              <div role="group" aria-label="Sumber Data">
-                <button type="button" class="chip-btn src-btn" data-src="auto" aria-pressed="true">Otomatis</button>
-                <button type="button" class="chip-btn src-btn" data-src="esp32" aria-pressed="false">ESP32</button>
-                <button type="button" class="chip-btn src-btn" data-src="sitl" aria-pressed="false">SITL</button>
-              </div>
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Rentang Waktu dan Ekspor">
               <select id="sel-window" class="op-select" aria-label="Rentang Waktu Grafik">
                 <option value="120">120 dtk</option>
                 <option value="300" selected>300 dtk</option>
@@ -2875,11 +3072,11 @@ RENDERED_HTML = """<!DOCTYPE html>
           </div>
 
           <div class="preset-bar">
-            <div role="toolbar" aria-label="Preset Layer Grafik" id="preset-toolbar">
-              <span class="preset-label">Preset Kurva:</span>
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Tampilan Kurva Grafik" id="preset-toolbar">
+              <span class="preset-label">Tampilan Kurva:</span>
               <button type="button" class="chip-btn preset-btn" data-preset="demo" aria-pressed="true">Demo Sidang <kbd class="key-hint">1</kbd></button>
               <button type="button" class="chip-btn preset-btn" data-preset="dsp" aria-pressed="false">Validasi DSP <kbd class="key-hint">2</kbd></button>
-              <button type="button" class="chip-btn preset-btn" data-preset="all" aria-pressed="false">Semua Layer <kbd class="key-hint">3</kbd></button>
+              <button type="button" class="chip-btn preset-btn" data-preset="all" aria-pressed="false">Semua Kurva <kbd class="key-hint">3</kbd></button>
               <span id="badge-preset-custom" class="pill-badge" data-tone="accent" hidden>Kustom</span>
             </div>
             <div class="preset-actions">
@@ -2892,7 +3089,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           </div>
 
           <div id="layers-drawer" class="compact-drawer" hidden>
-            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Filter Layer Overlay Grafik" id="overlay-toolbar">
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Filter Kurva Overlay Grafik" id="overlay-toolbar">
               <div role="group" aria-label="Kurva Utama">
                 <button type="button" class="chip-btn layer-btn" data-layer="fi" aria-pressed="true">
                   <span class="chip-dot" aria-hidden="true"></span> Fusion Index (FI)
@@ -2929,10 +3126,36 @@ RENDERED_HTML = """<!DOCTYPE html>
                 </button>
               </div>
             </div>
+            <div class="drawer-source-row">
+              <span class="preset-label">Sumber Grafik (Override Tampilan):</span>
+              <div role="toolbar" focusgroup="toolbar wrap" aria-label="Sumber Data Grafik">
+                <button type="button" class="chip-btn src-btn" data-src="auto" aria-pressed="true">Ikuti Target Eksekusi</button>
+                <button type="button" class="chip-btn src-btn" data-src="esp32" aria-pressed="false">ESP32</button>
+                <button type="button" class="chip-btn src-btn" data-src="sitl" aria-pressed="false">SITL</button>
+              </div>
+            </div>
             <label class="touch-label" for="sw-zoom-y">
               <input id="sw-zoom-y" type="checkbox" switch>
-              <span>Skala Y Ketat (Auto-zoom untuk skenario udara bersih)</span>
+              <span>Skala Y Ketat (Zoom otomatis untuk skenario udara bersih)</span>
             </label>
+          </div>
+
+          <div id="chart-legend" class="chart-legend" aria-label="Legenda Kurva Aktif"></div>
+
+          <div class="canvas-wrap" id="main-wrap">
+            <div id="esp-banner" class="offline-banner" hidden>
+              <span id="esp-banner-text"></span>
+              <button type="button" class="chip-btn" id="btn-fallback-sitl">Beralih ke SITL</button>
+            </div>
+            <button type="button" id="btn-clear-hover" class="chip-btn hover-dismiss-btn" hidden>Tutup Inspeksi</button>
+            <canvas id="main-chart" class="chart-stage" width="960" height="320" tabindex="0" role="img" aria-label="Grafik Utama Multi-Overlay (gunakan panah kiri atau kanan untuk inspeksi titik)" aria-describedby="chart-sr-summary"></canvas>
+            <p id="chart-sr-summary" class="sr-only">Belum ada data telemetri.</p>
+            <div id="chart-live-readout" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+          </div>
+
+          <div class="canvas-wrap">
+            <canvas id="sub-chart" class="subchart-stage" width="960" height="150" tabindex="0" role="img" aria-label="Sub-Grafik Duty Kipas dan Pita State FSM (gunakan panah kiri atau kanan untuk inspeksi)" aria-describedby="subchart-sr-summary"></canvas>
+            <p id="subchart-sr-summary" class="sr-only">Belum ada histori duty kipas dan state FSM.</p>
           </div>
 
           <div id="run-summary-card" class="run-summary" role="region" aria-labelledby="rs-title" hidden>
@@ -2954,28 +3177,10 @@ RENDERED_HTML = """<!DOCTYPE html>
               <div><dt>Sampel</dt><dd id="rs-samples">-</dd></div>
             </dl>
           </div>
-
-          <div id="chart-legend" class="chart-legend" aria-label="Legenda Kurva Aktif"></div>
-
-          <div class="canvas-wrap" id="main-wrap">
-            <div id="esp-banner" class="offline-banner" hidden>
-              <span id="esp-banner-text"></span>
-              <button type="button" class="chip-btn" id="btn-fallback-sitl">Beralih ke SITL</button>
-            </div>
-            <button type="button" id="btn-clear-hover" class="chip-btn hover-dismiss-btn" hidden>Tutup Inspeksi</button>
-            <canvas id="main-chart" class="chart-stage" width="960" height="320" tabindex="0" role="img" aria-label="Grafik Utama Multi-Overlay (gunakan panah kiri atau kanan untuk inspeksi titik)" aria-describedby="chart-sr-summary"></canvas>
-            <p id="chart-sr-summary" class="sr-only">Belum ada data telemetri.</p>
-            <div id="chart-live-readout" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
-          </div>
-
-          <div class="canvas-wrap">
-            <canvas id="sub-chart" class="subchart-stage" width="960" height="150" tabindex="0" role="img" aria-label="Sub-Grafik Duty Kipas dan Pita State FSM (gunakan panah kiri atau kanan untuk inspeksi)" aria-describedby="subchart-sr-summary"></canvas>
-            <p id="subchart-sr-summary" class="sr-only">Belum ada histori duty kipas dan state FSM.</p>
-          </div>
         </div>
 
         <!-- Right: Override, Simulation, Collapsible MQTT Log & Mobile Export -->
-        <aside class="control-column" aria-label="Panel Kontrol dan Operasi">
+        <aside id="control-panel" class="control-column" tabindex="-1" aria-label="Panel Kontrol dan Operasi">
           <section class="panel-card" id="override-panel" aria-label="Kontrol Override Aktuator">
             <div>
               <h2 class="panel-title">Kontrol Override Aktuator <code class="topic-tag">karhutla/cmd</code></h2>
@@ -2985,22 +3190,22 @@ RENDERED_HTML = """<!DOCTYPE html>
             <div class="op-row override-scope-row">
               <label for="sel-cmd-target">Sasaran Perintah</label>
               <select id="sel-cmd-target" class="op-select" aria-label="Target Perintah Override">
-                <option value="auto" selected>Otomatis (semua jalur aktif)</option>
-                <option value="sitl">SITL (Python) saja</option>
-                <option value="esp32">ESP32 (Broker :6669) saja</option>
+                <option value="auto" selected>Semua jalur aktif</option>
+                <option value="sitl">Hanya SITL (Python)</option>
+                <option value="esp32">Hanya ESP32 (:6669)</option>
               </select>
             </div>
 
-            <div role="toolbar" aria-label="Perintah Override Kipas" class="cmd-grid" id="cmd-toolbar">
-              <button type="button" class="cmd-btn" data-cmd="AUTO" aria-pressed="false" disabled>
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Perintah Override Kipas" class="cmd-grid" id="cmd-toolbar">
+              <button type="button" class="cmd-btn" data-cmd="AUTO" aria-pressed="false" title="Kembalikan kendali kipas ke mode otomatis FSM (Alt+⇧A)" disabled>
                 <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.02 1.4 1.15.2.04.41.06.62.06H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
                 AUTO <kbd class="key-hint">Alt+⇧A</kbd>
               </button>
-              <button type="button" class="cmd-btn" data-cmd="FORCE_MAX" aria-pressed="false" disabled>
+              <button type="button" class="cmd-btn" data-cmd="FORCE_MAX" aria-pressed="false" title="Paksa kipas 100% secara manual (Alt+⇧M)" disabled>
                 <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
                 MAX 100% <kbd class="key-hint">Alt+⇧M</kbd>
               </button>
-              <button type="button" class="cmd-btn" data-cmd="FORCE_OFF" aria-pressed="false" disabled>
+              <button type="button" class="cmd-btn" data-cmd="FORCE_OFF" aria-pressed="false" title="Paksa kipas mati 0% (tanpa pintasan demi keselamatan)" disabled>
                 <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
                 OFF 0%
               </button>
@@ -3024,7 +3229,7 @@ RENDERED_HTML = """<!DOCTYPE html>
               <span id="badge-sim-state" class="pill-badge">Tidak aktif</span>
             </div>
 
-            <div role="toolbar" aria-label="Kontrol Runner Simulasi" class="exec-top">
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Kontrol Runner Simulasi" class="exec-top">
               <button type="button" class="cmd-btn btn-primary" id="btn-sim-start">
                 <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="6 3 20 12 6 21 6 3"/></svg>
                 <span id="lbl-sim-start">Mulai</span>
@@ -3041,12 +3246,12 @@ RENDERED_HTML = """<!DOCTYPE html>
               <button type="button" class="chip-btn" id="btn-toggle-sim-cfg" aria-expanded="false" aria-controls="sim-config-fields">Ubah Target/Skenario</button>
             </div>
 
-            <div class="sim-zone">
+            <div id="sim-config-zone" class="sim-zone">
               <span class="sim-zone-label">Konfigurasi Simulasi</span>
               <div id="sim-config-fields" class="op-list">
                 <div class="op-row">
                   <span>Target Eksekusi</span>
-                  <div role="toolbar" aria-label="Target Runner Simulasi" id="target-toolbar">
+                  <div role="toolbar" focusgroup="toolbar wrap" aria-label="Target Runner Simulasi" id="target-toolbar">
                     <button type="button" class="chip-btn tgt-btn" data-target="sitl" aria-pressed="true">SITL (Python)</button>
                     <button type="button" class="chip-btn tgt-btn" data-target="hils" aria-pressed="false">HILS (ESP32)</button>
                   </div>
@@ -3079,7 +3284,7 @@ RENDERED_HTML = """<!DOCTYPE html>
               <div class="sim-adv-body">
                 <div class="op-row">
                   <span>Kecepatan</span>
-                  <div role="toolbar" aria-label="Kecepatan Simulasi" id="speed-toolbar">
+                  <div role="toolbar" focusgroup="toolbar wrap" aria-label="Kecepatan Simulasi" id="speed-toolbar">
                     <button type="button" class="chip-btn spd-btn" data-speed="1" aria-pressed="true">1x</button>
                     <button type="button" class="chip-btn spd-btn" data-speed="5" aria-pressed="false">5x</button>
                     <button type="button" class="chip-btn spd-btn" data-speed="10" aria-pressed="false">10x</button>
@@ -3144,14 +3349,25 @@ RENDERED_HTML = """<!DOCTYPE html>
   <!-- Sticky Mobile Thumb-Zone Quick Controls -->
   <nav class="mobile-dock" aria-label="Kendali Cepat Mobile">
     <div id="mob-dock-context" class="mob-dock-context">SITL • Api Cepat • 1x</div>
+    <div id="mob-dock-cmd-status" class="mob-dock-cmd-status" aria-live="polite">Perintah: memeriksa jalur...</div>
     <div id="mob-dock-tray" class="mob-dock-tray" hidden>
-      <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="FORCE_OFF" data-variant="danger" aria-pressed="false" disabled>OFF 0%</button>
-      <button type="button" class="cmd-btn" id="mob-btn-stop" disabled>Berhenti</button>
-      <button type="button" class="cmd-btn" id="btn-mob-reset" data-cmd="RESET" data-variant="danger" disabled>Reset Sistem</button>
+      <div class="mob-cmd-scope">
+        <label for="mob-sel-cmd-target">Sasaran Perintah</label>
+        <select id="mob-sel-cmd-target" class="op-select" aria-label="Sasaran Perintah Mobile">
+          <option value="auto" selected>Semua jalur aktif</option>
+          <option value="sitl">Hanya SITL (Python)</option>
+          <option value="esp32">Hanya ESP32 (:6669)</option>
+        </select>
+      </div>
+      <div class="mob-tray-actions">
+        <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="FORCE_OFF" data-variant="danger" aria-pressed="false" aria-describedby="mob-dock-cmd-status" disabled>OFF 0%</button>
+        <button type="button" class="cmd-btn" id="mob-btn-stop" disabled>Berhenti</button>
+        <button type="button" class="cmd-btn" id="btn-mob-reset" data-cmd="RESET" data-variant="danger" aria-describedby="mob-dock-cmd-status" disabled>Reset Sistem</button>
+      </div>
     </div>
     <div class="mob-dock-row">
-      <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="AUTO" aria-pressed="false" disabled>AUTO</button>
-      <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="FORCE_MAX" aria-pressed="false" disabled>MAX 100%</button>
+      <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="AUTO" aria-pressed="false" aria-describedby="mob-dock-cmd-status" disabled>AUTO</button>
+      <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="FORCE_MAX" aria-pressed="false" aria-describedby="mob-dock-cmd-status" disabled>MAX 100%</button>
       <button type="button" class="cmd-btn btn-primary" id="mob-btn-playpause">Mulai</button>
       <button type="button" class="cmd-btn" id="mob-btn-more" aria-expanded="false" aria-controls="mob-dock-tray">
         <span>Lainnya</span>
@@ -3184,10 +3400,12 @@ RENDERED_HTML = """<!DOCTYPE html>
       <div><strong>State FSM &amp; FAILSAFE:</strong> <code class="topic-tag">NORMAL</code>, <code class="topic-tag">WASPADA</code>, <code class="topic-tag">BAHAYA</code>, dan <code class="topic-tag">FAILSAFE</code> (kipas terkunci aman 70% bila kabel debu terputus, kecuali override manual). Sebelum ada data, kartu State menampilkan <em>BELUM ADA DATA</em>.</div>
       <div><strong>Skenario <em>Putus Sensor (fault)</em> vs Saklar <em>Injeksi Putus Kabel (FAILSAFE)</em>:</strong> skenario fault otomatis memutus sensor debu pada <code class="topic-tag">t=200–230s</code> di dalam simulasi; saklar injeksi memaksa <code class="topic-tag">Vd=0V</code> secara manual kapan saja, tanpa menunggu skenario.</div>
       <div><strong>SITL vs HILS &amp; Paritas (<code class="topic-tag">ΔFI</code>):</strong> SITL memakai firmware virtual Python; HILS menguji ESP32 fisik <em>lock-step</em> via MQTT :6669 dan membandingkannya dengan firmware referensi. Paritas dinyatakan <strong>OK</strong> bila maks |ΔFI| &lt; 1,0 dan 100% state cocok; selain itu tampil <strong>Cek</strong>.</div>
-      <div><strong>Tujuan Perintah Override:</strong> panel Override memiliki pengunci sasaran (Otomatis, SITL saja, atau ESP32 via broker :6669 saja) agar pengujian satu jalur tidak mengganggu jalur lain. Tombol dinonaktifkan bila jalur yang dipilih tidak aktif.</div>
-      <div><strong>Skala Kurva &amp; Pemulihan Cepat:</strong> <code class="topic-tag">Gas × 0.2</code>, <code class="topic-tag">g × 100</code>, <code class="topic-tag">Vd/Vm × 50</code> (sumbu kanan tampil otomatis saat layer diaktifkan). Bila HILS timeout, cek USB/Wi-Fi ESP32 dan pastikan <code class="topic-tag">hils.py</code> tidak berjalan ganda di terminal.</div>
+      <div><strong>Tujuan Perintah Override:</strong> panel Override memiliki pengunci sasaran (<em>Semua jalur aktif</em>, <em>Hanya SITL (Python)</em>, atau <em>Hanya ESP32 (:6669)</em>) agar pengujian satu jalur tidak mengganggu jalur lain. Tombol dinonaktifkan bila jalur yang dipilih tidak aktif.</div>
+      <div><strong>Skala Kurva &amp; Pemulihan Cepat:</strong> <code class="topic-tag">Gas × 0.2</code>, <code class="topic-tag">g × 100</code>, <code class="topic-tag">Vd/Vm × 50</code> (sumbu kanan tampil otomatis saat kurva diaktifkan). Bila HILS timeout, cek USB/Wi-Fi ESP32 dan pastikan <code class="topic-tag">hils.py</code> tidak berjalan ganda di terminal.</div>
+      <div><strong>Broker :6669 Terputus:</strong> pastikan layanan Mosquitto berjalan (<code class="topic-tag">mosquitto -c mosquitto.conf -d</code>) dan port <code class="topic-tag">6669</code> tidak terblokir firewall.</div>
     </div>
     <h3 class="sim-zone-label help-subhead">Pintasan Keyboard</h3>
+    <p class="brand-sub">Demi keselamatan, perintah <code class="topic-tag">FORCE OFF (0%)</code> sengaja tidak diberi pintasan keyboard. Tekan <kbd class="key-hint">Esc</kbd> untuk menutup dialog ini.</p>
     <label class="touch-label shortcut-toggle-row" for="sw-shortcuts">
       <input id="sw-shortcuts" type="checkbox" switch checked>
       <span>Aktifkan pintasan satu tombol (S, P, 1–3, Space)</span>
@@ -3209,8 +3427,8 @@ RENDERED_HTML = """<!DOCTYPE html>
       function syncAllToolbars() {
         toolbarSyncFns.forEach((fn) => fn());
       }
-      document.querySelectorAll('[role="toolbar"][focusgroup]').forEach((bar) => {
-        if ('focusGroup' in HTMLElement.prototype) return;
+      document.querySelectorAll('[role="toolbar"]').forEach((bar) => {
+        if ('focusGroup' in HTMLElement.prototype && bar.hasAttribute('focusgroup')) return;
         const getButtons = () => Array.from(bar.querySelectorAll('button'));
         const getEnabled = () => getButtons().filter((b) => !b.disabled);
         function syncBar() {
@@ -3262,7 +3480,7 @@ RENDERED_HTML = """<!DOCTYPE html>
       const PRESET_LABELS = {
         demo: 'Demo Sidang',
         dsp: 'Validasi DSP',
-        all: 'Semua Layer',
+        all: 'Semua Kurva',
         custom: 'Kustom',
       };
 
@@ -3285,6 +3503,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         hilsTimeoutInfo: null,
         wasEspStale: false,
         cmdBusy: false,
+        pendingCmd: null,
         simConfigExpanded: false,
         lastActiveSource: null,
         lastRunSummary: null,
@@ -3375,6 +3594,9 @@ RENDERED_HTML = """<!DOCTYPE html>
           v_mq: '#a78bfa',
           waspada: '#fbbf24',
           bahaya: 'rgba(248,113,113,0.85)',
+          fault: '#f472b6',
+          faultFill: 'rgba(244,114,182,0.22)',
+          faultHatch: 'rgba(244,114,182,0.48)',
           fsm: '#fbbf24',
           duty: '#4ade80',
           tipBg: 'rgba(22,26,31,0.96)',
@@ -3397,6 +3619,9 @@ RENDERED_HTML = """<!DOCTYPE html>
           v_mq: '#7c3aed',
           waspada: '#92400e',
           bahaya: 'rgba(185,28,28,0.82)',
+          fault: '#9d174d',
+          faultFill: 'rgba(157,23,77,0.14)',
+          faultHatch: 'rgba(157,23,77,0.34)',
           fsm: '#92400e',
           duty: '#14532d',
           tipBg: 'rgba(255,255,255,0.97)',
@@ -3498,12 +3723,30 @@ RENDERED_HTML = """<!DOCTYPE html>
         scheduleDraw();
       }
 
-      function showToast(message, tone = 'ok') {
+      function showToast(message, tone = 'ok', opts = null) {
         if (!message) return;
         const el = document.createElement('div');
         el.className = 'toast';
         el.setAttribute('data-tone', tone);
-        el.textContent = message;
+        const actionLabel = opts && opts.actionLabel;
+        const onAction = opts && opts.onAction;
+        if (actionLabel && typeof onAction === 'function') {
+          el.classList.add('toast-with-action');
+          const span = document.createElement('span');
+          span.textContent = message;
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'chip-btn';
+          btn.textContent = actionLabel;
+          btn.addEventListener('click', () => {
+            if (el.parentNode) el.parentNode.removeChild(el);
+            onAction();
+          });
+          el.appendChild(span);
+          el.appendChild(btn);
+        } else {
+          el.textContent = message;
+        }
         toastRegion.appendChild(el);
         while (toastRegion.children.length > 4) {
           toastRegion.removeChild(toastRegion.firstChild);
@@ -3514,9 +3757,10 @@ RENDERED_HTML = """<!DOCTYPE html>
             toastLive.textContent = message;
           });
         }
+        const durationMs = (opts && opts.durationMs) || (actionLabel ? 6500 : 3600);
         setTimeout(() => {
           if (el.parentNode) el.parentNode.removeChild(el);
-        }, 3600);
+        }, durationMs);
       }
 
       function announceSafety(msg) {
@@ -3568,11 +3812,11 @@ RENDERED_HTML = """<!DOCTYPE html>
       function activeSource() {
         if (state.viewMode === 'sitl' || state.viewMode === 'esp32') return state.viewMode;
         if (state.sim && state.sim.running) return state.sim.target === 'hils' ? 'esp32' : 'sitl';
+        if (state.simTarget === 'hils') return 'esp32';
         if (state.lastActiveSource && state.src[state.lastActiveSource] && state.src[state.lastActiveSource].history.length) {
           return state.lastActiveSource;
         }
-        if (state.esp.online) return 'esp32';
-        if (state.src.esp32.history.length) return 'esp32';
+        if (state.esp.online && !state.src.sitl.history.length) return 'esp32';
         return 'sitl';
       }
 
@@ -3717,7 +3961,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           const forcedOff = row.mode === 'FORCE_OFF';
           verdict = {
             hidden: false,
-            tone: 'danger',
+            tone: forcedOff ? 'danger' : 'fault',
             text: forcedOff
               ? `Mode FAILSAFE dengan override FORCE OFF: sensor debu terputus dan kipas dipaksa mati (${dutyTxt}%). Kembalikan ke AUTO untuk pengamanan 70%.`
               : `Mode FAILSAFE aktif: pembacaan sensor debu tidak valid atau terputus. Kipas dikunci aman pada ${dutyTxt}%.`,
@@ -3899,6 +4143,24 @@ RENDERED_HTML = """<!DOCTYPE html>
         if (card) card.hidden = true;
       }
 
+      function commandFeedbackRow() {
+        if (state.cmdTarget === 'sitl') return state.src.sitl.latest;
+        if (state.cmdTarget === 'esp32') return state.src.esp32.latest;
+        return state.src[activeSource()].latest;
+      }
+
+      function syncCmdPressedState() {
+        const refRow = commandFeedbackRow();
+        const hasLive = !!(refRow && (state.history.length > 0 || refRow.scenario !== 'idle'));
+        const mode = hasLive ? (refRow.mode || null) : null;
+        document.querySelectorAll('#cmd-toolbar .cmd-btn[data-cmd], .mob-cmd-btn[data-cmd]').forEach((btn) => {
+          const c = btn.getAttribute('data-cmd');
+          if (c !== 'RESET') {
+            btn.setAttribute('aria-pressed', (!btn.disabled && mode && c === mode) ? 'true' : 'false');
+          }
+        });
+      }
+
       function updateOverrideControlState() {
         const sim = state.sim || {};
         const port = sim.broker_port || 6669;
@@ -3910,44 +4172,59 @@ RENDERED_HTML = """<!DOCTYPE html>
         if (selCmd && selCmd.value !== targetLock) {
           selCmd.value = targetLock;
         }
-        let canSend = !!sim.can_send_cmd;
-        if (targetLock === 'sitl') {
-          canSend = hasSitl;
-        } else if (targetLock === 'esp32') {
-          canSend = hasBroker || hasHilsRef;
+        const mobSelCmd = document.getElementById('mob-sel-cmd-target');
+        if (mobSelCmd && mobSelCmd.value !== targetLock) {
+          mobSelCmd.value = targetLock;
+        }
+        const hitsSitl = hasSitl && (targetLock === 'auto' || targetLock === 'sitl');
+        const hitsEsp = (hasBroker || hasHilsRef) && (targetLock === 'auto' || targetLock === 'esp32');
+        const canSend = hitsSitl || hitsEsp;
+        const viewedSrc = activeSource();
+        let tone = 'ok';
+        let dest = '';
+        if (!canSend) {
+          tone = 'idle';
+          if (targetLock === 'sitl') {
+            dest = 'Perintah nonaktif — mulai simulasi SITL';
+          } else if (targetLock === 'esp32') {
+            dest = `Perintah nonaktif — broker\u00A0:${port} belum terhubung`;
+          } else {
+            dest = `Perintah nonaktif — mulai SITL atau sambungkan broker\u00A0:${port}`;
+          }
+        } else {
+          if (hitsSitl && hitsEsp) {
+            dest = `Perintah → SITL + ESP32 :${port}`;
+          } else if (hitsSitl) {
+            dest = 'Perintah → Hanya SITL (Python)';
+          } else if (hasHilsRef) {
+            dest = `Perintah → HILS (ESP32 + Ref :${port})`;
+          } else {
+            dest = `Perintah → Hanya ESP32 (:${port})`;
+          }
+          let mismatch = false;
+          if ((viewedSrc === 'sitl' && !hitsSitl) || (viewedSrc === 'esp32' && !hitsEsp)) {
+            mismatch = true;
+            dest += ` — ⚠ tidak mencakup grafik ${viewedSrc.toUpperCase()}`;
+          } else if (targetLock === 'auto' && viewedSrc === 'esp32' && hitsSitl) {
+            mismatch = true;
+            dest += ' — ⚠ SITL juga terpengaruh';
+          }
+          tone = mismatch ? 'warn' : 'ok';
         }
         const line = document.getElementById('override-target-line');
         if (line) {
-          let dest = `Belum ada jalur kendali aktif — mulai simulasi SITL atau hubungkan broker :${port}`;
-          if (targetLock === 'sitl') {
-            dest = hasSitl
-              ? 'Tujuan terkunci: SITL (Python) saja — broker MQTT tidak disentuh'
-              : 'Target SITL dipilih — mulai simulasi SITL untuk mengaktifkan tombol';
-          } else if (targetLock === 'esp32') {
-            dest = hasBroker
-              ? (hasHilsRef
-                  ? `Tujuan terkunci: ESP32 + Referensi HILS via :${port} (SITL diabaikan)`
-                  : `Tujuan terkunci: ESP32 via Broker :${port} saja (SITL diabaikan)`)
-              : `Target ESP32 dipilih — broker MQTT :${port} belum terhubung`;
-          } else {
-            if (hasHilsRef && hasBroker) {
-              dest = `Tujuan aktif: HILS (ESP32 + Referensi via :${port})`;
-            } else if (hasSitl && hasBroker) {
-              dest = `Tujuan aktif: SITL (Python) + Broker MQTT :${port}`;
-            } else if (hasSitl) {
-              dest = 'Tujuan aktif: SITL (Python)';
-            } else if (hasBroker) {
-              dest = `Tujuan aktif: Broker MQTT :${port} (ESP32)`;
-            }
-            if (activeSource() === 'esp32' && hasSitl) {
-              dest += ' (perhatian: simulasi SITL juga ikut terpengaruh)';
-            }
-          }
           line.textContent = dest;
+          line.setAttribute('data-tone', tone);
+        }
+        const mobCmdLine = document.getElementById('mob-dock-cmd-status');
+        if (mobCmdLine) {
+          mobCmdLine.textContent = dest;
+          mobCmdLine.setAttribute('data-tone', tone);
         }
         document.querySelectorAll('#cmd-toolbar .cmd-btn[data-cmd], #btn-cmd-reset, #btn-mob-reset, .mob-cmd-btn[data-cmd]').forEach((btn) => {
           btn.disabled = !canSend;
         });
+        syncCmdPressedState();
         syncAllToolbars();
       }
 
@@ -3963,10 +4240,10 @@ RENDERED_HTML = """<!DOCTYPE html>
         const flt = swFlt ? swFlt.checked : !!sim.fault_inject;
         const parts = [`${spd}x`];
         if (pre) parts.push('AI Preempt');
-        if (flt) parts.push('Fault');
+        if (flt) parts.push('Putus Sensor');
         if (!pre && !flt) parts.push('Standar');
         el.textContent = parts.join(' • ');
-        if (flt) el.setAttribute('data-tone', 'danger');
+        if (flt) el.setAttribute('data-tone', 'fault');
         else if (pre) el.setAttribute('data-tone', 'accent');
         else el.removeAttribute('data-tone');
       }
@@ -4024,9 +4301,23 @@ RENDERED_HTML = """<!DOCTYPE html>
         }
         document.getElementById('kpi-seq').textContent = '0';
         document.getElementById('kpi-fi').textContent = '--';
+        const fiUnitEl = document.getElementById('kpi-fi-unit');
+        if (fiUnitEl) fiUnitEl.hidden = false;
+        const fiFootL = document.getElementById('kpi-fi-foot-left');
+        const fiFootR = document.getElementById('kpi-fi-foot-right');
+        if (fiFootL) fiFootL.textContent = 'Waspada ≥ 55';
+        if (fiFootR) fiFootR.textContent = 'Bahaya ≥ 150';
         document.getElementById('kpi-fi-wrap').style.color = 'var(--text-muted)';
         document.getElementById('fi-meter-fill').style.inlineSize = '0%';
         document.getElementById('kpi-pm').textContent = '--';
+        const pmCard = document.getElementById('card-pm');
+        if (pmCard) pmCard.removeAttribute('data-tone');
+        const pmUnitEl = document.getElementById('kpi-pm-unit');
+        if (pmUnitEl) pmUnitEl.hidden = false;
+        const pmWrapEl = document.getElementById('kpi-pm-wrap');
+        if (pmWrapEl) pmWrapEl.style.color = '';
+        const pmFrozEl = document.getElementById('kpi-pm-frozen');
+        if (pmFrozEl) { pmFrozEl.hidden = true; pmFrozEl.textContent = ''; }
         document.getElementById('kpi-pmraw').textContent = '--';
         document.getElementById('kpi-dcdt').textContent = '0.00';
         document.getElementById('kpi-vd').textContent = '--';
@@ -4035,6 +4326,12 @@ RENDERED_HTML = """<!DOCTYPE html>
         document.getElementById('kpi-g').textContent = '--';
         document.getElementById('kpi-vm').textContent = '--';
         document.getElementById('kpi-fc').textContent = '--';
+        const fcCard = document.getElementById('card-fc');
+        if (fcCard) fcCard.removeAttribute('data-tone');
+        const fcUnitEl = document.getElementById('kpi-fc-unit');
+        if (fcUnitEl) fcUnitEl.hidden = false;
+        const fcFrozEl = document.getElementById('kpi-fc-frozen');
+        if (fcFrozEl) { fcFrozEl.hidden = true; fcFrozEl.textContent = ''; }
         document.getElementById('kpi-fc-wrap').style.color = 'var(--text-muted)';
         document.getElementById('kpi-eta').textContent = '-';
         document.getElementById('kpi-mae').textContent = '-';
@@ -4043,11 +4340,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         document.getElementById('pwm-meter-fill').style.inlineSize = '0%';
         document.getElementById('kpi-fan-ctrl').textContent = '--';
         document.getElementById('kpi-fan-state').textContent = '--';
-        document.querySelectorAll('#cmd-toolbar .cmd-btn[data-cmd], .mob-cmd-btn[data-cmd]').forEach((btn) => {
-          if (btn.getAttribute('data-cmd') !== 'RESET') {
-            btn.setAttribute('aria-pressed', 'false');
-          }
-        });
+        syncCmdPressedState();
         setFsmBadge('IDLE', null);
         updateParityUI(state.sim, null);
         updateSafetyCallout(null, state.sim);
@@ -4056,8 +4349,8 @@ RENDERED_HTML = """<!DOCTYPE html>
       function applyView() {
         const src = activeSource();
         state.history = state.src[src].history;
-        const srcTag = src === 'esp32' ? 'ESP32 (hardware)' : 'SITL (simulasi)';
-        document.getElementById('src-label').textContent = srcTag + (state.viewMode === 'auto' ? ' — otomatis' : '');
+        const srcTag = src === 'esp32' ? 'ESP32 (HILS/Perangkat)' : 'SITL (Python)';
+        document.getElementById('src-label').textContent = srcTag + (state.viewMode === 'auto' ? ' — mengikuti target' : ' — dikunci manual');
         document.getElementById('kpi-src-tag').textContent = src === 'esp32' ? 'ESP32' : 'SITL';
         document.querySelectorAll('.src-btn').forEach((b) =>
           b.setAttribute('aria-pressed', b.getAttribute('data-src') === state.viewMode ? 'true' : 'false'));
@@ -4103,8 +4396,8 @@ RENDERED_HTML = """<!DOCTYPE html>
           return;
         }
         const st = row.state || 'NORMAL';
-        const toneMap = { NORMAL: 'ok', WASPADA: 'warn', BAHAYA: 'danger', FAILSAFE: 'danger' };
-        const colorMap = { NORMAL: 'var(--ok)', WASPADA: 'var(--warn)', BAHAYA: 'var(--danger)', FAILSAFE: 'var(--danger)' };
+        const toneMap = { NORMAL: 'ok', WASPADA: 'warn', BAHAYA: 'danger', FAILSAFE: 'fault' };
+        const colorMap = { NORMAL: 'var(--ok)', WASPADA: 'var(--warn)', BAHAYA: 'var(--danger)', FAILSAFE: 'var(--fault)' };
         const tone = toneMap[st] || 'ok';
 
         document.getElementById('card-state').setAttribute('data-tone', tone);
@@ -4128,36 +4421,102 @@ RENDERED_HTML = """<!DOCTYPE html>
         }
         document.getElementById('kpi-seq').textContent = row.seq ?? 0;
 
-        const fiVal = row.fi ?? 0;
-        const fiColor = fiVal >= 150 ? 'var(--danger)' : (fiVal >= 55 ? 'var(--warn)' : 'var(--ok)');
-        document.getElementById('kpi-fi').textContent = fiVal.toFixed(1);
-        document.getElementById('kpi-fi-wrap').style.color = fiVal >= 55 ? fiColor : 'var(--text-main)';
+        const fiUnitEl = document.getElementById('kpi-fi-unit');
+        const fiFootL = document.getElementById('kpi-fi-foot-left');
+        const fiFootR = document.getElementById('kpi-fi-foot-right');
         const fiFill = document.getElementById('fi-meter-fill');
-        fiFill.style.inlineSize = `${Math.min(100, Math.max(0, (fiVal / 250) * 100)).toFixed(1)}%`;
-        fiFill.style.backgroundColor = fiColor;
+        if (st === 'FAILSAFE') {
+          document.getElementById('kpi-fi').textContent = 'TIDAK VALID';
+          if (fiUnitEl) fiUnitEl.hidden = true;
+          document.getElementById('kpi-fi-wrap').style.color = 'var(--fault)';
+          fiFill.style.inlineSize = '0%';
+          fiFill.style.backgroundColor = 'var(--fault)';
+          if (fiFootL) fiFootL.textContent = 'FI tidak valid (sensor debu)';
+          if (fiFootR) fiFootR.textContent = 'Kipas 70%';
+        } else {
+          const fiVal = row.fi ?? 0;
+          const fiColor = fiVal >= 150 ? 'var(--danger)' : (fiVal >= 55 ? 'var(--warn)' : 'var(--ok)');
+          document.getElementById('kpi-fi').textContent = fiVal.toFixed(1);
+          if (fiUnitEl) fiUnitEl.hidden = false;
+          document.getElementById('kpi-fi-wrap').style.color = fiVal >= 55 ? fiColor : 'var(--text-main)';
+          fiFill.style.inlineSize = `${Math.min(100, Math.max(0, (fiVal / 250) * 100)).toFixed(1)}%`;
+          fiFill.style.backgroundColor = fiColor;
+          if (fiFootL) fiFootL.textContent = 'Waspada ≥ 55';
+          if (fiFootR) fiFootR.textContent = 'Bahaya ≥ 150';
+        }
 
-        document.getElementById('kpi-pm').textContent = (row.pm ?? 0).toFixed(1);
+        const isFault = (st === 'FAILSAFE' || !!row.sensor_fault);
+        const pmCard = document.getElementById('card-pm');
+        const pmUnitEl = document.getElementById('kpi-pm-unit');
+        const pmWrapEl = document.getElementById('kpi-pm-wrap');
+        const pmFrozEl = document.getElementById('kpi-pm-frozen');
+        if (isFault) {
+          if (pmCard) pmCard.setAttribute('data-tone', 'fault');
+          document.getElementById('kpi-pm').textContent = 'DITANGGUHKAN';
+          if (pmUnitEl) pmUnitEl.hidden = true;
+          if (pmWrapEl) pmWrapEl.style.color = 'var(--fault)';
+          if (pmFrozEl) {
+            pmFrozEl.textContent = `Terakhir: ${(row.pm ?? 0).toFixed(1)} µg/m³ (beku)`;
+            pmFrozEl.hidden = false;
+          }
+        } else {
+          if (pmCard) pmCard.removeAttribute('data-tone');
+          document.getElementById('kpi-pm').textContent = (row.pm ?? 0).toFixed(1);
+          if (pmUnitEl) pmUnitEl.hidden = false;
+          if (pmWrapEl) pmWrapEl.style.color = '';
+          if (pmFrozEl) {
+            pmFrozEl.hidden = true;
+            pmFrozEl.textContent = '';
+          }
+        }
         document.getElementById('kpi-pmraw').textContent = (row.pm_raw ?? 0).toFixed(1);
         const dcdt = row.dcdt ?? 0;
         document.getElementById('kpi-dcdt').textContent = (dcdt >= 0 ? '+' : '') + dcdt.toFixed(2);
         document.getElementById('kpi-vd').textContent = (row.v_dust ?? 0).toFixed(2);
-        document.getElementById('kpi-v0').textContent = (row.v0 ?? 0.6).toFixed(3);
+        document.getElementById('kpi-v0').textContent = row.v0 != null ? Number(row.v0).toFixed(3) : '--';
 
-        document.getElementById('kpi-ppm').textContent = (row.gas_ppm ?? 400).toFixed(0);
+        document.getElementById('kpi-ppm').textContent = row.gas_ppm != null ? Number(row.gas_ppm).toFixed(0) : '--';
         document.getElementById('kpi-g').textContent = (row.g ?? 0).toFixed(2);
         document.getElementById('kpi-vm').textContent = (row.v_mq ?? 0).toFixed(2);
 
         const fcVal = row.forecast;
-        document.getElementById('kpi-fc').textContent = fcVal != null ? fcVal.toFixed(1) : '-';
-        document.getElementById('kpi-fc-wrap').style.color =
-          fcVal == null ? 'var(--text-muted)'
-          : (fcVal >= 150 ? 'var(--danger)' : (fcVal >= 55 ? 'var(--warn)' : 'var(--violet)'));
-        document.getElementById('kpi-eta').textContent = row.eta_bahaya_s != null ? `${row.eta_bahaya_s.toFixed(0)} s` : '-';
+        const fcCard = document.getElementById('card-fc');
+        const fcUnitEl = document.getElementById('kpi-fc-unit');
+        const fcFrozEl = document.getElementById('kpi-fc-frozen');
+        if (isFault) {
+          if (fcCard) fcCard.setAttribute('data-tone', 'fault');
+          document.getElementById('kpi-fc').textContent = 'DITANGGUHKAN';
+          if (fcUnitEl) fcUnitEl.hidden = true;
+          document.getElementById('kpi-fc-wrap').style.color = 'var(--fault)';
+          if (fcFrozEl) {
+            fcFrozEl.textContent = fcVal != null
+              ? `Terakhir: ${fcVal.toFixed(1)} µg/m³ (beku)`
+              : 'Prakiraan dijeda (sensor debu putus)';
+            fcFrozEl.hidden = false;
+          }
+          document.getElementById('kpi-eta').textContent = '— (FAILSAFE)';
+        } else {
+          if (fcCard) fcCard.removeAttribute('data-tone');
+          document.getElementById('kpi-fc').textContent = fcVal != null ? fcVal.toFixed(1) : '-';
+          if (fcUnitEl) fcUnitEl.hidden = false;
+          if (fcFrozEl) {
+            fcFrozEl.hidden = true;
+            fcFrozEl.textContent = '';
+          }
+          document.getElementById('kpi-fc-wrap').style.color =
+            fcVal == null ? 'var(--text-muted)'
+            : (fcVal >= 150 ? 'var(--danger)' : (fcVal >= 55 ? 'var(--warn)' : 'var(--violet)'));
+          if (st === 'BAHAYA' && row.eta_bahaya_s != null && row.eta_bahaya_s <= 0.5) {
+            document.getElementById('kpi-eta').textContent = 'Tercapai';
+          } else {
+            document.getElementById('kpi-eta').textContent = row.eta_bahaya_s != null ? `${row.eta_bahaya_s.toFixed(0)} s` : '-';
+          }
+        }
         document.getElementById('kpi-mae').textContent = row.mae != null ? row.mae.toFixed(2) : '-';
 
         const dutyVal = row.duty ?? 0;
         const dutyColor = row.mode === 'FORCE_OFF' ? 'var(--warn)'
-          : (st === 'BAHAYA' ? 'var(--danger)' : (st === 'FAILSAFE' ? 'var(--warn)' : (dutyVal > 0 ? 'var(--accent)' : 'var(--ok)')));
+          : (st === 'BAHAYA' ? 'var(--danger)' : (st === 'FAILSAFE' ? 'var(--fault)' : (dutyVal > 0 ? 'var(--accent)' : 'var(--ok)')));
         document.getElementById('kpi-duty').textContent = dutyVal.toFixed(1);
         document.getElementById('kpi-duty-wrap').style.color = dutyColor;
         const pwmFill = document.getElementById('pwm-meter-fill');
@@ -4169,13 +4528,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         document.getElementById('kpi-fan-state').textContent = describeFanState(row);
 
         setFsmBadge(st, tone);
-
-        document.querySelectorAll('#cmd-toolbar .cmd-btn[data-cmd], .mob-cmd-btn[data-cmd]').forEach((btn) => {
-          const c = btn.getAttribute('data-cmd');
-          if (c !== 'RESET') {
-            btn.setAttribute('aria-pressed', c === row.mode ? 'true' : 'false');
-          }
-        });
+        syncCmdPressedState();
 
         updateParityUI(activeSim, row);
         updateSafetyCallout(row, activeSim);
@@ -4243,6 +4596,7 @@ RENDERED_HTML = """<!DOCTYPE html>
 
         const activeBar = document.getElementById('sim-active-bar');
         const activeTxt = document.getElementById('sim-active-text');
+        const cfgZone = document.getElementById('sim-config-zone');
         const cfgFields = document.getElementById('sim-config-fields');
         const toggleBtn = document.getElementById('btn-toggle-sim-cfg');
         if (sim.running) {
@@ -4253,11 +4607,13 @@ RENDERED_HTML = """<!DOCTYPE html>
           } else {
             activeTxt.textContent = `${tgtLabel} • ${scenLbl} (${sim.speed || 1}x${sim.paused ? ', Jeda' : ''})`;
           }
+          if (cfgZone) cfgZone.hidden = !state.simConfigExpanded;
           cfgFields.hidden = !state.simConfigExpanded;
           toggleBtn.setAttribute('aria-expanded', state.simConfigExpanded ? 'true' : 'false');
         } else {
           state.simConfigExpanded = false;
           activeBar.hidden = true;
+          if (cfgZone) cfgZone.hidden = false;
           cfgFields.hidden = false;
           toggleBtn.setAttribute('aria-expanded', 'false');
         }
@@ -4298,6 +4654,20 @@ RENDERED_HTML = """<!DOCTYPE html>
         syncHoverDismissBtn();
       }
 
+      function getChartPads(w) {
+        const compact = w < 520;
+        const fsmCompact = w < 420;
+        const isProj = window.matchMedia('(max-height: 820px) and (min-width: 1280px)').matches;
+        return {
+          compact,
+          fsmCompact,
+          isProj,
+          chartScale: isProj ? 1.15 : 1,
+          padL: compact ? 46 : (isProj ? 60 : 54),
+          padR: fsmCompact ? 52 : (isProj ? 92 : 84),
+        };
+      }
+
       function drawCharts() {
         syncCanvasSize(mainCanvas, 960, 320);
         syncCanvasSize(subCanvas, 960, 150);
@@ -4319,29 +4689,28 @@ RENDERED_HTML = """<!DOCTYPE html>
         const monoFont = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
 
         const rows = state.history;
-        const compact = w < 520;
-        const fsmCompact = w < 420;
-        const padL = compact ? 44 : 54;
-        const padR = fsmCompact ? 46 : 74;
+        const { compact, fsmCompact, chartScale, padL, padR } = getChartPads(w);
+        const fs = (px) => Math.max(12, Math.round(px * chartScale));
+        const lw = (px) => Number((px * chartScale).toFixed(2));
         const padT = 26;
         const padB = 28;
         const plotW = Math.max(40, w - padL - padR);
         const plotH = Math.max(40, h - padT - padB);
 
-        const sPadT = 22, sPadB = 10;
+        const sPadT = 24, sPadB = 10;
         const sInnerH = Math.max(54, sh - sPadT - sPadB);
         const dutyTop = sPadT;
-        const dutyH = Math.max(28, Math.round(sInnerH * 0.60));
+        const dutyH = Math.max(28, Math.round(sInnerH * 0.58));
         const dutyBot = dutyTop + dutyH;
         const sepY = dutyBot + Math.max(3, Math.round(sInnerH * 0.06));
         const ribbonTop = dutyBot + Math.max(6, Math.round(sInnerH * 0.12));
-        const ribbonH = Math.max(16, sh - sPadB - ribbonTop);
+        const ribbonH = Math.max(18, sh - sPadB - ribbonTop);
         const syOf = (v) => dutyTop + dutyH - (Math.max(0, Math.min(100, v)) / 100) * dutyH;
 
         function drawSubBase() {
           sCtx.strokeStyle = palette.grid;
           sCtx.fillStyle = palette.text;
-          sCtx.font = `11px ${monoFont}`;
+          sCtx.font = `${fs(12)}px ${monoFont}`;
           sCtx.lineWidth = 1;
           for (const pct of [0, 50, 100]) {
             const y = syOf(pct);
@@ -4349,53 +4718,68 @@ RENDERED_HTML = """<!DOCTYPE html>
             sCtx.fillText(`${pct}%`, 6, y + 4);
           }
 
-          // Subtle 70% FAILSAFE duty mark in upper lane
+          // 70% FAILSAFE duty reference line in upper lane
           const y70 = syOf(70);
           sCtx.save();
-          sCtx.strokeStyle = palette.waspada;
-          sCtx.globalAlpha = 0.55;
+          sCtx.strokeStyle = palette.fault;
+          sCtx.globalAlpha = 0.7;
+          sCtx.lineWidth = lw(1.2);
           sCtx.setLineDash([4, 4]);
           sCtx.beginPath(); sCtx.moveTo(padL, y70); sCtx.lineTo(sw - padR, y70); sCtx.stroke();
           sCtx.restore();
-          sCtx.font = `600 10px ${monoFont}`;
-          sCtx.fillStyle = palette.waspada;
-          sCtx.fillText(fsmCompact ? '70%' : '70% FS', sw - padR + 5, y70 + 3);
 
           // Hairline separator between upper duty lane and lower FSM state ribbon lane
           sCtx.strokeStyle = palette.grid;
           sCtx.beginPath(); sCtx.moveTo(padL, sepY); sCtx.lineTo(sw - padR, sepY); sCtx.stroke();
 
           // Lower FSM ribbon lane label
-          sCtx.font = `600 10.5px ${monoFont}`;
+          sCtx.font = `700 ${fs(12)}px ${monoFont}`;
           sCtx.fillStyle = palette.text;
           sCtx.fillText('FSM', 6, ribbonTop + ribbonH / 2 + 4);
 
-          sCtx.font = '700 11.5px system-ui, sans-serif';
+          sCtx.font = `700 ${fs(12)}px system-ui, sans-serif`;
           sCtx.fillStyle = palette.duty;
           sCtx.fillRect(padL, 8, 14, 3);
           sCtx.fillStyle = palette.text;
-          sCtx.fillText('Duty Kipas (0–100%)', padL + 18, 13);
+          const dutyLegTxt = 'Duty Kipas (0–100%)';
+          sCtx.fillText(dutyLegTxt, padL + 18, 14);
 
-          const fsmLegX = padL + (compact ? 140 : 156);
+          const fsmLegX = padL + 24 + Math.ceil(sCtx.measureText(dutyLegTxt).width);
           sCtx.fillStyle = palette.fsm;
           sCtx.fillRect(fsmLegX, 8, 14, 3);
           sCtx.fillStyle = palette.text;
-          sCtx.fillText('Pita State FSM', fsmLegX + 18, 13);
+          const fsmLegTxt = 'Pita State FSM';
+          sCtx.fillText(fsmLegTxt, fsmLegX + 18, 14);
+
+          if (!compact) {
+            const fsLegX = fsmLegX + 26 + Math.ceil(sCtx.measureText(fsmLegTxt).width);
+            if (fsLegX + 110 < sw - padR) {
+              sCtx.save();
+              sCtx.strokeStyle = palette.fault;
+              sCtx.lineWidth = 2;
+              sCtx.setLineDash([4, 3]);
+              sCtx.beginPath(); sCtx.moveTo(fsLegX, 9.5); sCtx.lineTo(fsLegX + 14, 9.5); sCtx.stroke();
+              sCtx.restore();
+              sCtx.fillStyle = palette.fault;
+              sCtx.fillText('70% FAILSAFE', fsLegX + 18, 14);
+            }
+          }
         }
 
         drawSubBase();
 
         if (!rows.length) {
           mCtx.fillStyle = palette.text;
-          mCtx.font = '600 13px system-ui, sans-serif';
+          mCtx.font = `600 ${fs(13)}px system-ui, sans-serif`;
+          const actionLoc = window.matchMedia('(max-width: 1279px)').matches ? 'di panel bawah' : 'di panel kanan';
           const msg = activeSource() === 'esp32'
             ? 'Menunggu telemetri ESP32 dari broker MQTT (:6669)...'
-            : 'Belum ada data SITL — tekan "Mulai" di panel kanan atau di bawah.';
-          mCtx.fillText(msg, Math.min(padL + 10, 24), h / 2, w - 36);
+            : `Belum ada data SITL — tekan "Mulai" ${actionLoc}.`;
+          mCtx.fillText(msg, padL + 12, h / 2, w - padL - padR - 24);
 
           sCtx.fillStyle = palette.muted;
-          sCtx.font = '600 11.5px system-ui, sans-serif';
-          sCtx.fillText('Belum ada histori duty kipas & pita state FSM.', Math.min(padL + 10, 24), dutyTop + dutyH / 2 + 4, sw - padL - padR - 12);
+          sCtx.font = `600 ${fs(12)}px system-ui, sans-serif`;
+          sCtx.fillText('Belum ada histori duty kipas & pita state FSM.', padL + 12, dutyTop + dutyH / 2 + 4, sw - padL - padR - 24);
           document.getElementById('chart-sr-summary').textContent = msg;
           const subSr = document.getElementById('subchart-sr-summary');
           if (subSr) subSr.textContent = 'Belum ada histori duty kipas dan state FSM.';
@@ -4453,10 +4837,10 @@ RENDERED_HTML = """<!DOCTYPE html>
             mCtx.lineTo(xNow, h - padB);
             mCtx.stroke();
             mCtx.fillStyle = palette.forecast;
-            mCtx.font = `700 10.5px ${monoFont}`;
+            mCtx.font = `700 ${fs(12)}px ${monoFont}`;
             const nowLbl = compact ? 'KINI' : 'SEKARANG → +60s';
             const txtW = mCtx.measureText(nowLbl).width;
-            mCtx.fillText(nowLbl, Math.min(xRight - txtW - 4, xNow + 5), padT + 12);
+            mCtx.fillText(nowLbl, Math.min(xRight - txtW - 4, xNow + 5), padT + 14);
             mCtx.restore();
           }
         }
@@ -4470,7 +4854,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         // Horizontal Y grid + rounded labels + optional right-axis ticks
         mCtx.strokeStyle = palette.grid;
         mCtx.fillStyle = palette.text;
-        mCtx.font = `11.5px ${monoFont}`;
+        mCtx.font = `${fs(12)}px ${monoFont}`;
         mCtx.lineWidth = 1;
         for (let val = 0; val <= maxY + 0.001; val += yStep) {
           const y = yOf(val);
@@ -4482,25 +4866,25 @@ RENDERED_HTML = """<!DOCTYPE html>
           mCtx.fillText(Math.round(val).toString(), 6, y + 4);
           if (rightAxes.length === 1) {
             mCtx.fillStyle = rightAxes[0].color;
-            mCtx.font = `600 10.5px ${monoFont}`;
-            mCtx.fillText(`${rightAxes[0].fmt(val)}${fsmCompact ? '' : ' ' + rightAxes[0].unit}`, w - padR + 4, y + 4);
-            mCtx.font = `11.5px ${monoFont}`;
+            mCtx.font = `600 ${fs(12)}px ${monoFont}`;
+            mCtx.fillText(`${rightAxes[0].fmt(val)}${fsmCompact ? '' : ' ' + rightAxes[0].unit}`, w - padR + 4, y + 4, padR - 6);
+            mCtx.font = `${fs(12)}px ${monoFont}`;
           } else if (rightAxes.length > 1) {
             const primary = rightAxes[0];
             mCtx.fillStyle = primary.color;
-            mCtx.font = `600 10px ${monoFont}`;
+            mCtx.font = `600 ${fs(12)}px ${monoFont}`;
             const composite = fsmCompact
               ? primary.fmt(val)
               : rightAxes.map((ax) => ax.fmt(val)).join('/');
             mCtx.fillText(composite, w - padR + 4, y + 4, padR - 6);
-            mCtx.font = `11.5px ${monoFont}`;
+            mCtx.font = `${fs(12)}px ${monoFont}`;
           }
         }
         mCtx.fillStyle = palette.text;
-        mCtx.font = '700 11.5px system-ui, sans-serif';
+        mCtx.font = `700 ${fs(12)}px system-ui, sans-serif`;
         mCtx.fillText('µg/m³ / FI', 6, 15);
         if (rightAxes.length > 0) {
-          mCtx.font = `700 10.5px ${monoFont}`;
+          mCtx.font = `700 ${fs(12)}px ${monoFont}`;
           mCtx.fillStyle = rightAxes[0].color;
           const unitHdr = rightAxes.map((a) => a.unit).join('/');
           mCtx.fillText(unitHdr, w - padR + 4, 15, padR - 6);
@@ -4508,7 +4892,7 @@ RENDERED_HTML = """<!DOCTYPE html>
 
         const xStep = niceStep(spanT / (compact ? 4 : 6));
         const firstTick = Math.ceil(minT / xStep) * xStep;
-        mCtx.font = `11.5px ${monoFont}`;
+        mCtx.font = `${fs(12)}px ${monoFont}`;
         mCtx.fillStyle = palette.text;
         let lastTickX = -Infinity;
         for (let tv = firstTick; tv <= minT + spanT + 0.001; tv += xStep) {
@@ -4518,7 +4902,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           mCtx.lineTo(x, h - padB);
           mCtx.stroke();
           const tx = Math.max(padL, Math.min(w - padR - 26, x - 10));
-          if (tx - lastTickX >= 38) {
+          if (tx - lastTickX >= 42) {
             mCtx.fillText(`${Math.round(tv)}s`, tx, h - 9);
             lastTickX = tx;
           }
@@ -4527,7 +4911,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         // Threshold lines (when within current Y range) + tight-zoom note when < 55
         if (state.layers.thresholds) {
           mCtx.save();
-          mCtx.font = '700 11px system-ui, sans-serif';
+          mCtx.font = `700 ${fs(12)}px system-ui, sans-serif`;
           mCtx.setLineDash([7, 5]);
           if (55 <= maxY) {
             const yW = yOf(55);
@@ -4545,12 +4929,12 @@ RENDERED_HTML = """<!DOCTYPE html>
           }
           if (state.zoomY && maxY < 55) {
             mCtx.setLineDash([]);
-            mCtx.font = '600 10.5px system-ui, sans-serif';
+            mCtx.font = `600 ${fs(12)}px system-ui, sans-serif`;
             mCtx.fillStyle = palette.muted;
             const zoomNote = 'Ambang 55/150 di luar skala ketat';
             const nw = mCtx.measureText(zoomNote).width;
             const nx = state.layers.forecast ? (padL + 8) : Math.max(padL + 8, w - padR - nw - 8);
-            mCtx.fillText(zoomNote, nx, padT + 13);
+            mCtx.fillText(zoomNote, nx, padT + 14);
           }
           mCtx.restore();
         }
@@ -4587,17 +4971,56 @@ RENDERED_HTML = """<!DOCTYPE html>
           mCtx.restore();
         }
 
-        if (state.layers.pm_raw) plotSeries((r) => r.pm_raw, palette.pm_raw, 1.4);
-        if (state.layers.pm_true) plotSeries((r) => r.pm_true, palette.pm_true, 2.0);
-        if (state.layers.voltages) {
-          plotSeries((r) => (r.v_dust ?? 0) * 50, palette.v_dust, 1.6, [4, 3]);
-          plotSeries((r) => (r.v_mq ?? 0) * 50, palette.v_mq, 1.6, [6, 3]);
+        // Shade FAILSAFE / sensor-fault intervals on the main canvas so flatlined curves are unmistakable
+        const faultSegs = [];
+        for (let i = 0; i < visible.length; i++) {
+          const r = visible[i];
+          const isF = r.state === 'FAILSAFE' || !!r.sensor_fault;
+          if (!isF) continue;
+          const rt = r.t ?? 0;
+          const nextT = (i + 1 < visible.length) ? (visible[i + 1].t ?? rt) : Math.max(rt + 1, minT + spanT * 0.015);
+          if (faultSegs.length && Math.abs(faultSegs[faultSegs.length - 1].endT - rt) <= 2.0) {
+            faultSegs[faultSegs.length - 1].endT = Math.max(faultSegs[faultSegs.length - 1].endT, nextT);
+          } else {
+            faultSegs.push({ startT: rt, endT: Math.max(rt + 0.5, nextT) });
+          }
         }
-        if (state.layers.gas_ppm) plotSeries((r) => (r.gas_ppm ?? 400) * 0.2, palette.gas_ppm, 1.8, [4, 3]);
-        if (state.layers.g_scaled) plotSeries((r) => (r.g ?? 0) * 100, palette.g_scaled, 1.8, [2, 3]);
-        if (state.layers.pm) plotSeries((r) => r.pm, palette.pm, 2.4);
-        if (state.layers.fi) plotSeries((r) => r.fi, palette.fi, 2.8);
-        if (state.layers.forecast) plotSeries((r) => r.forecast, palette.forecast, 2.4, [3, 3], 60, true);
+        if (faultSegs.length) {
+          mCtx.save();
+          faultSegs.forEach((seg) => {
+            const x1 = Math.max(padL, xOf(seg.startT));
+            const x2 = Math.min(w - padR, Math.max(x1 + 3, xOf(seg.endT)));
+            const segW = Math.max(2, x2 - x1);
+            mCtx.fillStyle = palette.faultFill;
+            mCtx.fillRect(x1, padT, segW, plotH);
+            mCtx.strokeStyle = palette.fault;
+            mCtx.lineWidth = 1.25;
+            mCtx.setLineDash([4, 3]);
+            mCtx.beginPath();
+            mCtx.moveTo(x1, padT); mCtx.lineTo(x1, h - padB);
+            mCtx.moveTo(x2, padT); mCtx.lineTo(x2, h - padB);
+            mCtx.stroke();
+            if (segW >= 42) {
+              mCtx.fillStyle = palette.fault;
+              mCtx.font = `700 ${fs(12)}px ${monoFont}`;
+              const lbl = segW >= 120 ? 'FAILSAFE (Vd=0V)' : 'FAILSAFE';
+              mCtx.fillText(lbl, x1 + 5, padT + 14, segW - 10);
+            }
+          });
+          mCtx.restore();
+        }
+
+        if (state.layers.pm_raw) plotSeries((r) => r.pm_raw, palette.pm_raw, lw(1.4));
+        if (state.layers.pm_true) plotSeries((r) => r.pm_true, palette.pm_true, lw(2.0));
+        if (state.layers.voltages) {
+          plotSeries((r) => (r.v_dust ?? 0) * 50, palette.v_dust, lw(1.6), [4, 3]);
+          plotSeries((r) => (r.v_mq ?? 0) * 50, palette.v_mq, lw(1.6), [6, 3]);
+        }
+        if (state.layers.gas_ppm) plotSeries((r) => (r.gas_ppm ?? 400) * 0.2, palette.gas_ppm, lw(1.8), [4, 3]);
+        if (state.layers.g_scaled) plotSeries((r) => (r.g ?? 0) * 100, palette.g_scaled, lw(1.8), [2, 3]);
+        if (state.layers.pm) plotSeries((r) => r.pm, palette.pm, lw(2.4));
+        if (state.layers.fi) plotSeries((r) => r.fi, palette.fi, lw(2.8));
+        if (state.layers.forecast) plotSeries((r) => r.forecast, palette.forecast, lw(2.4), [3, 3], 60, true);
 
         // Sub-chart Lane 1 (Upper): Duty Kipas (%) step function
         function plotStepSub(extractYFn, color, width, dash = []) {
@@ -4624,7 +5047,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           sCtx.stroke();
           sCtx.restore();
         }
-        plotStepSub((r) => syOf(r.duty ?? 0), palette.duty, 2.5);
+        plotStepSub((r) => syOf(r.duty ?? 0), palette.duty, lw(2.5));
 
         // Sub-chart Lane 2 (Lower): Discrete State FSM color-coded ribbon (zero overlap with Duty %)
         const ribbonStyles = {
@@ -4644,9 +5067,10 @@ RENDERED_HTML = """<!DOCTYPE html>
             short: 'BHY',
           },
           FAILSAFE: {
-            fill: dark ? 'rgba(232,121,249,0.28)' : 'rgba(109,40,217,0.18)',
-            stroke: palette.forecast,
+            fill: palette.faultFill,
+            stroke: palette.fault,
             short: 'FAIL',
+            hatch: true,
           },
         };
         if (visible.length) {
@@ -4670,25 +5094,47 @@ RENDERED_HTML = """<!DOCTYPE html>
             const segW = Math.max(2, x2 - x1);
             sCtx.fillStyle = stStyle.fill;
             sCtx.fillRect(x1, ribbonTop, segW, ribbonH);
-            sCtx.strokeStyle = stStyle.stroke;
-            sCtx.lineWidth = 1.2;
-            sCtx.strokeRect(x1, ribbonTop, segW, ribbonH);
-            if (segW >= 28) {
-              const lbl = segW >= 58 ? seg.state : stStyle.short;
-              sCtx.fillStyle = palette.tipFg;
-              sCtx.font = `700 10px ${monoFont}`;
-              const tw = sCtx.measureText(lbl).width;
-              if (tw + 6 <= segW) {
-                sCtx.fillText(lbl, x1 + (segW - tw) / 2, ribbonTop + ribbonH / 2 + 3.5);
+            if (stStyle.hatch) {
+              sCtx.save();
+              sCtx.beginPath();
+              sCtx.rect(x1, ribbonTop, segW, ribbonH);
+              sCtx.clip();
+              sCtx.strokeStyle = palette.faultHatch;
+              sCtx.lineWidth = 1.4;
+              for (let hx = x1 - ribbonH; hx < x1 + segW + ribbonH; hx += 7) {
+                sCtx.beginPath();
+                sCtx.moveTo(hx, ribbonTop + ribbonH);
+                sCtx.lineTo(hx + ribbonH, ribbonTop);
+                sCtx.stroke();
               }
+              sCtx.restore();
+            }
+            sCtx.strokeStyle = stStyle.stroke;
+            sCtx.lineWidth = 1.4;
+            sCtx.strokeRect(x1, ribbonTop, segW, ribbonH);
+            sCtx.font = `700 ${fs(12)}px ${monoFont}`;
+            const fullW = sCtx.measureText(seg.state).width;
+            const lbl = (fullW + 10 <= segW) ? seg.state : stStyle.short;
+            const tw = sCtx.measureText(lbl).width;
+            if (tw + 8 <= segW) {
+              const tx = x1 + (segW - tw) / 2;
+              if (stStyle.hatch) {
+                sCtx.save();
+                sCtx.fillStyle = palette.tipBg;
+                sCtx.globalAlpha = 0.78;
+                sCtx.fillRect(tx - 3, ribbonTop + 2, tw + 6, ribbonH - 4);
+                sCtx.restore();
+              }
+              sCtx.fillStyle = palette.tipFg;
+              sCtx.fillText(lbl, tx, ribbonTop + ribbonH / 2 + 4);
             }
           });
           const lastSeg = segments[segments.length - 1];
           if (lastSeg) {
             const stStyle = ribbonStyles[lastSeg.state] || ribbonStyles.NORMAL;
             sCtx.fillStyle = stStyle.stroke;
-            sCtx.font = `700 10px ${monoFont}`;
-            sCtx.fillText(fsmCompact ? stStyle.short : lastSeg.state, sw - padR + 5, ribbonTop + ribbonH / 2 + 3.5);
+            sCtx.font = `700 ${fs(12)}px ${monoFont}`;
+            sCtx.fillText(fsmCompact ? stStyle.short : lastSeg.state, sw - padR + 5, ribbonTop + ribbonH / 2 + 4, padR - 6);
           }
           sCtx.restore();
         }
@@ -4727,23 +5173,23 @@ RENDERED_HTML = """<!DOCTYPE html>
               }
               const cx = xOf(nearest.t ?? 0);
               const lines = [
-                { font: `700 11px ${monoFont}`, text: `t=${(nearest.t ?? 0).toFixed(0)}s | FSM:${nearest.state}` },
-                { font: `11px ${monoFont}`, text: `FI:${(nearest.fi ?? 0).toFixed(1)} | PM:${(nearest.pm ?? 0).toFixed(1)}` },
-                { font: `11px ${monoFont}`, text: `Gas:${(nearest.gas_ppm ?? 400).toFixed(0)}ppm (g=${(nearest.g ?? 0).toFixed(2)})` },
-                { font: `11px ${monoFont}`, text: `Duty:${(nearest.duty ?? 0).toFixed(0)}% | Fc:${nearest.forecast != null ? nearest.forecast.toFixed(1) : '-'}` },
+                { font: `700 ${fs(12)}px ${monoFont}`, text: `t=${(nearest.t ?? 0).toFixed(0)}s | FSM:${nearest.state}` },
+                { font: `${fs(12)}px ${monoFont}`, text: `FI:${(nearest.fi ?? 0).toFixed(1)} | PM:${(nearest.pm ?? 0).toFixed(1)}` },
+                { font: `${fs(12)}px ${monoFont}`, text: `Gas:${(nearest.gas_ppm ?? 400).toFixed(0)}ppm (g=${(nearest.g ?? 0).toFixed(2)})` },
+                { font: `${fs(12)}px ${monoFont}`, text: `Duty:${(nearest.duty ?? 0).toFixed(0)}% | Fc:${nearest.forecast != null ? nearest.forecast.toFixed(1) : '-'}` },
               ];
               if (state.layers.pm_true || state.layers.pm_raw) {
                 const pt = nearest.pm_true != null ? nearest.pm_true.toFixed(1) : '-';
-                lines.push({ font: `11px ${monoFont}`, text: `True:${pt} | Mentah:${(nearest.pm_raw ?? 0).toFixed(1)} | dC:${(nearest.dcdt ?? 0).toFixed(2)}` });
+                lines.push({ font: `${fs(12)}px ${monoFont}`, text: `True:${pt} | Mentah:${(nearest.pm_raw ?? 0).toFixed(1)} | dC:${(nearest.dcdt ?? 0).toFixed(2)}` });
               }
               if (state.layers.voltages) {
-                lines.push({ font: `11px ${monoFont}`, text: `Vd:${(nearest.v_dust ?? 0).toFixed(2)}V | Vm:${(nearest.v_mq ?? 0).toFixed(2)}V` });
+                lines.push({ font: `${fs(12)}px ${monoFont}`, text: `Vd:${(nearest.v_dust ?? 0).toFixed(2)}V | Vm:${(nearest.v_mq ?? 0).toFixed(2)}V` });
               }
               if (nearest.parity_delta_fi != null && nearest.ref_fi != null) {
-                lines.push({ font: `11px ${monoFont}`, text: `RefFI:${nearest.ref_fi.toFixed(1)} | dFI:${nearest.parity_delta_fi.toFixed(2)}` });
+                lines.push({ font: `${fs(12)}px ${monoFont}`, text: `RefFI:${nearest.ref_fi.toFixed(1)} | dFI:${nearest.parity_delta_fi.toFixed(2)}` });
               }
 
-              const tipW = Math.min(238, w - 16);
+              const tipW = Math.min(258, w - 16);
               const tipH = 14 + lines.length * 17;
               let boxX = cx + 10;
               if (boxX + tipW > w - padR - 4) boxX = cx - tipW - 10;
@@ -4801,6 +5247,8 @@ RENDERED_HTML = """<!DOCTYPE html>
 
       document.getElementById('btn-toggle-sim-cfg').addEventListener('click', () => {
         state.simConfigExpanded = !state.simConfigExpanded;
+        const cfgZone = document.getElementById('sim-config-zone');
+        if (cfgZone) cfgZone.hidden = !state.simConfigExpanded;
         document.getElementById('sim-config-fields').hidden = !state.simConfigExpanded;
         document.getElementById('btn-toggle-sim-cfg').setAttribute('aria-expanded', state.simConfigExpanded ? 'true' : 'false');
         syncAllToolbars();
@@ -4842,10 +5290,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         const rect = canvas.getBoundingClientRect();
         if (!rect.width || !state.history.length) return;
         const w = canvas._cw || rect.width || 960;
-        const compact = w < 520;
-        const fsmCompact = w < 420;
-        const padL = compact ? 44 : 54;
-        const padR = fsmCompact ? 46 : 74;
+        const { padL, padR } = getChartPads(w);
         const plotW = Math.max(40, w - padL - padR);
         const px = e.clientX - rect.left;
         if (px < padL || px > w - padR) {
@@ -5146,6 +5591,35 @@ RENDERED_HTML = """<!DOCTYPE html>
         });
       }
 
+      const mobSelCmdTarget = document.getElementById('mob-sel-cmd-target');
+      if (mobSelCmdTarget) {
+        mobSelCmdTarget.value = state.cmdTarget || 'auto';
+        mobSelCmdTarget.addEventListener('change', (e) => {
+          state.cmdTarget = e.target.value || 'auto';
+          savePrefs();
+          updateOverrideControlState();
+        });
+      }
+
+      function clearPendingCmd() {
+        if (state.pendingCmd && state.pendingCmd.timerId) {
+          clearTimeout(state.pendingCmd.timerId);
+        }
+        state.pendingCmd = null;
+      }
+
+      function checkPendingCmdConfirm(source, row) {
+        if (!state.pendingCmd || source !== 'esp32' || !row) return;
+        const { cmd } = state.pendingCmd;
+        const matched = cmd === 'RESET'
+          ? (row.mode === 'AUTO' && row.state === 'NORMAL')
+          : (row.mode === cmd);
+        if (matched) {
+          clearPendingCmd();
+          showToast(`✓ ESP32 menerapkan ${cmd}.`, 'ok');
+        }
+      }
+
       function setCmdButtonsBusy(busy) {
         state.cmdBusy = busy;
         document.querySelectorAll('#cmd-toolbar .cmd-btn, .mob-cmd-btn, #btn-cmd-reset, #btn-mob-reset').forEach((b) => {
@@ -5155,6 +5629,7 @@ RENDERED_HTML = """<!DOCTYPE html>
 
       async function sendActuatorCmd(cmd) {
         if (state.cmdBusy) return;
+        clearPendingCmd();
         setCmdButtonsBusy(true);
         try {
           const r = await fetch('/api/cmd', {
@@ -5172,7 +5647,25 @@ RENDERED_HTML = """<!DOCTYPE html>
             clearHover();
             hideRunSummary();
           }
-          showToast(`Perintah ${cmd} dikirim.`, 'ok');
+          const paths = res.paths || {};
+          if (paths.esp32) {
+            const msg = paths.sitl
+              ? `Perintah ${cmd} diterapkan ke SITL; dikirim ke ESP32 — menunggu konfirmasi telemetri…`
+              : `Perintah ${cmd} dikirim ke ESP32 — menunggu konfirmasi telemetri…`;
+            showToast(msg, 'accent');
+            const timerId = setTimeout(() => {
+              if (!state.pendingCmd || state.pendingCmd.cmd !== cmd) return;
+              state.pendingCmd = null;
+              showToast(`Belum ada konfirmasi ${cmd} dari ESP32 (>3 dtk).`, 'warn', {
+                durationMs: 6500,
+                actionLabel: 'Kirim Ulang',
+                onAction: () => sendActuatorCmd(cmd),
+              });
+            }, 3200);
+            state.pendingCmd = { cmd, timerId };
+          } else {
+            showToast(`✓ SITL menerapkan ${cmd}.`, 'ok');
+          }
         } catch (err) {
           showToast(`Gagal mengirim ${cmd}: server tidak merespons.`, 'danger');
         } finally {
@@ -5223,7 +5716,8 @@ RENDERED_HTML = """<!DOCTYPE html>
           if (label) showToast(label, 'ok');
           return res;
         } catch (err) {
-          showToast('Perintah simulasi gagal diproses — menyinkronkan ulang status.', 'danger');
+          const reason = (err && err.message) ? err.message : 'koneksi terputus';
+          showToast(`Perintah simulasi gagal diproses (${reason}) — menyinkronkan ulang status.`, 'danger');
           loadStateSnapshot(true, true);
           return null;
         } finally {
@@ -5342,6 +5836,8 @@ RENDERED_HTML = """<!DOCTYPE html>
           });
           document.getElementById('hils-concurrency-hint').hidden = tgt !== 'hils';
           updateMobileDockContext();
+          if (state.viewMode === 'auto') applyView();
+          else updateOverrideControlState();
           postSim({ target: tgt });
         });
       });
@@ -5615,6 +6111,7 @@ RENDERED_HTML = """<!DOCTYPE html>
               state.esp.online = true;
               state.esp.lastRx = Date.now();
             }
+            checkPendingCmdConfirm(src, msg.row);
             if (msg.sim) updateSimBadges(msg.sim);
             applyView();
           } else if (msg.type === 'esp_status') {
@@ -5811,7 +6308,11 @@ def start_dashboard_server(engine, host="0.0.0.0", port=8080):
                 data = {}
             if parsed.path == "/api/cmd":
                 ok = engine.send_cmd(data.get("cmd"), target=data.get("target", "auto"))
-                self._send_json({"ok": ok, "reason": None if ok else getattr(engine, "_last_cmd_error", "Perintah ditolak.")})
+                self._send_json({
+                    "ok": ok,
+                    "reason": None if ok else getattr(engine, "_last_cmd_error", "Perintah ditolak."),
+                    "paths": getattr(engine, "_last_cmd_paths", {"sitl": False, "esp32": False}) if ok else None,
+                })
                 return
             if parsed.path == "/api/sim":
                 ok = engine.control_sim(data)

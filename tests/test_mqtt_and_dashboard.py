@@ -722,6 +722,111 @@ class TestModernWebDashboard(unittest.TestCase):
         self.assertIn("#475569", html)
         self.assertIn("#854d0e", html)
 
+    def test_dashboard_round6_routing_failsafe_mobile_and_harden_invariants(self):
+        html = dashboard.RENDERED_HTML
+        self.assertNotIn("siaga", html.lower())
+        self.assertIn('href="#control-panel" class="skip-link"', html)
+        self.assertIn('id="control-panel"', html)
+        self.assertIn("Proyektor", html)
+
+        # Sumber grafik demoted into #layers-drawer
+        drawer_idx = html.index('id="layers-drawer"')
+        legend_idx = html.index('id="chart-legend"')
+        src_btn_idx = html.index('class="chip-btn src-btn"')
+        self.assertGreater(src_btn_idx, drawer_idx)
+        self.assertLess(src_btn_idx, legend_idx)
+        self.assertIn("Ikuti Target Eksekusi", html)
+
+        # Unified command target options & mobile visibility
+        self.assertIn("Semua jalur aktif", html)
+        self.assertIn("Hanya SITL (Python)", html)
+        self.assertIn("Hanya ESP32 (:6669)", html)
+        self.assertIn('id="mob-dock-cmd-status"', html)
+        self.assertIn('id="mob-sel-cmd-target"', html)
+        self.assertIn('aria-describedby="mob-dock-cmd-status"', html)
+
+        # Dedicated FAILSAFE identity & projector scale & summary placement below sub-chart
+        self.assertIn("--fault-light", html)
+        self.assertIn("--fault-dark", html)
+        self.assertIn('data-tone="fault"', html)
+        self.assertIn("FI tidak valid", html)
+        self.assertIn("faultHatch", html)
+        self.assertIn("chartScale", html)
+        self.assertGreater(html.index('id="run-summary-card"'), html.index('id="sub-chart"'))
+
+        # Toolbar focusgroup parity
+        for tid in ("preset-toolbar", "cmd-toolbar", "target-toolbar", "speed-toolbar"):
+            pos = html.index(f'id="{tid}"')
+            snippet = html[max(0, pos - 120):pos + 80]
+            self.assertIn('focusgroup="toolbar wrap"', snippet)
+
+        # Backend /api/cmd paths & sanitized MQTT error handling
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            srv = dashboard.start_dashboard_server(eng, host="127.0.0.1", port=0)
+            port = srv.server_address[1]
+            base = f"http://127.0.0.1:{port}"
+            try:
+                eng.control_sim({"action": "start", "target": "sitl", "scenario": "clean", "speed": 20})
+                time.sleep(0.15)
+                req = urllib.request.Request(
+                    f"{base}/api/cmd",
+                    data=json.dumps({"cmd": "FORCE_MAX", "target": "sitl"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                res = json.loads(urllib.request.urlopen(req, timeout=3).read().decode("utf-8"))
+                self.assertTrue(res["ok"])
+                self.assertIsNone(res["reason"])
+                self.assertEqual(res["paths"], {"sitl": True, "esp32": False})
+
+                class BrokenClient:
+                    def publish(self, *args, **kwargs):
+                        raise RuntimeError("secret-internal-trace")
+
+                with eng.lock:
+                    eng.client = BrokenClient()
+                    eng.broker_connected = True
+                ok_fail = eng.send_cmd("AUTO", target="esp32")
+                self.assertFalse(ok_fail)
+                err_msg = eng._last_cmd_error or ""
+                self.assertNotIn("secret-internal-trace", err_msg)
+                self.assertIn("Broker MQTT", err_msg)
+            finally:
+                with eng.lock:
+                    eng.client = None
+                    eng.broker_connected = False
+                eng.shutdown()
+                srv.shutdown()
+                srv.server_close()
+
+    def test_dashboard_round7_visual_failsafe_and_projector_invariants(self):
+        html = dashboard.RENDERED_HTML
+        self.assertNotIn("siaga", html.lower())
+        self.assertIn('id="sim-config-zone"', html)
+        self.assertIn('id="card-pm"', html)
+        self.assertIn('id="card-fc"', html)
+        self.assertIn('id="kpi-pm-frozen"', html)
+        self.assertIn('id="kpi-fc-frozen"', html)
+        self.assertIn("DITANGGUHKAN", html)
+        self.assertIn("FAILSAFE (Vd=0V)", html)
+        self.assertIn("@container (max-width: 440px)", html)
+        self.assertIn('.cmd-btn[aria-pressed="true"]:not(:disabled)', html)
+        self.assertNotIn("Math.min(padL + 10, 24)", html)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            try:
+                eng.control_sim({"action": "start", "target": "sitl", "scenario": "flaming", "speed": 50, "fault_inject": True})
+                time.sleep(0.35)
+                snap = eng.get_state_snapshot()
+                fault_rows = [r for r in snap["history"] if r.get("state") == "FAILSAFE"]
+                self.assertGreaterEqual(len(fault_rows), 1)
+                self.assertEqual(fault_rows[-1].get("slope"), 0.0)
+                self.assertIsNone(fault_rows[-1].get("eta_bahaya_s"))
+            finally:
+                eng.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
