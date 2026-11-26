@@ -1171,6 +1171,42 @@ class TestEspBackupSyncAndClear(unittest.TestCase):
         self.assertEqual(topics["karhutla/t/log_pct"]["type"], "progress")
         self.assertEqual(topics["karhutla/t/log_full"]["type"], "led_status")
 
+    def test_esp_log_status_broadcast_on_online_offline_transitions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            eng.esp_stale_s = 0.25
+            try:
+                q = eng.register_sse()
+
+                def drain_esp_log():
+                    out = []
+                    while q:
+                        raw = q.popleft().decode("utf-8")
+                        if raw.startswith("data: "):
+                            ev = json.loads(raw[6:].strip())
+                            if ev.get("type") == "esp_log_status":
+                                out.append(ev)
+                    return out
+
+                eng._esp_alive("RIIL")
+                ev_on = drain_esp_log()
+                self.assertTrue(any(e.get("online") is True for e in ev_on), ev_on)
+
+                # Wait for watchdog to mark ESP32 offline
+                deadline = time.time() + 2.0
+                ev_off = []
+                while time.time() < deadline and not any(e.get("online") is False for e in ev_off):
+                    time.sleep(0.1)
+                    ev_off.extend(drain_esp_log())
+                self.assertTrue(any(e.get("online") is False for e in ev_off), ev_off)
+
+                # Reconnect with identical heartbeat fields -> must still broadcast online=True
+                eng._esp_alive("RIIL")
+                ev_re = drain_esp_log()
+                self.assertTrue(any(e.get("online") is True for e in ev_re), ev_re)
+            finally:
+                eng.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

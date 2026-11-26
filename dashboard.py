@@ -451,6 +451,7 @@ class DashboardEngine:
                 changed = True
         if changed:
             self._broadcast({"type": "esp_status", "online": True, "hw_mode": self.esp_hw_mode, "age_s": 0.0})
+            self._broadcast_esp_log()
 
     # ---------- Backup log ESP32 (sync / download / clear) ----------
     ESP_REC = struct.Struct("<4sBBBBIII10fI")
@@ -824,6 +825,7 @@ class DashboardEngine:
             if went_offline:
                 self._broadcast({"type": "esp_status", "online": False, "hw_mode": self.esp_hw_mode,
                                  "age_s": age})
+                self._broadcast_esp_log()
 
     def _ingest_external(self, tel, target):
         """Masukkan telemetri dari MQTT ke aliran `target` ('esp32' atau 'sitl')."""
@@ -7400,7 +7402,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         }
         if (rtcClock) rtcClock.textContent = formatEspClockWib(st.epoch_s);
 
-        bar.style.width = `${pct}%`;
+        bar.style.inlineSize = `${pct}%`;
         bar.setAttribute('aria-valuenow', String(pct));
         if (st.log_full || pct >= 95) bar.setAttribute('data-tone', 'danger');
         else if (pct >= 75) bar.setAttribute('data-tone', 'warn');
@@ -7470,7 +7472,6 @@ RENDERED_HTML = """<!DOCTYPE html>
               a.click();
               a.remove();
               URL.revokeObjectURL(url);
-              await refreshEspLogStatus();
               showToast('Log ESP32 berhasil disinkronkan dan diunduh.', 'ok');
             })
             .catch(() => {
@@ -7516,7 +7517,6 @@ RENDERED_HTML = """<!DOCTYPE html>
 
       applyTheme(state.theme, false);
       loadStateSnapshot(false, false);
-      refreshEspLogStatus();
 
       const es = new EventSource('/api/stream');
       es.onopen = () => {
