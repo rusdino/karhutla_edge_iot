@@ -217,6 +217,7 @@ async fn session(
 
     let mut js = [0u8; JS_BUF];
     let mut hb = Ticker::every(Duration::from_secs(1));
+    let mut last_ping = Instant::now();
     #[cfg(feature = "riil")]
     let mut last_scalar = Instant::from_millis(0);
     #[cfg(feature = "riil")]
@@ -369,8 +370,9 @@ async fn session(
                     out.publish(T_LOG_PCT, b, false).await?;
                     out.publish(T_LOG_FULL, if full { b"1" } else { b"0" }, false).await?;
                 }
-                if Instant::now().duration_since(out.last_tx) >= PING_EVERY {
+                if Instant::now().duration_since(last_ping) >= PING_EVERY {
                     out.ping().await?;
+                    last_ping = Instant::now();
                 }
             }
         }

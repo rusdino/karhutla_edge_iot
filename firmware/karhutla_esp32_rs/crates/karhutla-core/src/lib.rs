@@ -472,6 +472,7 @@ impl FirmwareCore {
         self.bad = cfg::FS_INVALID_N;
         self.good = 0;
         self.enter_failsafe();
+        self.duty = self.target_duty(AlarmState::Failsafe);
         self.current_telemetry(None, None)
     }
 
@@ -712,6 +713,7 @@ mod tests {
         // force_failsafe()
         let tel_fs = fw.force_failsafe();
         assert_eq!(tel_fs.state, AlarmState::Failsafe);
+        assert_eq!(tel_fs.duty, cfg::DUTY_FAILSAFE);
         assert_eq!(fw.state(), AlarmState::Failsafe);
         let tel_auto = fw.apply_command(CmdMsg::Auto);
         assert_eq!(tel_auto.mode, OpMode::Auto);

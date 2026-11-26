@@ -283,21 +283,21 @@ async fn storage_rtc_task(mut store: FlashLogStore<'static>, mut rtc: RtcClock<'
                 LogReq::Meta => {
                     if let Ok(meta) = store.compute_meta().await {
                         let (epoch_s, rtc_ok) = refresh_status(&store, &mut rtc);
-                        LOG_RESP_CH.send(LogResp::Meta { meta, rtc_ok: rtc_ok, epoch_s }).await;
+                        let _ = LOG_RESP_CH.try_send(LogResp::Meta { meta, rtc_ok, epoch_s });
                     }
                 }
                 LogReq::Get { start, count } => {
                     let mut data = [0u8; CHUNK_B64_MAX];
                     if let Ok((s, n, len)) = store.read_chunk_b64(start, count, &mut data) {
                         let total = store.status().0;
-                        LOG_RESP_CH.send(LogResp::Chunk { start: s, count: n, total, len, data }).await;
+                        let _ = LOG_RESP_CH.try_send(LogResp::Chunk { start: s, count: n, total, len, data });
                     }
                 }
                 LogReq::Clear { expected_count, expected_crc } => {
                     let done = match store.compute_meta().await {
                         Ok(m) if m.count == expected_count && m.crc32 == expected_crc => {
                             let sectors = (m.used_bytes + 4095) / 4096;
-                            LOG_RESP_CH.send(LogResp::ClearStarted { sectors }).await;
+                            let _ = LOG_RESP_CH.try_send(LogResp::ClearStarted { sectors });
                             match store.clear_verified(expected_count, expected_crc, || {}).await {
                                 Ok(Some(n)) => LogResp::ClearDone { ok: true, reason: "", erased: n, count: 0 },
                                 Ok(None) => LogResp::ClearDone { ok: false, reason: "mismatch", erased: 0, count: 0 },
@@ -308,7 +308,7 @@ async fn storage_rtc_task(mut store: FlashLogStore<'static>, mut rtc: RtcClock<'
                         Err(_) => LogResp::ClearDone { ok: false, reason: "flash_error", erased: 0, count: 0 },
                     };
                     refresh_status(&store, &mut rtc);
-                    LOG_RESP_CH.send(done).await;
+                    let _ = LOG_RESP_CH.try_send(done);
                 }
             },
             Either4::Fourth(()) => {
