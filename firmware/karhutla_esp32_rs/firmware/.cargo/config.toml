@@ -1,6 +1,3 @@
-[target.xtensa-esp32-none-elf]
-runner = "espflash flash --monitor"
-
 [build]
 target = "xtensa-esp32-none-elf"
 
@@ -10,7 +7,6 @@ build-std = ["alloc", "core"]
 [env]
 ESP_LOG = "info"
 
-[target.'cfg(all())']
-rustflags = [
-    "-C", "link-arg=-nostartfiles",
-]
+[target.xtensa-esp32-none-elf]
+runner = "espflash flash --monitor"
+rustflags = ["-C", "link-arg=-nostartfiles"]
