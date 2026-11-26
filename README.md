@@ -6,35 +6,70 @@ Satu basis algoritma, tiga cara menjalankan:
 |---|---|---|---|---|
 | **SITL** | `core.py` (virtual ESP32) | model Python | `plant.py` | `python sitl.py` |
 | **Web Dashboard** | `core.py` / monitor MQTT `:6669` | model Python / live MQTT | `plant.py` / live | `python dashboard.py` |
-| **HILS** | ESP32 asli (`pio run -e hils`) | tegangan dikirim laptop via MQTT | `plant.py` | `python hils.py` |
-| **Riil** | ESP32 asli (`pio run -e riil`) | Sharp + MQ-135 fisik | dunia nyata | `python field_node.py` |
+| **HILS** | ESP32 asli (Rust Embassy `--features hils`, fallback `pio run -e hils`) | tegangan dikirim laptop via MQTT | `plant.py` | `python hils.py` |
+| **Riil** | ESP32 asli (Rust Embassy `--features riil`, fallback `pio run -e riil`) | Sharp + MQ-135 fisik (+ RTC DS3231/DS1307) | dunia nyata | `python field_node.py` |
 
 ## Struktur
 ```
-config.py            parameter bersama (harus sama dgn firmware/.../include/config.h)
+config.py            parameter bersama (harus sama dgn crates/karhutla-core/src/lib.rs & include/config.h)
 core.py              firmware virtual: median3 -> Kalman 2-state -> fusi -> FSM -> PWM -> failsafe
 plant.py             ruang asap + model tegangan Sharp & MQ-135 (skenario clean/smolder/flaming/fault)
 forecast.py          AI tren linear (t+horizon) + PreemptController (FORCE_MAX proaktif yang aman)
 logger.py            CSV harian logs/karhutla_<sumber>_YYYY-MM-DD.csv & log MQTT logs/mqtt_YYYY-MM-DD.log
 report.py            ringkasan + uji lulus/gagal
-dashboard.py         Modern Web Dashboard di laptop (grafik multi-overlay, kontrol cmd, runner SITL & HILS, live MQTT log)
+dashboard.py         Modern Web Dashboard di laptop (grafik multi-overlay, kontrol cmd, runner SITL & HILS, Memori Backup ESP32 & RTC, live MQTT log)
 sitl.py  hils.py  field_node.py
 mosquitto.conf       broker lokal (port 6669)
-firmware/karhutla_esp32/{platformio.ini, CMakeLists.txt, include/config.h, src/main.cpp}
+firmware/karhutla_esp32_rs/
+  partitions.csv               tabel partisi 4 MiB (nvs, factory 1,25 MiB, logs 2,625 MiB)
+  crates/karhutla-core/        pustaka no_std DSP, FSM, RTC BCD, 8 pola buzzer, codec MQTT & record flash 64 B
+  firmware/                    firmware utama ESP32 Rust + Embassy (esp-hal 1.2.2, esp-rtos, embassy-net, esp-storage)
+firmware/karhutla_esp32/       firmware fallback Native ESP-IDF (PlatformIO: platformio.ini, include/config.h, src/main.cpp)
 ```
 
-## Arsitektur Native ESP-IDF & FreeRTOS pada Firmware ESP32 (`src/main.cpp`)
-Firmware ditulis **100% menggunakan Native ESP-IDF (`framework = espidf`) di PlatformIO** tanpa ketergantungan pada framework/library Arduino sama sekali (`app_main()`, `driver/gpio.h`, `driver/ledc.h`, `esp_adc/adc_oneshot.h`, `esp_adc/adc_cali.h`, `esp_wifi.h`, `esp_event.h`, `nvs_flash.h`, dan `mqtt_client.h`):
+## Arsitektur Firmware ESP32 Utama: Rust `no_std` + Embassy (`firmware/karhutla_esp32_rs/`)
+Firmware utama ditulis dalam **Rust `no_std` berbasis `esp-hal 1.2.2`, `esp-rtos`, `embassy-executor`, `embassy-net`, dan `esp-storage`** dengan logika inti di `crates/karhutla-core/` yang dapat diuji langsung di host Linux (`cargo test`):
+- **`control_task`:** Menjalankan rantai DSP & kontrol (`Median3` → PM-proxy → `Kalman2` → skor gas → fusi `FI` → `Fsm` → PWM kipas `LEDC` 25 kHz 8-bit & LED indikator) pada 1 Hz (mode `riil` membaca ADC + pulsa IR Sharp) atau *lock-step* dari `HILS_CH` (mode `hils`, dengan watchdog 5 detik). Saat MQTT terputus, setiap sampel dikirim ke `BACKUP_CH` untuk disimpan ke flash lokal.
+- **`buzzer_task`:** Berjalan independen setiap 20 ms mengevaluasi 8 pola buzzer komposit (`karhutla_core::buzzer::buzzer_on`) berdasarkan kombinasi `AlarmState` dan status `log_full` dari memori backup flash.
+- **`storage_rtc_task`:** Mengelola partisi flash `logs` (`0x150000`, ukuran `0x2A0000` = 2,625 MiB, kapasitas **43.008 sampel × 64 byte**, *append-only* tanpa menimpa data lama saat penuh), membaca/menyinkronkan RTC eksternal **DS3231/DS1307** pada bus I2C0 (`GPIO21`/`GPIO22`, `0x68`), serta melayani protokol sinkronisasi & penghapusan dua fase (`META`, `GET`, `CLEAR`).
+- **`wifi_task`, `net_task`, dan `mqtt_task`:** Mengelola koneksi Wi-Fi STA, stack TCP/IP `embassy-net`, dan klien MQTT 3.1.1 QoS 0 kustom dengan *Last Will* (`karhutla/status`), heartbeat 1 Hz (`karhutla/hb` memuat `log_count`, `log_cap`, `log_full`, `rtc_ok`, `epoch_s`), sinkronisasi waktu (`karhutla/time/sync`), serta transfer chunk log backup (`karhutla/log/{req,meta,chunk,ack}`). **Kontrol lokal dan penyimpanan backup tetap berjalan meskipun Wi-Fi/MQTT terputus.**
+
+### Arsitektur Fallback Native ESP-IDF & FreeRTOS (`firmware/karhutla_esp32/src/main.cpp`)
+Firmware fallback tetap dipertahankan **100% menggunakan Native ESP-IDF (`framework = espidf`) di PlatformIO** tanpa ketergantungan pada framework/library Arduino sama sekali (`app_main()`, `driver/gpio.h`, `driver/ledc.h`, `esp_adc/adc_oneshot.h`, `esp_adc/adc_cali.h`, `esp_wifi.h`, `esp_event.h`, `nvs_flash.h`, dan `mqtt_client.h`):
 - **`controlTask` (Core 1, prioritas 5, stack 8192 bytes):** Menjalankan akuisisi ADC (`adc_oneshot` + `adc_cali` pada mode Riil dengan pewaktu deterministik `vTaskDelayUntil` 1 Hz dan pulsa IR `esp_rom_delay_us`) atau menerima sampel dari `hilsQueue` (mode HILS *lock-step*), mengeksekusi rantai `step()` (`Median3` → PM-proxy → `Kalman2` → skor gas → fusi `FI` → `Fsm` → `ledc` PWM kipas & `gpio_set_level` LED), serta memproses perintah masuk dari `cmdQueue`.
 - **`buzzerTask` (Core 1, prioritas 3, stack 2048 bytes):** Berjalan independen setiap 20 ms membaca variabel tunggal `volatile uint8_t activeBuzzerState` yang diperbarui oleh `controlTask` menggunakan waktu milidetik dari `esp_timer_get_time()`, sehingga pola kedip buzzer tetap presisi tanpa tertahan saat pembacaan sensor fisik (~96 ms).
 - **Wi-Fi & `esp_mqtt_client` Event-Driven + `txTask` (Core 0, prioritas 2, stack 6144 bytes):** Menangani koneksi ulang Wi-Fi (`WIFI_EVENT_STA_DISCONNECTED`) dan broker MQTT `:6669` secara *event-driven*, mendorong perintah `karhutla/cmd` ke `cmdQueue` dan sampel `karhutla/hils/sensor` ke `hilsQueue` pada event `MQTT_EVENT_DATA`, serta mempublikasikan telemetri yang dilindungi mutex (`mtx`). **Kontrol lokal di Core 1 tidak bergantung pada koneksi Wi-Fi/MQTT.**
 
-## Instalasi
+## Instalasi & Kompilasi Firmware
 ```bash
 pip install -r requirements.txt
 mosquitto -c mosquitto.conf -v        # untuk HILS / riil / dashboard HP
 ```
-**PlatformIO (Native ESP-IDF):** Edit `firmware/karhutla_esp32/include/config.h` (`WIFI_SSID`, `WIFI_PASS`, `MQTT_HOST` = IP LAN laptop) dan `BROKER_HOST` di `config.py`, lalu kompilasi/flash sesuai mode:
+
+### Firmware Utama: Rust + Embassy (`firmware/karhutla_esp32_rs/`)
+Edit kredensial jaringan & parameter di `firmware/karhutla_esp32_rs/crates/karhutla-core/src/lib.rs` (`mod cfg`: `WIFI_SSID`, `WIFI_PASS`, `MQTT_HOST` = IP LAN laptop) dan `BROKER_HOST` di `config.py`, lalu aktifkan toolchain Xtensa ESP (`espup`) dan kompilasi/flash:
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+source "$HOME/export-esp.sh"
+
+# 1. Uji unit & paritas golden-vector pada host Linux
+(cd firmware/karhutla_esp32_rs && cargo test --target x86_64-unknown-linux-gnu -p karhutla-core)
+
+# 2. Kompilasi firmware ESP32 (pilih mode hils atau riil)
+(cd firmware/karhutla_esp32_rs/firmware && cargo +esp build --release --features hils)
+(cd firmware/karhutla_esp32_rs/firmware && cargo +esp build --release --no-default-features --features riil)
+
+# 3. (Opsional saat migrasi pertama dari PlatformIO) Bersihkan partisi logs lama ke 0xFF
+espflash erase-region --port /dev/ttyUSB0 0x150000 0x2a0000
+
+# 4. Flash ke ESP32 dengan tabel partisi kustom (wajib menyertakan partitions.csv)
+espflash flash --port /dev/ttyUSB0 \
+  --partition-table firmware/karhutla_esp32_rs/partitions.csv \
+  firmware/karhutla_esp32_rs/target/xtensa-esp32-none-elf/release/karhutla-esp32
+```
+
+### Firmware Fallback: PlatformIO (Native ESP-IDF)
+Edit `firmware/karhutla_esp32/include/config.h` (`WIFI_SSID`, `WIFI_PASS`, `MQTT_HOST` = IP LAN laptop) dan `BROKER_HOST` di `config.py`, lalu kompilasi/flash sesuai mode:
 ```bash
 cd firmware/karhutla_esp32
 pio run -e hils -t upload             # flash mode HILS (MODE_HILS=1) ke esp32dev
@@ -63,7 +98,7 @@ python dashboard.py --auto-sim flaming --speed 1                    # buka Web D
 tanpa chattering, FAILSAFE terdeteksi lalu pulih).
 
 ## 2. HILS (ESP32 asli, sensor virtual)
-1. Flash dengan PlatformIO: `cd firmware/karhutla_esp32 && pio run -e hils -t upload`.
+1. Flash firmware Rust mode `hils` (lihat bagian *Instalasi & Kompilasi Firmware* di atas), atau fallback PlatformIO: `cd firmware/karhutla_esp32 && pio run -e hils -t upload`.
 2. `python hils.py --scenario flaming --speed 5 --shadow`
 3. Uji watchdog: `python hils.py --scenario smolder --dropout-at 150 --dropout-s 8`
 
@@ -73,7 +108,7 @@ persentase langkah yang berbeda (paritas SITL ↔ ESP32).
 Validasi pin-level: ukur GPIO18 (gate MOSFET) dengan logic analyzer / LED / multimeter.
 
 ## 3. Riil (lapangan)
-1. Flash dengan PlatformIO: `cd firmware/karhutla_esp32 && pio run -e riil -t upload`.
+1. Flash firmware Rust mode `riil` (`cargo +esp build --release --no-default-features --features riil` lalu `espflash flash ...`), atau fallback PlatformIO: `cd firmware/karhutla_esp32 && pio run -e riil -t upload`.
 2. `python field_node.py --host <IP_laptop>` → forecast, log CSV harian, (opsional) `--ai-preempt`.
 
 ### Wiring
@@ -82,13 +117,24 @@ Validasi pin-level: ukur GPIO18 (gate MOSFET) dengan logic analyzer / LED / mult
 | Sharp Vo | GPIO34 | divider 10k/20k (V_adc = Vo × 2/3) |
 | MQ-135 AO | GPIO35 | divider 10k/20k |
 | Sharp LED | GPIO4 | aktif LOW; R150 Ω + C220 µF ke 5 V sesuai datasheet |
-| Kipas (gate MOSFET) | GPIO18 | seri 100 Ω, pull-down 10 k |
+| Kipas (gate MOSFET) | GPIO18 | seri 100 Ω, pull-down 10 k (PWM 25 kHz 8-bit) |
 | Buzzer / LED G-Y-R | 23 / 25 / 26 / 27 | |
+| RTC I2C SDA / SCL | GPIO21 / GPIO22 | DS3231 / DS1307 alamat I2C `0x68` (100 kHz), baterai cadangan CR2032 |
+
+### Pola Buzzer Komposit (8 Kombinasi State FSM × Memori Penuh)
+Pada firmware Rust Embassy, buzzer (`GPIO23`) membedakan status bahaya (`AlarmState`) sekaligus kondisi memori backup flash penuh (`storage_full = true`, yaitu mencapai 43.008 sampel) melalui 8 pola deterministik:
+
+| State FSM | Memori Normal (`storage_full = false`) | Memori Penuh (`storage_full = true`) |
+|---|---|---|
+| **`NORMAL`** | Mati (`0 ms`) | `1500 ms ON`, `1500 ms OFF` (siklus `3000 ms`) |
+| **`WASPADA`** | `100 ms ON`, `1900 ms OFF` (siklus `2000 ms`) | `1500 ms ON`, `250 ms OFF`, `100 ms ON`, `1150 ms OFF` (siklus `3000 ms`) |
+| **`BAHAYA`** | `200 ms ON`, `200 ms OFF` (siklus `400 ms`) | `1500 ms ON`, `200 ms OFF`, `4×(150 ms ON, 150 ms OFF)`, `300 ms OFF` (siklus `3200 ms`) |
+| **`FAILSAFE`** | `100 ms ON`, `100 ms OFF`, `100 ms ON`, `1700 ms OFF` (siklus `2000 ms`) | `1500 ms ON`, `250 ms OFF`, `100 ms ON`, `100 ms OFF`, `100 ms ON`, `950 ms OFF` (siklus `3000 ms`) |
 
 ### Kalibrasi sebelum data dipakai
 1. **Sharp**: ukur tegangan sensor di udara bersih → `DUST_V0`; bandingkan dengan alat ukur PM referensi → `DUST_SLOPE`.
 2. **MQ-135**: preheat 24–48 jam, ukur di udara bersih; setelah itu isi `MQ_RS_CLEAN_KOHM` (hindari auto-calibrasi di ruangan berasap). Cek nilai RL modul → `MQ_RL_KOHM`.
-3. Ubah parameter di **dua tempat**: `config.py` dan `config.h`.
+3. Ubah parameter di `config.py` dan `firmware/karhutla_esp32_rs/crates/karhutla-core/src/lib.rs` (serta `firmware/karhutla_esp32/include/config.h` jika memakai fallback PlatformIO).
 
 ---
 
@@ -209,7 +255,13 @@ python sitl.py --scenario smolder --mqtt --speed 1 --dashboard
    - Pilih skenario (`flaming`, `smolder`, `clean`, `fault`), klik **`▶ Mulai`**, **`⏸ Jeda`**, **`⏹ Berhenti`**, atau **`🗑 Bersihkan`**, serta atur kecepatan simulasi (`1x`, `2x`, `5x`, `10x`, `20x`) secara langsung saat simulasi sedang berjalan.
    - Saklar **`AI Preempt`** untuk mengaktifkan/mematikan pemicuan dini `FORCE_MAX` oleh AI.
    - Saklar **`Injeksi Putus Kabel Sensor Debu (FAILSAFE)`** untuk menyimulasikan kabel sensor Sharp putus (`v_dust = 0 V`) kapan saja dan menguji transisi masuk/keluar state `FAILSAFE` (`duty = 70%`).
-5. **Auto-Logging CSV & MQTT (`logs/`):**
+5. **Panel Memori Backup ESP32 & RTC (`Sync → Download → Clear`):**
+   - Menampilkan status RTC eksternal (`DS3231/DS1307`, sinkronisasi otomatis via `karhutla/time/sync`), jam WIB, serta bar kapasitas memori flash backup (`0 / 43.008 sampel`, partisi `logs` 2,625 MiB) yang diperbarui dari heartbeat `karhutla/hb` (`GET /api/esp-log/status`).
+   - Saat koneksi Wi-Fi/MQTT terputus, ESP32 otomatis mencatat telemetri 64 byte/sampel ke flash lokal (tanpa menimpa data lama; jika penuh, badge `MEMORI PENUH — BUZZER AKTIF` menyala dan pola buzzer komposit aktif).
+   - **Alur Sinkronisasi Aman:**
+     1. Klik **`Sinkronkan & Unduh Log ESP32`** → memanggil `POST /api/esp-log/sync` (mengirim `META` dan `GET:<start>:<count>` ke `karhutla/log/req`, memverifikasi CRC32 dari `karhutla/log/meta` & `karhutla/log/chunk`, lalu menyimpan CSV lokal di `logs/`), dilanjutkan `GET /api/esp-log/download` untuk mengunduh file CSV ke browser.
+     2. Klik **`Kosongkan Memori ESP32`** → memanggil `POST /api/esp-log/clear`. Endpoint ini melindungi data dengan gerbang **`HTTP 409 Conflict`** jika log belum selesai disinkronkan/terverifikasi. Setelah sinkronisasi valid, dashboard mengirim perintah dua fase `CLEAR:<count>:<crc32>` ke ESP32 dan menunggu konfirmasi `karhutla/log/ack` hingga `log_count == 0`.
+6. **Auto-Logging CSV & MQTT (`logs/`):**
    - **Log Telemetri CSV:** `logs/karhutla_<sitl|hils|field>_YYYY-MM-DD.csv`
    - **Log Trafik MQTT Otomatis:** `logs/mqtt_YYYY-MM-DD.log` (mencatat seluruh aktivitas `BROKER_START`, `CONNECT`, `SUBSCRIBE`, `PUBLISH`, `RECV`, dan `DISCONNECT` dengan *timestamp* milidetik serta ditampilkan langsung pada panel *Live MQTT Stream* di kanan bawah dashboard).
 

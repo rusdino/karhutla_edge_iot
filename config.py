@@ -74,3 +74,10 @@ FORECAST_HORIZON_S = 60
 PREEMPT_ON = 150.0
 PREEMPT_OFF = 125.0
 PREEMPT_HOLD_S = 30.0
+
+# ---------- Backup log ESP32 (flash) & sinkronisasi waktu ----------
+T_TIME_SYNC = "karhutla/time/sync"      # laptop -> ESP32: epoch detik (desimal)
+T_LOG_REQ = "karhutla/log/req"          # laptop -> ESP32: META | GET:<start>:<count> | CLEAR:<count>:<crc32>
+T_LOG_META = "karhutla/log/meta"        # ESP32 -> laptop: JSON metadata log
+T_LOG_CHUNK = "karhutla/log/chunk"      # ESP32 -> laptop: JSON {start,count,total,data(base64)}
+T_LOG_ACK = "karhutla/log/ack"          # ESP32 -> laptop: JSON ack CLEAR dua fase
