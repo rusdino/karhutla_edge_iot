@@ -54,7 +54,10 @@ fn valid(dt: &RtcDateTime) -> bool {
 
 /// regs: [sec, min, hour, dow, date, month(+century bit7), year]
 pub fn decode_ds3231_regs(regs: &[u8; 7]) -> Option<RtcDateTime> {
-    let sec = bcd_dec(regs[0] & 0x7F)?; // bit7 = DS1307 CH flag
+    if regs[0] & 0x80 != 0 {
+        return None;
+    }
+    let sec = bcd_dec(regs[0] & 0x7F)?;
     let min = bcd_dec(regs[1] & 0x7F)?;
     let hour = if regs[2] & 0x40 != 0 {
         // 12-hour mode
@@ -185,5 +188,13 @@ mod tests {
             assert_eq!(datetime_to_epoch_utc(d), Some(e));
             e += 86_399 * 7 + 1234;
         }
+    }
+
+    #[test]
+    fn test_rtc_rejects_ds1307_clock_halt_bit() {
+        let mut regs = encode_ds3231_regs(dt(2026, 11, 26, 10, 15, 30));
+        assert!(decode_ds3231_regs(&regs).is_some());
+        regs[0] |= 0x80; // DS1307 Clock Halt (CH) bit set
+        assert_eq!(decode_ds3231_regs(&regs), None);
     }
 }

@@ -960,6 +960,7 @@ class FakeEsp:
         self.eng = None
         self.published = []
         self.corrupt = False
+        self.clear_reject_reason = None
 
     def raw(self):
         return b"".join(self.records)
@@ -991,6 +992,11 @@ class FakeEsp:
                 "start": st, "count": len(self.records[st:st + cnt]), "total": len(self.records),
                 "data": base64.b64encode(bytes(data)).decode()}))
         elif payload.startswith("CLEAR:"):
+            if self.clear_reject_reason is not None:
+                e.ingest_mqtt("karhutla/log/ack", json.dumps({
+                    "action": "CLEAR", "status": "done", "ok": False, "reason": self.clear_reject_reason
+                }))
+                return
             e.ingest_mqtt("karhutla/log/ack", json.dumps({"action": "CLEAR", "status": "started", "sectors": 4}))
             self.records = []
             e.ingest_mqtt("karhutla/log/ack", json.dumps({"action": "CLEAR", "status": "done", "ok": True}))
@@ -1080,7 +1086,7 @@ class TestEspBackupSyncAndClear(unittest.TestCase):
                 self.assertEqual(self._req(base, "/api/esp-log/sync", "POST")[0], 200)
                 self.assertEqual(self._req(base, "/api/esp-log/sync", "POST")[0], 200)
                 self.assertFalse(glob.glob(os.path.join(tmp, "*1970-01-01*")))
-                today_str = _dt.date.today().isoformat()
+                today_str = _dt.datetime.now(dashboard.DashboardEngine.ESP_WIB).date().isoformat()
                 for d in ("2026-11-25", "2026-11-26"):
                     p = os.path.join(tmp, f"karhutla_esp32_backup_{d}.csv")
                     self.assertTrue(os.path.exists(p), p)
@@ -1108,7 +1114,8 @@ class TestEspBackupSyncAndClear(unittest.TestCase):
                 self.assertEqual(self._req(base, "/api/esp-log/sync", "POST")[0], 200)
                 self.assertFalse(glob.glob(os.path.join(tmp, "*1970-01-01*")))
                 self.assertFalse(glob.glob(os.path.join(tmp, "*unsynced*")))
-                today = os.path.join(tmp, f"karhutla_esp32_backup_{_dt.date.today().isoformat()}.csv")
+                today_wib = _dt.datetime.now(dashboard.DashboardEngine.ESP_WIB).date().isoformat()
+                today = os.path.join(tmp, f"karhutla_esp32_backup_{today_wib}.csv")
                 with open(today, newline="", encoding="utf-8") as f:
                     rows = list(_csv.DictReader(f))
                 self.assertEqual([r["timestamp"] for r in rows], ["UNSYNCED+5000ms", "UNSYNCED+6000ms"])
@@ -1206,6 +1213,58 @@ class TestEspBackupSyncAndClear(unittest.TestCase):
                 self.assertTrue(any(e.get("online") is True for e in ev_re), ev_re)
             finally:
                 eng.shutdown()
+
+    def test_clear_surfaces_immediate_mismatch_done_without_504(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, esp, srv, base = self._setup(tmp, self._recs(3))
+            try:
+                self.assertEqual(self._req(base, "/api/esp-log/sync", "POST")[0], 200)
+                self.assertEqual(self._req(base, "/api/esp-log/download")[0], 200)
+                esp.clear_reject_reason = "mismatch"
+                t0 = time.monotonic()
+                st, body = self._req(base, "/api/esp-log/clear", "POST")
+                elapsed = time.monotonic() - t0
+                self.assertEqual(st, 409, body)
+                self.assertLess(elapsed, 2.0, f"expected fast 409 without 5s wait, took {elapsed:.2f}s")
+                data = json.loads(body)
+                self.assertFalse(data["ok"])
+                self.assertEqual(data["ack"]["reason"], "mismatch")
+                self.assertFalse(data["status"]["synced"])
+                self.assertFalse(data["status"]["downloaded"])
+                self.assertFalse(data["status"]["can_clear"])
+            finally:
+                self._stop(eng, srv)
+
+    def test_sync_quarantines_flash_resident_torn_slot_when_aggregate_crc_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            valid = self._recs(2)
+            torn_slot = b"TORN" + bytes(range(60))  # 64 B with bad magic & CRC, stored on flash
+            eng, esp, srv, base = self._setup(tmp, [valid[0], torn_slot, valid[1]])
+            try:
+                st, body = self._req(base, "/api/esp-log/sync", "POST")
+                self.assertEqual(st, 200, body)
+                data = json.loads(body)
+                self.assertTrue(data["ok"])
+                self.assertEqual(data["corrupt_skipped"], 1)
+                self.assertEqual(data["count"], 2)
+                self.assertEqual(data["status"]["corrupt_skipped"], 1)
+                self.assertTrue(data["status"]["synced"])
+
+                st_dl, csv_body = self._req(base, "/api/esp-log/download")
+                self.assertEqual(st_dl, 200)
+                batch_rows = list(_csv.DictReader(io.StringIO(csv_body.decode("utf-8"))))
+                self.assertEqual(len(batch_rows), 2)
+
+                arch_files = glob.glob(os.path.join(tmp, "karhutla_esp32_backup_*.csv"))
+                self.assertEqual(len(arch_files), 1)
+                with open(arch_files[0], newline="", encoding="utf-8") as f:
+                    self.assertEqual(len(list(_csv.DictReader(f))), 2)
+
+                # CLEAR must unlock after download even though 1 torn slot was quarantined
+                st_clr, clr_body = self._req(base, "/api/esp-log/clear", "POST")
+                self.assertEqual(st_clr, 200, clr_body)
+            finally:
+                self._stop(eng, srv)
 
 
 if __name__ == "__main__":

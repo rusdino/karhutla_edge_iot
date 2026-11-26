@@ -67,7 +67,6 @@ fn fmt_into<'a>(buf: &'a mut [u8], args: fmt::Arguments<'_>) -> Result<&'a [u8],
 struct Out<'a, 's> {
     sock: &'a mut TcpSocket<'s>,
     pkt: [u8; PKT_BUF],
-    last_tx: Instant,
 }
 
 impl Out<'_, '_> {
@@ -80,7 +79,6 @@ impl Out<'_, '_> {
             }
             off += w;
         }
-        self.last_tx = Instant::now();
         Ok(())
     }
 
@@ -183,7 +181,7 @@ async fn session(
         .map_err(|_| ())?
         .map_err(|_| ())?;
 
-    let mut out = Out { sock: &mut sock, pkt: [0; PKT_BUF], last_tx: Instant::now() };
+    let mut out = Out { sock: &mut sock, pkt: [0; PKT_BUF] };
     let n = encode_connect_with_lwt(&mut out.pkt, "karhutla-esp32", KEEPALIVE_S, cfg::T_STATUS, b"offline")?;
     out.send_pkt(n).await?;
 

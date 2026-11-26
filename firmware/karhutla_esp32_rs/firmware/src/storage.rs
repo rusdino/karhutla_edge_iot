@@ -152,11 +152,15 @@ impl<'d> FlashLogStore<'d> {
         }
         let bytes = self.count * RECORD_SIZE as u32;
         let sectors = (bytes + SECTOR_SIZE - 1) / SECTOR_SIZE;
+        self.cached_crc = None;
         let mut done = 0u32;
         while done < sectors {
             let batch = core::cmp::min(4, sectors - done);
             let from = LOG_PART_OFFSET + done * SECTOR_SIZE;
-            self.flash.erase(from, from + batch * SECTOR_SIZE)?;
+            if let Err(e) = self.flash.erase(from, from + batch * SECTOR_SIZE) {
+                self.init_scan();
+                return Err(e);
+            }
             done += batch;
             on_yield();
             Timer::after_millis(10).await;

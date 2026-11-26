@@ -267,7 +267,7 @@ class DashboardEngine:
             "count": None, "meta_count": None, "crc32": None, "cap": None, "full": None, "bytes": None,
             "cap_bytes": None, "synced_key": None, "downloaded_key": None, "busy": None,
             "progress": None, "last_error": None, "last_sync": None, "batch_csv": None,
-            "rtc_ok": None, "epoch_s": None,
+            "rtc_ok": None, "epoch_s": None, "corrupt_skipped": 0,
         }
         self._log_cond = threading.Condition()
         self._log_op = threading.Lock()
@@ -572,6 +572,7 @@ class DashboardEngine:
             "csv_file": os.path.basename(lg["batch_csv"]) if lg["batch_csv"] else None,
             "rtc_ok": lg.get("rtc_ok"),
             "epoch_s": lg.get("epoch_s"),
+            "corrupt_skipped": lg.get("corrupt_skipped", 0),
         }
 
     def _broadcast_esp_log(self):
@@ -626,15 +627,6 @@ class DashboardEngine:
             if len(data) != want * size or int(msg.get("count", -1)) != want or int(msg.get("total", -1)) != total:
                 last = f"chunk {start} terpotong/tidak konsisten"
                 continue
-            bad = None
-            for i in range(want):
-                slot = data[i * size:(i + 1) * size]
-                if self._esp_parse_record(slot) is None:
-                    bad = start + i
-                    break
-            if bad is not None:
-                last = f"CRC/magic rekaman {bad} salah"
-                continue
             return data, None
         return None, last
 
@@ -663,7 +655,7 @@ class DashboardEngine:
             day = dt.date().isoformat()
         else:
             row["timestamp"] = f"UNSYNCED+{rec['uptime_ms']}ms"
-            day = datetime.date.today().isoformat()
+            day = datetime.datetime.now(self.ESP_WIB).date().isoformat()
         for k_f in ("v_dust", "v_mq", "pm_raw", "pm", "dcdt", "gas_ppm", "g", "fi", "v0", "duty"):
             row[k_f] = f"{row[k_f]:.6g}"
         return row, day
@@ -724,8 +716,12 @@ class DashboardEngine:
             if len(raw_all) != total * size or (zlib.crc32(raw_all) & 0xFFFFFFFF) != meta["crc32"]:
                 return self._fail_sync("CRC-32 total log tidak cocok dengan META")
             rows, by_day = [], {}
+            corrupt_skipped = 0
             for i in range(total):
                 rec = self._esp_parse_record(raw_all[i * size:(i + 1) * size])
+                if rec is None:
+                    corrupt_skipped += 1
+                    continue
                 row, day = self._esp_record_row(rec)
                 rows.append(row)
                 by_day.setdefault(day, []).append(row)
@@ -741,8 +737,11 @@ class DashboardEngine:
             self._esp_log_apply_meta(meta)
             self._esp_log_set(synced_key=(meta["count"], meta["crc32"]), downloaded_key=None,
                               batch_csv=batch, last_sync=datetime.datetime.now().isoformat(timespec="seconds"),
-                              last_error=None)
-            return True, {"count": total, "crc32": meta["crc32"], "csv_file": os.path.basename(batch)}
+                              last_error=None, corrupt_skipped=corrupt_skipped)
+            return True, {
+                "count": len(rows), "corrupt_skipped": corrupt_skipped,
+                "crc32": meta["crc32"], "csv_file": os.path.basename(batch),
+            }
         except Exception as exc:
             return self._fail_sync(f"sync gagal: {exc}")
 
@@ -752,11 +751,19 @@ class DashboardEngine:
             key = (lg["count"], lg["crc32"]) if lg["count"] is not None and lg["crc32"] is not None else None
             if key is None or lg["synced_key"] != key or not lg["batch_csv"] \
                     or not os.path.exists(lg["batch_csv"]):
-                return None, "Belum sync (atau log berubah sejak sync); jalankan sync dulu."
+                return None, None, "Belum sync (atau log berubah sejak sync); jalankan sync dulu."
             path = lg["batch_csv"]
+        return path, key, None
+
+    def mark_esp_log_downloaded(self, key):
+        with self.lock:
+            lg = self.esp_log
+            cur = (lg["count"], lg["crc32"]) if lg["count"] is not None and lg["crc32"] is not None else None
+            if cur != key or lg["synced_key"] != key:
+                return False
             lg["downloaded_key"] = key
         self._broadcast_esp_log()
-        return path, None
+        return True
 
     def clear_esp_logs(self):
         if not self._log_op.acquire(blocking=False):
@@ -795,21 +802,38 @@ class DashboardEngine:
                     return a
             return None
         with self._log_cond:
-            if not self._log_cond.wait_for(lambda: find("started") is not None, 5.0):
+            if not self._log_cond.wait_for(
+                lambda: find("started") is not None or find("done") is not None, 5.0
+            ):
                 return 504, {"ok": False, "error": "ESP32 tidak mengakui CLEAR"}
-            try:
-                sectors = int(find("started").get("sectors", 0))
-            except (TypeError, ValueError):
-                sectors = 0
-            timeout = min(90.0, max(20.0, math.ceil(sectors * 0.12) + 15.0))
-            if not self._log_cond.wait_for(lambda: find("done") is not None, timeout):
-                return 504, {"ok": False, "error": "timeout menunggu CLEAR selesai"}
             done = find("done")
+            if done is None:
+                started = find("started")
+                try:
+                    sectors = int(started.get("sectors", 0))
+                except (TypeError, ValueError):
+                    sectors = 0
+                timeout = min(90.0, max(20.0, math.ceil(sectors * 0.12) + 15.0))
+                if not self._log_cond.wait_for(lambda: find("done") is not None, timeout):
+                    return 504, {"ok": False, "error": "timeout menunggu CLEAR selesai"}
+                done = find("done")
         if not done.get("ok"):
+            if done.get("reason") == "mismatch":
+                self._esp_log_set(
+                    synced_key=None,
+                    downloaded_key=None,
+                    crc32=None,
+                    last_error="Isi log ESP32 berubah; clear ditolak (mismatch).",
+                )
+                return 409, {
+                    "ok": False,
+                    "error": "Isi log ESP32 berubah; clear ditolak (mismatch).",
+                    "ack": done,
+                }
             self._esp_log_set(last_error="CLEAR gagal di ESP32")
             return 500, {"ok": False, "error": "CLEAR gagal di ESP32", "ack": done}
         self._esp_log_set(count=0, meta_count=0, crc32=0, synced_key=None, downloaded_key=None,
-                          batch_csv=None, full=False, bytes=0)
+                          batch_csv=None, full=False, bytes=0, corrupt_skipped=0)
         return 200, {"ok": True, "ack": done}
 
     def _watchdog_loop(self):
@@ -4120,7 +4144,7 @@ RENDERED_HTML = """<!DOCTYPE html>
             </div>
             <div class="esp-log-meter">
               <div class="esp-log-track">
-                <div id="esp-log-bar" class="esp-log-fill" role="progressbar" aria-label="Penggunaan Memori Backup ESP32" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" style="width: 0%;"></div>
+                <div id="esp-log-bar" class="esp-log-fill" role="progressbar" aria-label="Penggunaan Memori Backup ESP32" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
               </div>
               <div class="esp-log-meta">
                 <span id="esp-log-usage">0 / 43.008 sampel</span>
@@ -7651,7 +7675,7 @@ def start_dashboard_server(engine, host="0.0.0.0", port=8080):
                 self._send_json(engine.get_esp_log_status())
                 return
             if parsed.path == "/api/esp-log/download":
-                path, err = engine.get_esp_log_download_path()
+                path, key, err = engine.get_esp_log_download_path()
                 if path is None:
                     self._send_json({"ok": False, "error": err}, 409)
                     return
@@ -7664,6 +7688,8 @@ def start_dashboard_server(engine, host="0.0.0.0", port=8080):
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
+                self.wfile.flush()
+                engine.mark_esp_log_downloaded(key)
                 return
             if parsed.path == "/api/mobile-config":
                 cfg = build_mobile_dashboard_config(engine.broker_host, engine.broker_port)
