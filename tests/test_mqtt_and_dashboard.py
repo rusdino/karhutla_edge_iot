@@ -1080,20 +1080,38 @@ class TestEspBackupSyncAndClear(unittest.TestCase):
                 self.assertEqual(self._req(base, "/api/esp-log/sync", "POST")[0], 200)
                 self.assertEqual(self._req(base, "/api/esp-log/sync", "POST")[0], 200)
                 self.assertFalse(glob.glob(os.path.join(tmp, "*1970-01-01*")))
+                today_str = _dt.date.today().isoformat()
                 for d in ("2026-11-25", "2026-11-26"):
                     p = os.path.join(tmp, f"karhutla_esp32_backup_{d}.csv")
                     self.assertTrue(os.path.exists(p), p)
                     with open(p, newline="", encoding="utf-8") as f:
-                        self.assertEqual(len(list(_csv.DictReader(f))), 1)
-                unsynced = glob.glob(os.path.join(tmp, "karhutla_esp32_backup_*unsynced*.csv"))
-                self.assertEqual(len(unsynced), 1)
-                with open(unsynced[0], newline="", encoding="utf-8") as f:
+                        expected_n = 3 if d == today_str else 1
+                        self.assertEqual(len(list(_csv.DictReader(f))), expected_n)
+                self.assertFalse(glob.glob(os.path.join(tmp, "*unsynced*")))
+                today = os.path.join(tmp, f"karhutla_esp32_backup_{today_str}.csv")
+                with open(today, newline="", encoding="utf-8") as f:
                     rows = list(_csv.DictReader(f))
-                self.assertEqual([r["timestamp"] for r in rows], ["UNSYNCED+5000ms", "UNSYNCED+6000ms"])
+                unsynced_ts = [r["timestamp"] for r in rows if r["timestamp"].startswith("UNSYNCED+")]
+                self.assertEqual(unsynced_ts, ["UNSYNCED+5000ms", "UNSYNCED+6000ms"])
                 st, body = self._req(base, "/api/esp-log/download")
                 self.assertEqual(st, 200)
                 rows = list(_csv.DictReader(io.StringIO(body.decode("utf-8"))))
                 self.assertEqual(len(rows), 4)
+            finally:
+                self._stop(eng, srv)
+
+    def test_unsynced_and_implausible_epoch_route_to_today_csv(self):
+        recs = [_mk_rec(0, 5000, 1, rtc=False), _mk_rec(100, 6000, 2, rtc=True)]
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, esp, srv, base = self._setup(tmp, recs)
+            try:
+                self.assertEqual(self._req(base, "/api/esp-log/sync", "POST")[0], 200)
+                self.assertFalse(glob.glob(os.path.join(tmp, "*1970-01-01*")))
+                self.assertFalse(glob.glob(os.path.join(tmp, "*unsynced*")))
+                today = os.path.join(tmp, f"karhutla_esp32_backup_{_dt.date.today().isoformat()}.csv")
+                with open(today, newline="", encoding="utf-8") as f:
+                    rows = list(_csv.DictReader(f))
+                self.assertEqual([r["timestamp"] for r in rows], ["UNSYNCED+5000ms", "UNSYNCED+6000ms"])
             finally:
                 self._stop(eng, srv)
 
@@ -1110,7 +1128,6 @@ class TestEspBackupSyncAndClear(unittest.TestCase):
                 esp.hb(rtc_ok=True, epoch_s=int(time.time()) + 60)
                 self.assertEqual(len([p for p in esp.published if p[0] == K.T_TIME_SYNC]), 1)
                 esp.published.clear()
-                time.sleep(0)
                 esp.hb(rtc_ok=True)
                 self.assertEqual([p for p in esp.published if p[0] == K.T_TIME_SYNC], [])
             finally:

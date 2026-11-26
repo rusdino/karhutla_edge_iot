@@ -621,13 +621,13 @@ class DashboardEngine:
 
     def _esp_record_row(self, rec):
         row = dict(rec)
-        if rec["rtc_valid"] and rec["epoch_s"] > 0:
+        if rec["rtc_valid"] and rec["epoch_s"] >= 1_700_000_000:
             dt = datetime.datetime.fromtimestamp(rec["epoch_s"], self.ESP_WIB)
             row["timestamp"] = dt.isoformat(timespec="seconds")
             day = dt.date().isoformat()
         else:
             row["timestamp"] = f"UNSYNCED+{rec['uptime_ms']}ms"
-            day = "unsynced"
+            day = datetime.date.today().isoformat()
         for k_f in ("v_dust", "v_mq", "pm_raw", "pm", "dcdt", "gas_ppm", "g", "fi", "v0", "duty"):
             row[k_f] = f"{row[k_f]:.6g}"
         return row, day
@@ -659,8 +659,8 @@ class DashboardEngine:
         try:
             return self._sync_esp_logs_locked()
         finally:
-            self._log_op.release()
             self._esp_log_set(busy=None, progress=None)
+            self._log_op.release()
 
     def _fail_sync(self, msg):
         self._esp_log_set(last_error=msg)
@@ -728,8 +728,8 @@ class DashboardEngine:
         try:
             return self._clear_esp_logs_locked()
         finally:
-            self._log_op.release()
             self._esp_log_set(busy=None, progress=None)
+            self._log_op.release()
 
     def _clear_esp_logs_locked(self):
         st = self.get_esp_log_status()
