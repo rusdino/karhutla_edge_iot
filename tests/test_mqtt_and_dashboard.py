@@ -852,6 +852,86 @@ class TestModernWebDashboard(unittest.TestCase):
             finally:
                 eng.shutdown()
 
+    def test_dashboard_round9_mobile_hils_canvas_and_clarity_invariants(self):
+        html = dashboard.RENDERED_HTML
+        self.assertIn("display: contents;", html)
+        self.assertIn("di bilah bawah", html)
+        self.assertIn("Injeksi Fault", html)
+        self.assertIn("maks ΔFI", html)
+        self.assertIn("Kurva Telemetri", html)
+        self.assertIn("Metrik DSP &amp; Prakiraan AI", html)
+        self.assertIn("const lbl = segW >= 124 ? 'FAILSAFE (Vd=0V)' : 'FAILSAFE';", html)
+        self.assertNotIn("segW >= 64 ? 'FAILSAFE' : 'FAIL'", html)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            try:
+                st0 = eng.get_sim_status()
+                self.assertIn("enable_mqtt", st0)
+                self.assertFalse(st0["enable_mqtt"])
+                with eng.lock:
+                    eng.hils_consec_timeouts = 3
+                eng.stop_sim()
+                self.assertEqual(eng.get_sim_status()["hils_consec_timeouts"], 0)
+            finally:
+                eng.shutdown()
+
+    def test_dashboard_round10_forecast_a11y_mobile_and_polish_invariants(self):
+        html = dashboard.RENDERED_HTML
+        self.assertIn("Tercapai (FI ≥ 150)", html)
+        self.assertIn("Prakiraan PM AI", html)
+        self.assertIn('id="btn-theme-cycle"', html)
+        self.assertIn('id="btn-quick-src"', html)
+        self.assertIn('id="mob-sel-sim-target"', html)
+        self.assertIn('id="mob-sel-scenario"', html)
+        self.assertIn('id="mob-sw-fault"', html)
+        self.assertIn('.cmd-btn[data-variant="danger"]:not(:disabled)', html)
+        self.assertIn('.topbar kbd.key-hint', html)
+        self.assertIn('role="switch"', html)
+        self.assertIn('function formatClock(', html)
+        self.assertIn('earlyFaultThr', html)
+
+    def test_dashboard_round11_mobile_failsafe_ia_popover_and_minor_invariants(self):
+        html = dashboard.RENDERED_HTML
+        self.assertIn('<link rel="icon" type="image/svg+xml"', html)
+        self.assertIn("#cbb2e8", html)
+        self.assertLess(html.index('id="sim-panel"'), html.index('id="override-panel"'))
+        self.assertLess(html.index('id="speed-toolbar"'), html.index('id="sim-advanced-drawer"'))
+        self.assertLess(html.index('id="sw-preempt"'), html.index('id="sim-advanced-drawer"'))
+        self.assertIn('id="override-scope-row"', html)
+        self.assertIn('id="mob-cmd-scope-row"', html)
+        self.assertIn('id="mob-speed-toolbar"', html)
+        self.assertIn('id="mob-sw-preempt"', html)
+        self.assertIn('id="lbl-theme-cycle"', html)
+        self.assertIn('id="abbr-popover" popover="auto"', html)
+        self.assertIn('<details class="help-sec" name="help-sec"', html)
+        self.assertIn("suspendedFill", html)
+        self.assertIn("FI:TIDAK VALID", html)
+        self.assertIn("Fc:DITANGGUHKAN", html)
+        self.assertIn("log-empty-note", html)
+        self.assertIn("const expFontPx = 12;", html)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+            srv = dashboard.start_dashboard_server(eng, host="127.0.0.1", port=0)
+            port = srv.server_address[1]
+            base = f"http://127.0.0.1:{port}"
+            try:
+                with urllib.request.urlopen(f"{base}/favicon.ico", timeout=3) as fav:
+                    self.assertEqual(fav.status, 204)
+
+                eng.control_sim({"action": "start", "target": "sitl", "scenario": "flaming", "speed": 50})
+                time.sleep(0.25)
+                eng.control_sim({"action": "stop"})
+                ls = eng.get_sim_status()["last_summary"]
+                self.assertIsNotNone(ls)
+                self.assertTrue(ls.get("stopped_early"))
+                self.assertGreater(ls.get("samples", 0), 0)
+            finally:
+                eng.shutdown()
+                srv.shutdown()
+                srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

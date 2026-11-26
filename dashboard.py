@@ -780,11 +780,20 @@ class DashboardEngine:
             with self.lock:
                 self.sim_fault_inject = bool(params["fault_inject"])
 
+        manual_stop_summary = None
         if action == "start":
             self.stop_sim()
             self._start_sim_thread()
         elif action == "stop":
+            with self.lock:
+                was_running = bool(self.sim_running)
+                stop_target = self.sim_target
             self.stop_sim()
+            if was_running:
+                with self.lock:
+                    manual_stop_summary = self._build_run_summary_locked(stop_target, completed=False)
+                    if manual_stop_summary is not None:
+                        self._last_run_summary = dict(manual_stop_summary)
         elif action == "pause":
             with self.lock:
                 self.sim_paused = True
@@ -816,6 +825,8 @@ class DashboardEngine:
                 self._last_run_summary = None
             self._broadcast({"type": "clear", "source": "esp32" if src == "esp32" else "sitl"})
         self._broadcast({"type": "sim", "sim": self.get_sim_status()})
+        if manual_stop_summary is not None:
+            self._broadcast({"type": "sim_complete", "summary": manual_stop_summary, "sim": self.get_sim_status()})
         return True
 
     def _start_sim_thread(self):
@@ -964,23 +975,37 @@ class DashboardEngine:
                 self.sim_csv.close()
                 self.sim_csv = None
             if completed_naturally:
-                peak_fi = max((float(r.get("fi", 0.0)) for r in self.history), default=0.0)
-                last_t = float(self.history[-1].get("t", 0.0)) if self.history else 0.0
-                summary = {
-                    "target": self.sim_target,
-                    "source": "sitl",
-                    "scenario": self.sim_scenario,
-                    "samples": len(self.history),
-                    "peak_fi": round(peak_fi, 1),
-                    "hils_parity": None,
-                    "t_bahaya_s": self._run_t_bahaya,
-                    "ai_preempt_used": bool(self._run_preempt_used),
-                    "duration_s": round(float(last_t), 1),
-                }
-                self._last_run_summary = dict(summary)
+                summary = self._build_run_summary_locked(self.sim_target, completed=True)
+                if summary is not None:
+                    self._last_run_summary = dict(summary)
         self._broadcast({"type": "sim", "sim": self.get_sim_status()})
         if summary is not None:
             self._broadcast({"type": "sim_complete", "summary": summary, "sim": self.get_sim_status()})
+
+    def _build_run_summary_locked(self, target, completed=True):
+        is_hils = target == "hils"
+        hist = self.esp_history if is_hils else self.history
+        if not hist:
+            return None
+        valid_fis = [
+            float(r.get("fi", 0.0))
+            for r in hist
+            if r.get("state") != "FAILSAFE" and not r.get("sensor_fault")
+        ]
+        peak_fi = max(valid_fis, default=0.0)
+        last_t = float(hist[-1].get("t", 0.0))
+        return {
+            "target": target,
+            "source": "esp32" if is_hils else "sitl",
+            "scenario": self.sim_scenario,
+            "samples": len(hist),
+            "peak_fi": round(peak_fi, 1),
+            "hils_parity": dict(self.hils_parity) if is_hils else None,
+            "t_bahaya_s": self._run_t_bahaya,
+            "ai_preempt_used": bool(self._run_preempt_used),
+            "duration_s": round(last_t, 1),
+            "stopped_early": not completed,
+        }
 
     def _wait_hils_seq(self, seq, vd, vm, timeout=4.0):
         """Tunggu balasan telemetri ESP32 untuk `seq`, dengan 1x retry di tengah timeout."""
@@ -1141,20 +1166,9 @@ class DashboardEngine:
                 self.sim_csv.close()
                 self.sim_csv = None
             if completed_naturally:
-                peak_fi = max((float(r.get("fi", 0.0)) for r in self.esp_history), default=0.0)
-                last_t = float(self.esp_history[-1].get("t", 0.0)) if self.esp_history else 0.0
-                summary = {
-                    "target": self.sim_target,
-                    "source": "esp32",
-                    "scenario": self.sim_scenario,
-                    "samples": len(self.esp_history),
-                    "peak_fi": round(peak_fi, 1),
-                    "hils_parity": dict(self.hils_parity),
-                    "t_bahaya_s": self._run_t_bahaya,
-                    "ai_preempt_used": bool(self._run_preempt_used),
-                    "duration_s": round(float(last_t), 1),
-                }
-                self._last_run_summary = dict(summary)
+                summary = self._build_run_summary_locked(self.sim_target, completed=True)
+                if summary is not None:
+                    self._last_run_summary = dict(summary)
         self._broadcast({"type": "sim", "sim": self.get_sim_status()})
         if summary is not None:
             self._broadcast({"type": "sim_complete", "summary": summary, "sim": self.get_sim_status()})
@@ -1169,6 +1183,7 @@ class DashboardEngine:
         with self.lock:
             self.sim_running = False
             self.sim_paused = False
+            self.hils_consec_timeouts = 0
             if self.sim_csv:
                 self.sim_csv.close()
                 self.sim_csv = None
@@ -1190,6 +1205,7 @@ RENDERED_HTML = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>Karhutla Edge-IoT — Pusat Telemetri &amp; Kendali</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23c2410c' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 2c.5 4-3 6-3 10a5 5 0 0 0 10 0c0-3-2-5.5-4-8'/%3E%3Cpath d='M9 14a3 3 0 0 0 6 0'/%3E%3C/svg%3E">
   <style>
     :root {
       color-scheme: light dark;
@@ -1225,9 +1241,9 @@ RENDERED_HTML = """<!DOCTYPE html>
       --fault-light: #9d174d;
       --fault-dark: #f472b6;
       --violet-light: #6d28d9;
-      --violet-dark: #e879f9;
+      --violet-dark: #cbb2e8;
       --teal-light: #0f766e;
-      --teal-dark: #2dd4bf;
+      --teal-dark: #68c89c;
 
       --bg-canvas: var(--bg-canvas-light);
       --bg-surface: var(--bg-surface-light);
@@ -1427,9 +1443,22 @@ RENDERED_HTML = """<!DOCTYPE html>
     .src-btn[aria-pressed="true"]:not(:disabled) kbd.key-hint,
     .preset-btn[aria-pressed="true"]:not(:disabled) kbd.key-hint,
     .cmd-btn[aria-pressed="true"]:not(:disabled):not(#btn-sim-pause) kbd.key-hint {
-      color: var(--text-main);
-      background: var(--bg-surface);
-      border-color: color-mix(in oklab, var(--accent), transparent 35%);
+      color: var(--accent);
+      background: var(--accent-fg);
+      border-color: color-mix(in oklab, var(--accent-fg), transparent 35%);
+    }
+
+    .no-upper {
+      text-transform: none;
+    }
+
+    .drawer-group-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+      margin-block-end: 2px;
     }
 
     #btn-sim-pause[aria-pressed="true"] kbd.key-hint {
@@ -1655,6 +1684,8 @@ RENDERED_HTML = """<!DOCTYPE html>
       display: grid;
       grid-template-rows: subgrid;
       container-type: inline-size;
+      min-inline-size: 0;
+      overflow: hidden;
       background: var(--bg-surface);
       border: 1px solid var(--border-subtle);
       border-radius: 14px;
@@ -1703,9 +1734,14 @@ RENDERED_HTML = """<!DOCTYPE html>
       font-weight: 600;
       color: var(--text-muted);
       margin-block-start: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .kpi-frozen-note[hidden] { display: none; }
+
+    .kpi-atom { white-space: nowrap; }
 
     article.kpi-card > header {
       display: flex;
@@ -1928,7 +1964,7 @@ RENDERED_HTML = """<!DOCTYPE html>
     .chip-btn[hidden], .cmd-btn[hidden] { display: none; }
 
     .chip-btn[disabled], .cmd-btn[disabled] {
-      opacity: 0.72;
+      opacity: 0.78;
       border-style: dashed;
       color: var(--text-muted);
       background: var(--bg-canvas);
@@ -2116,8 +2152,8 @@ RENDERED_HTML = """<!DOCTYPE html>
       font-weight: 700;
     }
 
-    .cmd-btn[data-variant="danger"],
-    .chip-btn[data-variant="danger"] {
+    .cmd-btn[data-variant="danger"]:not(:disabled),
+    .chip-btn[data-variant="danger"]:not(:disabled) {
       border-color: color-mix(in oklab, var(--danger), transparent 35%);
       color: var(--danger);
       background: color-mix(in oklab, var(--bg-elevated), var(--danger) 8%);
@@ -2320,9 +2356,15 @@ RENDERED_HTML = """<!DOCTYPE html>
       padding-block-end: 3px;
     }
 
+    .log-empty-note {
+      color: var(--text-muted);
+      font-style: italic;
+      border-block-end: none;
+    }
+
     .glossary-list {
-      display: grid;
-      grid-template-columns: 1fr;
+      display: flex;
+      flex-direction: column;
       gap: 8px;
       font-size: 0.8125rem;
       color: var(--text-muted);
@@ -2331,6 +2373,73 @@ RENDERED_HTML = """<!DOCTYPE html>
 
     .glossary-list strong {
       color: var(--text-main);
+    }
+
+    details.help-sec {
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 8px 12px;
+      background: var(--bg-elevated);
+    }
+
+    details.help-sec > summary {
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 0.8125rem;
+      font-weight: 700;
+      color: var(--text-main);
+      user-select: none;
+    }
+
+    details.help-sec > summary::-webkit-details-marker { display: none; }
+
+    .help-sec-body {
+      margin-block-start: 8px;
+      padding-block-start: 8px;
+      border-block-start: 1px dashed var(--border-subtle);
+      display: grid;
+      gap: 8px;
+    }
+
+    .abbr-popover {
+      position: fixed;
+      margin: 0;
+      inset: auto;
+      max-inline-size: min(300px, calc(100vw - 24px));
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-surface);
+      color: var(--text-main);
+      font-size: 0.8125rem;
+      line-height: 1.45;
+      box-shadow: 0 12px 28px -6px rgba(0, 0, 0, 0.32);
+    }
+
+    .abbr-popover-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-block-end: 4px;
+      font-size: 0.75rem;
+      color: var(--accent);
+    }
+
+    .abbr-popover-close {
+      min-inline-size: 28px;
+      min-block-size: 28px;
+      border-radius: 6px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-elevated);
+      color: var(--text-main);
+      font-size: 0.75rem;
+      font-weight: 700;
+      cursor: pointer;
     }
 
     dialog.confirm-modal {
@@ -2608,7 +2717,17 @@ RENDERED_HTML = """<!DOCTYPE html>
     .layer-btn[data-layer="voltages"] { --chip-color: #2563eb; }
 
     .chip-dot-vd { background: var(--chip-color-vd, #60a5fa); }
-    .chip-dot-vm { background: var(--chip-color-vm, #a78bfa); margin-inline-start: -3px; }
+    .chip-dot-vm { background: var(--chip-color-vm, #cbb2e8); margin-inline-start: -3px; }
+
+    .sim-quick-controls {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding-block-start: 6px;
+      border-block-start: 1px dashed var(--border-subtle);
+    }
+
+    .override-scope-row[hidden], .mob-cmd-scope[hidden] { display: none; }
 
     /* Persistent run summary strip */
     .run-summary {
@@ -2659,6 +2778,12 @@ RENDERED_HTML = """<!DOCTYPE html>
 
     .run-summary-grid [hidden] { display: none; }
 
+    .mob-dock-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+
     .mob-dock-context {
       font-size: 0.75rem;
       font-weight: 600;
@@ -2690,7 +2815,36 @@ RENDERED_HTML = """<!DOCTYPE html>
       border-block-end: 1px dashed var(--border-subtle);
     }
 
-    .mob-dock-tray[hidden] { display: none; }
+    .mob-dock-tray[hidden], #btn-theme-cycle { display: none; }
+
+    .chip-inline-src {
+      min-block-size: 24px;
+      min-inline-size: 0;
+      padding: 2px 8px;
+      font-size: 0.75rem;
+      flex-shrink: 0;
+    }
+
+    .mob-quick-sim {
+      display: grid;
+      grid-template-columns: 1fr 1.2fr;
+      gap: 6px;
+    }
+
+    .mob-quick-sim .op-select {
+      inline-size: 100%;
+      min-inline-size: 0;
+    }
+
+    .mob-fault-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      min-block-size: 38px;
+    }
 
     .mob-cmd-scope {
       display: flex;
@@ -2750,8 +2904,11 @@ RENDERED_HTML = """<!DOCTYPE html>
       .kpi-meter { margin-block-start: 2px; }
       .kpi-frozen-note { margin-block-start: 0; line-height: 1.2; }
       article.kpi-card > footer { padding-block-start: 3px; }
-      .control-column { gap: 6px; }
-      .panel-card { padding: 6px 10px; gap: 4px; }
+      .control-column { gap: 5px; }
+      .panel-card { padding: 5px 10px; gap: 3px; }
+      .control-column .panel-head-row { flex-wrap: nowrap; gap: 6px; }
+      .control-column .panel-head-row .brand-sub { display: none; }
+      .control-column .panel-title { display: block; font-size: 0.87rem; letter-spacing: -0.02em; text-wrap: balance; }
       .control-column .panel-subtitle-row {
         margin-block-start: 0;
         white-space: nowrap;
@@ -2760,20 +2917,20 @@ RENDERED_HTML = """<!DOCTYPE html>
       }
       .preset-bar { padding: 3px 0; }
       .chip-btn { min-block-size: 28px; padding: 3px 9px; }
-      .cmd-btn { min-block-size: 32px; padding: 4px 8px; }
-      .reset-zone { padding-block-start: 5px; }
-      .sim-zone, .sim-adv-drawer { padding: 4px 0 0; gap: 3px; }
-      .op-list, .sim-adv-body { gap: 3px; }
-      .op-row, .override-scope-row { padding: 3px 0; }
-      .op-select { min-block-size: 28px; padding: 3px 8px; }
+      .cmd-btn { min-block-size: 30px; padding: 3px 8px; }
+      .reset-zone { padding-block-start: 4px; }
+      .sim-zone, .sim-adv-drawer, .sim-quick-controls { padding: 3px 0 0; gap: 2px; }
+      .op-list, .sim-adv-body { gap: 2px; }
+      .op-row, .override-scope-row { padding: 2px 0; }
+      .op-select { min-block-size: 27px; padding: 2px 8px; }
       details.drawer-card > summary, .sim-adv-drawer > summary { font-size: 0.8125rem; }
       .theme-switch .theme-btn { min-block-size: 28px; }
       .chart-head { padding: 5px 10px 4px; gap: 6px; }
       .chart-legend { padding: 0; gap: 4px 12px; }
       .run-summary { padding: 5px 10px; gap: 3px; }
       .run-summary-grid { grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 4px 10px; }
-      canvas.chart-stage { block-size: clamp(174px, 25.5dvh, 206px); }
-      canvas.subchart-stage { block-size: clamp(106px, 14.5dvh, 118px); }
+      canvas.chart-stage { block-size: clamp(164px, 24dvh, 194px); }
+      canvas.subchart-stage { block-size: clamp(98px, 13.8dvh, 112px); }
     }
 
     @media (max-width: 1279px) {
@@ -2792,46 +2949,101 @@ RENDERED_HTML = """<!DOCTYPE html>
 
     @media (max-width: 767px) {
       body {
-        padding-block-end: calc(108px + env(safe-area-inset-bottom));
+        padding: 4px 8px calc(100px + env(safe-area-inset-bottom));
       }
-      .page-frame, .dashboard-shell {
-        gap: 10px;
+      .page-frame {
+        gap: 5px;
+      }
+      .dashboard-shell {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-areas: none;
+        gap: 5px;
+      }
+      .kpi-grid, .workspace {
+        display: contents;
+      }
+      .kpi-grid > article.kpi-card[data-primary="true"] {
+        order: 1;
+        grid-row: auto;
+        grid-template-rows: auto 1fr auto;
+      }
+      .workspace > .panel-card {
+        order: 2;
+        grid-column: 1 / -1;
+      }
+      .kpi-grid > article.kpi-card:not([data-primary="true"]) {
+        order: 3;
+        grid-row: auto;
+        grid-template-rows: auto 1fr auto;
+      }
+      .workspace > .control-column {
+        order: 4;
+        grid-column: 1 / -1;
       }
       .topbar {
-        padding: 6px 9px;
-        gap: 4px 6px;
+        padding: 4px 8px;
+        gap: 3px 6px;
+        align-items: center;
+      }
+      .brand-group {
+        order: 1;
+        gap: 6px;
+        margin-inline-end: auto;
+        min-inline-size: 0;
+      }
+      .topbar-actions {
+        order: 2;
+        gap: 6px;
+        flex-wrap: nowrap;
+      }
+      .theme-switch, .topbar-btn-lbl, #btn-quick-src {
+        display: none;
       }
       .topbar .pill-badge {
         padding: 3px 8px;
         font-size: 0.75rem;
       }
-      .topbar-actions {
-        gap: 4px;
-      }
-      .theme-switch .theme-btn {
-        padding: 4px 7px;
+      #btn-theme-cycle {
+        display: inline-flex;
+        min-inline-size: 44px;
+        min-block-size: 44px;
+        padding: 0 9px;
+        gap: 5px;
+        justify-content: center;
         font-size: 0.75rem;
       }
       #btn-open-help {
-        padding: 4px 8px;
+        display: inline-flex;
+        min-inline-size: 44px;
+        min-block-size: 44px;
+        padding: 0;
+        justify-content: center;
         font-size: 0.75rem;
       }
-      .topbar .brand-sub, .brand-title-ext, #override-panel {
+      .topbar .brand-sub, .brand-title-ext, #override-panel, .panel-header .brand-sub {
         display: none;
       }
       .safety-callout {
-        padding: 8px 10px;
-        gap: 6px;
-      }
-      .safety-callout-desc {
-        display: none;
+        padding: 4px 8px;
+        gap: 4px;
+        font-size: 0.75rem;
+        line-height: 1.25;
       }
       .brand-badge {
-        inline-size: 32px;
-        block-size: 32px;
+        inline-size: 24px;
+        block-size: 24px;
+        border-radius: 7px;
+      }
+      .brand-title {
+        font-size: 1.25rem;
+        line-height: 1.15;
       }
       .status-cluster {
+        order: 3;
+        width: 100%;
         margin-inline-start: 0;
+        gap: 4px;
       }
       #mob-dock-context {
         font-weight: 700;
@@ -2840,13 +3052,13 @@ RENDERED_HTML = """<!DOCTYPE html>
       #mob-dock-context[data-tone="warn"] { color: var(--warn); }
       #mob-dock-context[data-tone="danger"] { color: var(--danger); }
       #mob-dock-context[data-tone="fault"] { color: var(--fault); }
-      .kpi-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 7px;
-      }
       article.kpi-card {
-        padding: 9px 10px;
-        gap: 3px;
+        padding: 5px 8px;
+        gap: 1px;
+      }
+      article.kpi-card > footer {
+        padding-block-start: 3px;
+        gap: 3px 6px;
       }
       .cmd-grid {
         grid-template-columns: 1fr;
@@ -2858,20 +3070,66 @@ RENDERED_HTML = """<!DOCTYPE html>
         grid-column: span 2;
       }
       canvas.chart-stage {
-        block-size: 250px;
+        block-size: 102px;
       }
       canvas.subchart-stage {
-        block-size: 132px;
+        block-size: 66px;
+      }
+      .mob-dock-meta {
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+      }
+      .mob-dock-context, .mob-dock-cmd-status {
+        min-inline-size: 0;
+        flex: 1 1 auto;
+      }
+      .mob-dock-context { text-align: start; }
+      .mob-dock-cmd-status { text-align: end; }
+      .panel-card {
+        padding: 5px 8px;
+        gap: 3px;
+      }
+      .panel-header {
+        gap: 4px;
+      }
+      .preset-bar {
+        padding: 3px 0;
+        gap: 4px 6px;
+        flex-wrap: wrap;
+        overflow-x: visible;
+      }
+      #preset-toolbar {
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+      .preset-actions {
+        flex-wrap: nowrap;
+        gap: 5px;
+      }
+      .preset-label {
+        display: none;
+      }
+      .chart-legend {
+        flex-wrap: wrap;
+        overflow-x: visible;
+        gap: 3px 10px;
+        padding: 1px 0;
+      }
+      .chip-btn {
+        min-block-size: 44px;
+        padding: 6px 9px;
       }
       .mobile-dock {
         display: flex;
         flex-direction: column;
-        gap: 4px;
+        gap: 2px;
         position: fixed;
         inset-block-end: 0;
         inset-inline: 0;
         z-index: 25;
-        padding: 8px 10px max(8px, env(safe-area-inset-bottom));
+        padding: 5px 10px max(5px, env(safe-area-inset-bottom));
         background: var(--bg-surface);
         border-block-start: 1px solid var(--border-subtle);
         box-shadow: 0 -6px 20px -6px color-mix(in oklab, var(--text-main), transparent 85%);
@@ -2881,13 +3139,43 @@ RENDERED_HTML = """<!DOCTYPE html>
         padding: 6px 4px;
         font-size: 0.75rem;
       }
+      .mob-dock-tray {
+        max-block-size: 62dvh;
+        overflow-y: auto;
+        gap: 7px;
+      }
+      .mob-tray-group {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+      .mob-tray-group + .mob-tray-group {
+        padding-block-start: 6px;
+        border-block-start: 1px dashed var(--border-subtle);
+      }
+      .mob-speed-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        font-size: 0.75rem;
+        font-weight: 600;
+      }
+      .mob-speed-row .mob-spd-btn {
+        min-inline-size: 44px;
+        min-block-size: 44px;
+        padding: 4px 8px;
+      }
       .toast-region {
-        inset-block-end: calc(120px + env(safe-area-inset-bottom));
+        inset-block-end: calc(114px + env(safe-area-inset-bottom));
       }
     }
 
     @media (pointer: coarse), (max-width: 767px) {
-      kbd.key-hint {
+      .topbar kbd.key-hint,
+      .preset-bar kbd.key-hint,
+      .cmd-btn kbd.key-hint,
+      .chip-btn kbd.key-hint {
         display: none;
       }
     }
@@ -2896,15 +3184,23 @@ RENDERED_HTML = """<!DOCTYPE html>
       .chip-btn, .cmd-btn, .op-select, .touch-label, .theme-switch .theme-btn, details.drawer-card > summary, .sim-adv-drawer > summary {
         min-block-size: 44px;
       }
-      .kpi-abbr-btn {
+      .topbar .theme-switch .theme-btn {
         min-block-size: 44px;
+      }
+      .topbar #btn-theme-cycle,
+      .topbar #btn-open-help {
+        min-inline-size: 44px;
+        min-block-size: 44px;
+      }
+      .kpi-abbr-btn {
+        min-block-size: 24px;
         display: inline-flex;
         align-items: center;
-        padding-inline: 3px;
-        margin-block: -10px;
+        padding: 2px 3px;
+        margin-block: 0;
       }
       .chip-btn {
-        padding: 8px 12px;
+        padding: 6px 10px;
       }
     }
 
@@ -2953,22 +3249,26 @@ RENDERED_HTML = """<!DOCTYPE html>
 
       <div class="topbar-actions">
         <div class="theme-switch" role="group" aria-label="Pilih Tema Tampilan">
-          <button type="button" class="chip-btn theme-btn" data-theme-val="light" aria-pressed="false" title="Tema Proyektor Terang">
+          <button type="button" class="chip-btn theme-btn" data-theme-val="light" aria-pressed="false" aria-label="Tema Proyektor Terang" title="Tema Proyektor Terang">
             <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
-            Proyektor
+            <span class="topbar-btn-lbl">Proyektor</span>
           </button>
-          <button type="button" class="chip-btn theme-btn" data-theme-val="dark" aria-pressed="false" title="Tema Gelap Laboratorium">
+          <button type="button" class="chip-btn theme-btn" data-theme-val="dark" aria-pressed="false" aria-label="Tema Gelap Laboratorium" title="Tema Gelap Laboratorium">
             <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-            Gelap
+            <span class="topbar-btn-lbl">Gelap</span>
           </button>
-          <button type="button" class="chip-btn theme-btn" data-theme-val="system" aria-pressed="true" title="Ikuti tema perangkat (prefers-color-scheme)">
+          <button type="button" class="chip-btn theme-btn" data-theme-val="system" aria-pressed="true" aria-label="Tema Ikuti Sistem Perangkat" title="Ikuti tema perangkat (prefers-color-scheme)">
             <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-            Sistem
+            <span class="topbar-btn-lbl">Sistem</span>
           </button>
         </div>
-        <button type="button" class="chip-btn" id="btn-open-help" title="Buka Glosarium Metrik dan Pintasan Keyboard">
+        <button type="button" class="chip-btn" id="btn-theme-cycle" aria-label="Ganti tema tampilan (Saat ini: Ikuti Sistem)" title="Ganti tema tampilan">
+          <svg id="ico-theme-cycle" class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3v18"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>
+          <span id="lbl-theme-cycle">Sistem</span>
+        </button>
+        <button type="button" class="chip-btn" id="btn-open-help" aria-label="Buka Glosarium Metrik dan Pintasan Keyboard" title="Buka Glosarium Metrik dan Pintasan Keyboard">
           <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-          Glosarium <kbd class="key-hint">?</kbd>
+          <span class="topbar-btn-lbl">Glosarium</span> <kbd class="key-hint">?</kbd>
         </button>
       </div>
     </header>
@@ -2994,8 +3294,9 @@ RENDERED_HTML = """<!DOCTYPE html>
             <span id="kpi-state">BELUM ADA DATA</span>
           </div>
           <footer>
-            <span>Mode: <strong id="kpi-mode">--</strong> • t=<span id="kpi-t">0s</span><span id="kpi-t-dur" hidden></span> (#<span id="kpi-seq">0</span>)</span>
-            <span id="kpi-parity-wrap" class="kpi-parity-tag" title="Kriteria paritas OK: |ΔFI| maks &lt; 1,0 dan 100% state cocok" hidden>Paritas: <strong id="kpi-parity">-</strong></span>
+            <span class="kpi-atom">Mode: <strong id="kpi-mode">--</strong></span>
+            <span class="kpi-atom">t=<span id="kpi-t">0s</span><span id="kpi-t-dur" hidden></span> (#<span id="kpi-seq">0</span>)</span>
+            <span id="kpi-parity-wrap" class="kpi-parity-tag kpi-atom" title="Kriteria paritas OK: |ΔFI| maks &lt; 1,0 dan 100% state cocok" hidden>Paritas: <strong id="kpi-parity">-</strong></span>
           </footer>
         </article>
 
@@ -3015,8 +3316,8 @@ RENDERED_HTML = """<!DOCTYPE html>
             </div>
           </div>
           <footer>
-            <span id="kpi-fi-foot-left">Waspada ≥ 55</span>
-            <span id="kpi-fi-foot-right">Bahaya ≥ 150</span>
+            <span id="kpi-fi-foot-left" class="kpi-atom">Waspada ≥ 55</span>
+            <span id="kpi-fi-foot-right" class="kpi-atom">Bahaya ≥ 150</span>
           </footer>
         </article>
 
@@ -3032,28 +3333,28 @@ RENDERED_HTML = """<!DOCTYPE html>
             <div id="kpi-pm-frozen" class="kpi-frozen-note" hidden></div>
           </div>
           <footer>
-            <span><button type="button" class="kpi-abbr-btn" data-abbr-help="Mentah: PM setelah filter Median3, sebelum Kalman (µg/m³)" title="Mentah: PM setelah filter Median3, sebelum Kalman (µg/m³)">Mentah:</button><span id="kpi-pmraw">--</span> • <button type="button" class="kpi-abbr-btn" data-abbr-help="dC/dt: laju kenaikan konsentrasi asap (µg/m³ per detik)" title="dC/dt: laju kenaikan konsentrasi asap (µg/m³ per detik)">dC/dt:</button><span id="kpi-dcdt">0.00</span></span>
-            <span><button type="button" class="kpi-abbr-btn" data-abbr-help="Vd: tegangan keluaran sensor debu Sharp (volt)" title="Vd: tegangan keluaran sensor debu Sharp (volt)">Vd:</button><span id="kpi-vd">--</span>V (<button type="button" class="kpi-abbr-btn" data-abbr-help="V0: tegangan baseline udara bersih sensor debu (volt)" title="V0: tegangan baseline udara bersih sensor debu (volt)">V0:</button><span id="kpi-v0">--</span>)</span>
+            <span><span class="kpi-atom"><button type="button" class="kpi-abbr-btn" data-abbr-help="Mentah: PM setelah filter Median3, sebelum Kalman (µg/m³)" title="Mentah: PM setelah filter Median3, sebelum Kalman (µg/m³)">Mentah:</button><span id="kpi-pmraw">--</span></span> • <span class="kpi-atom"><button type="button" class="kpi-abbr-btn" data-abbr-help="dC/dt: laju kenaikan konsentrasi asap (µg/m³ per detik)" title="dC/dt: laju kenaikan konsentrasi asap (µg/m³ per detik)">dC/dt:</button><span id="kpi-dcdt">0.00</span></span></span>
+            <span class="kpi-atom"><button type="button" class="kpi-abbr-btn" data-abbr-help="Vd: tegangan keluaran sensor debu Sharp (volt)" title="Vd: tegangan keluaran sensor debu Sharp (volt)">Vd:</button><span id="kpi-vd">--</span>V (<button type="button" class="kpi-abbr-btn" data-abbr-help="V0: tegangan baseline udara bersih sensor debu (volt)" title="V0: tegangan baseline udara bersih sensor debu (volt)">V0:</button><span id="kpi-v0">--</span>)</span>
           </footer>
         </article>
 
         <article class="kpi-card">
           <header>
-            <span>Gas MQ-135 &amp; Skor g</span>
+            <span>Gas MQ-135 (ppm)</span>
             <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 2v7.527a2 2 0 0 1-.211.896L4.72 20.55a1 1 0 0 0 .9 1.45h12.76a1 1 0 0 0 .9-1.45l-5.069-10.127A2 2 0 0 1 14 9.527V2"/><path d="M8.5 2h7"/></svg>
           </header>
           <div class="kpi-value tone-teal">
             <span id="kpi-ppm">--</span> <span class="kpi-unit">ppm</span>
           </div>
           <footer>
-            <span><button type="button" class="kpi-abbr-btn" data-abbr-help="g: skor gas ternormalisasi 0,00–1,00 (0 = udara bersih, 1 = gas pembakaran penuh)" title="g: skor gas ternormalisasi 0,00–1,00 (0 = udara bersih, 1 = gas pembakaran penuh)">Skor g:</button> <span id="kpi-g">--</span></span>
-            <span><button type="button" class="kpi-abbr-btn" data-abbr-help="Vm: tegangan ADC sensor gas MQ-135 (volt)" title="Vm: tegangan ADC sensor gas MQ-135 (volt)">Vm:</button> <span id="kpi-vm">--</span>V</span>
+            <span class="kpi-atom"><button type="button" class="kpi-abbr-btn" data-abbr-help="g: skor gas ternormalisasi 0,00–1,00 (0 = udara bersih, 1 = gas pembakaran penuh)" title="g: skor gas ternormalisasi 0,00–1,00 (0 = udara bersih, 1 = gas pembakaran penuh)">Skor g:</button> <span id="kpi-g">--</span></span>
+            <span class="kpi-atom"><button type="button" class="kpi-abbr-btn" data-abbr-help="Vm: tegangan ADC sensor gas MQ-135 (volt)" title="Vm: tegangan ADC sensor gas MQ-135 (volt)">Vm:</button> <span id="kpi-vm">--</span>V</span>
           </footer>
         </article>
 
         <article class="kpi-card" id="card-fc">
           <header>
-            <span>Prakiraan AI (t+60s)</span>
+            <span>Prakiraan PM AI <span class="no-upper">(t+60s)</span></span>
             <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
           </header>
           <div>
@@ -3063,8 +3364,8 @@ RENDERED_HTML = """<!DOCTYPE html>
             <div id="kpi-fc-frozen" class="kpi-frozen-note" hidden></div>
           </div>
           <footer>
-            <span><button type="button" class="kpi-abbr-btn" data-abbr-help="ETA: perkiraan waktu tersisa sampai FI mencapai ambang BAHAYA (150)" title="ETA: perkiraan waktu tersisa sampai FI mencapai ambang BAHAYA (150)">ETA Bahaya:</button> <strong id="kpi-eta">-</strong></span>
-            <span><button type="button" class="kpi-abbr-btn" data-abbr-help="MAE: rata-rata galat absolut prakiraan AI terhadap PM aktual (µg/m³)" title="MAE: rata-rata galat absolut prakiraan AI terhadap PM aktual (µg/m³)">MAE:</button> <span id="kpi-mae">-</span></span>
+            <span><button type="button" class="kpi-abbr-btn" data-abbr-help="ETA: perkiraan waktu tersisa sampai FI mencapai ambang BAHAYA (150)" title="ETA: perkiraan waktu tersisa sampai FI mencapai ambang BAHAYA (150)">ETA:</button> <strong id="kpi-eta">-</strong></span>
+            <span class="kpi-atom"><button type="button" class="kpi-abbr-btn" data-abbr-help="MAE: rata-rata galat absolut prakiraan AI terhadap PM aktual (µg/m³)" title="MAE: rata-rata galat absolut prakiraan AI terhadap PM aktual (µg/m³)">MAE:</button> <span id="kpi-mae">-</span></span>
           </footer>
         </article>
 
@@ -3082,7 +3383,7 @@ RENDERED_HTML = """<!DOCTYPE html>
             </div>
           </div>
           <footer>
-            <span>Kendali: <strong id="kpi-fan-ctrl">--</strong></span>
+            <span class="kpi-atom">Kendali: <strong id="kpi-fan-ctrl">--</strong></span>
             <span>Status: <strong id="kpi-fan-state">--</strong></span>
           </footer>
         </article>
@@ -3096,6 +3397,7 @@ RENDERED_HTML = """<!DOCTYPE html>
               <h2 class="panel-title">Grafik Multi-Overlay Real-Time</h2>
               <div class="panel-subtitle-row">
                 <p class="brand-sub">Sumber: <strong id="src-label">SITL (Python) — mengikuti target</strong></p>
+                <button type="button" class="chip-btn chip-inline-src" id="btn-quick-src" title="Putar sumber tampilan grafik (Ikuti Target / ESP32 / SITL)">Ganti Sumber</button>
                 <span id="parity-badge" class="pill-badge" data-tone="ok" title="Kriteria paritas OK: |ΔFI| maks &lt; 1,0 dan 100% state cocok" hidden>Paritas HILS: -</span>
               </div>
             </div>
@@ -3136,6 +3438,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           </div>
 
           <div id="layers-drawer" class="compact-drawer" hidden>
+            <div class="drawer-group-label">Kurva Telemetri</div>
             <div role="toolbar" focusgroup="toolbar wrap" aria-label="Filter Kurva Overlay Grafik" id="overlay-toolbar">
               <div role="group" aria-label="Kurva Utama">
                 <button type="button" class="chip-btn layer-btn" data-layer="fi" aria-pressed="true">
@@ -3173,6 +3476,7 @@ RENDERED_HTML = """<!DOCTYPE html>
                 </button>
               </div>
             </div>
+            <div class="drawer-group-label">Sumber &amp; Skala Sumbu</div>
             <div class="drawer-source-row">
               <span class="preset-label">Sumber Grafik (Override Tampilan):</span>
               <div role="toolbar" focusgroup="toolbar wrap" aria-label="Sumber Data Grafik">
@@ -3182,7 +3486,7 @@ RENDERED_HTML = """<!DOCTYPE html>
               </div>
             </div>
             <label class="touch-label" for="sw-zoom-y">
-              <input id="sw-zoom-y" type="checkbox" switch>
+              <input id="sw-zoom-y" type="checkbox" switch role="switch">
               <span>Skala Y Ketat (Zoom otomatis untuk skenario udara bersih)</span>
             </label>
           </div>
@@ -3226,48 +3530,9 @@ RENDERED_HTML = """<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Right: Override, Simulation, Collapsible MQTT Log & Mobile Export -->
+        <!-- Right: Simulation, Override, Collapsible MQTT Log & Mobile Export -->
         <aside id="control-panel" class="control-column" tabindex="-1" aria-label="Panel Kontrol dan Operasi">
-          <section class="panel-card" id="override-panel" aria-label="Kontrol Override Aktuator">
-            <div>
-              <h2 class="panel-title">Kontrol Override Aktuator <code class="topic-tag">karhutla/cmd</code></h2>
-              <p id="override-target-line" class="brand-sub override-target-line">Memeriksa jalur kendali...</p>
-            </div>
-
-            <div class="op-row override-scope-row">
-              <label for="sel-cmd-target">Sasaran Perintah</label>
-              <select id="sel-cmd-target" class="op-select" aria-label="Target Perintah Override">
-                <option value="auto" selected>Semua jalur aktif</option>
-                <option value="sitl">Hanya SITL (Python)</option>
-                <option value="esp32">Hanya ESP32 (:6669)</option>
-              </select>
-            </div>
-
-            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Perintah Override Kipas" class="cmd-grid" id="cmd-toolbar">
-              <button type="button" class="cmd-btn" data-cmd="AUTO" aria-pressed="false" title="Kembalikan kendali kipas ke mode otomatis FSM (Alt+⇧A)" disabled>
-                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.02 1.4 1.15.2.04.41.06.62.06H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
-                AUTO <kbd class="key-hint">Alt+⇧A</kbd>
-              </button>
-              <button type="button" class="cmd-btn" data-cmd="FORCE_MAX" aria-pressed="false" title="Paksa kipas 100% secara manual (Alt+⇧M)" disabled>
-                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                MAX 100% <kbd class="key-hint">Alt+⇧M</kbd>
-              </button>
-              <button type="button" class="cmd-btn" data-cmd="FORCE_OFF" aria-pressed="false" title="Paksa kipas mati 0% (tanpa pintasan demi keselamatan)" disabled>
-                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-                OFF 0%
-              </button>
-            </div>
-
-            <div class="reset-zone">
-              <span class="brand-sub">Mengatur ulang Kalman, FSM &amp; histori</span>
-              <button type="button" class="cmd-btn" id="btn-cmd-reset" data-cmd="RESET" data-variant="danger" disabled>
-                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
-                Reset Sistem
-              </button>
-            </div>
-          </section>
-
-          <section class="panel-card" aria-label="Operasi Simulasi SITL dan HILS">
+          <section class="panel-card" id="sim-panel" aria-label="Operasi Simulasi SITL dan HILS">
             <div class="panel-head-row">
               <div>
                 <h2 class="panel-title">Operasi Simulasi SITL / HILS Terpadu</h2>
@@ -3320,36 +3585,77 @@ RENDERED_HTML = """<!DOCTYPE html>
               </div>
             </div>
 
+            <div class="sim-quick-controls">
+              <div class="op-row">
+                <span>Kecepatan</span>
+                <div role="toolbar" focusgroup="toolbar wrap" aria-label="Kecepatan Simulasi" id="speed-toolbar">
+                  <button type="button" class="chip-btn spd-btn" data-speed="1" aria-pressed="true">1x</button>
+                  <button type="button" class="chip-btn spd-btn" data-speed="5" aria-pressed="false">5x</button>
+                  <button type="button" class="chip-btn spd-btn" data-speed="10" aria-pressed="false">10x</button>
+                  <button type="button" class="chip-btn spd-btn" data-speed="20" aria-pressed="false">20x</button>
+                </div>
+              </div>
+
+              <label class="op-row touch-label" for="sw-preempt">
+                <span>AI Preempt (FORCE MAX Proaktif Dini)</span>
+                <input id="sw-preempt" type="checkbox" switch role="switch">
+              </label>
+            </div>
+
             <details id="sim-advanced-drawer" class="sim-adv-drawer">
               <summary>
-                <span>Setelan Simulasi Lanjut</span>
+                <span>Injeksi Fault Sensor</span>
                 <span class="summary-trail">
-                  <span id="sim-adv-summary" class="pill-badge">1x • Standar</span>
+                  <span id="sim-adv-summary" class="pill-badge">Standar</span>
                   <svg class="ico drawer-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
                 </span>
               </summary>
               <div class="sim-adv-body">
-                <div class="op-row">
-                  <span>Kecepatan</span>
-                  <div role="toolbar" focusgroup="toolbar wrap" aria-label="Kecepatan Simulasi" id="speed-toolbar">
-                    <button type="button" class="chip-btn spd-btn" data-speed="1" aria-pressed="true">1x</button>
-                    <button type="button" class="chip-btn spd-btn" data-speed="5" aria-pressed="false">5x</button>
-                    <button type="button" class="chip-btn spd-btn" data-speed="10" aria-pressed="false">10x</button>
-                    <button type="button" class="chip-btn spd-btn" data-speed="20" aria-pressed="false">20x</button>
-                  </div>
-                </div>
-
-                <label class="op-row touch-label" for="sw-preempt">
-                  <span>AI Preempt (FORCE MAX Proaktif Dini)</span>
-                  <input id="sw-preempt" type="checkbox" switch>
-                </label>
-
                 <label class="op-row touch-label" for="sw-fault">
                   <span>Injeksi Putus Kabel Sensor Debu (FAILSAFE) — manual, kapan saja</span>
-                  <input id="sw-fault" type="checkbox" switch>
+                  <input id="sw-fault" type="checkbox" switch role="switch">
                 </label>
               </div>
             </details>
+          </section>
+
+          <section class="panel-card" id="override-panel" aria-label="Kontrol Override Aktuator">
+            <div>
+              <h2 class="panel-title">Kontrol Override Aktuator <code class="topic-tag">karhutla/cmd</code></h2>
+              <p id="override-target-line" class="brand-sub override-target-line">Memeriksa jalur kendali...</p>
+            </div>
+
+            <div class="op-row override-scope-row" id="override-scope-row" hidden>
+              <label for="sel-cmd-target">Sasaran Perintah</label>
+              <select id="sel-cmd-target" class="op-select" aria-label="Target Perintah Override">
+                <option value="auto" selected>Semua jalur aktif</option>
+                <option value="sitl">Hanya SITL (Python)</option>
+                <option value="esp32">Hanya ESP32 (:6669)</option>
+              </select>
+            </div>
+
+            <div role="toolbar" focusgroup="toolbar wrap" aria-label="Perintah Override Kipas" class="cmd-grid" id="cmd-toolbar">
+              <button type="button" class="cmd-btn" data-cmd="AUTO" aria-pressed="false" title="Kembalikan kendali kipas ke mode otomatis FSM (Alt+⇧A)" disabled>
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.02 1.4 1.15.2.04.41.06.62.06H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
+                AUTO <kbd class="key-hint">Alt+⇧A</kbd>
+              </button>
+              <button type="button" class="cmd-btn" data-cmd="FORCE_MAX" aria-pressed="false" title="Paksa kipas 100% secara manual (Alt+⇧M)" disabled>
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                MAX 100% <kbd class="key-hint">Alt+⇧M</kbd>
+              </button>
+              <button type="button" class="cmd-btn" data-cmd="FORCE_OFF" aria-pressed="false" title="Paksa kipas mati 0% (tanpa pintasan demi keselamatan)" disabled>
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                OFF 0%
+              </button>
+            </div>
+
+            <div class="reset-zone">
+              <span class="brand-sub">Mengatur ulang Kalman, FSM &amp; histori</span>
+              <button type="button" class="cmd-btn" id="btn-cmd-reset" data-cmd="RESET" data-variant="danger" disabled>
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+                Reset Sistem
+              </button>
+            </div>
           </section>
 
           <details id="drawer-mqtt" class="panel-card drawer-card">
@@ -3367,7 +3673,7 @@ RENDERED_HTML = """<!DOCTYPE html>
                   <button type="button" class="chip-btn" id="btn-export-log" title="Unduh file log trafik MQTT (.log)">Unduh Log</button>
                   <label class="touch-label" for="sw-autoscroll">
                     <span>Gulir otomatis</span>
-                    <input id="sw-autoscroll" type="checkbox" switch checked>
+                    <input id="sw-autoscroll" type="checkbox" switch role="switch" checked>
                   </label>
                 </div>
               </div>
@@ -3395,21 +3701,58 @@ RENDERED_HTML = """<!DOCTYPE html>
 
   <!-- Sticky Mobile Thumb-Zone Quick Controls -->
   <nav class="mobile-dock" aria-label="Kendali Cepat Mobile">
-    <div id="mob-dock-context" class="mob-dock-context">SITL • Api Cepat • 1x</div>
-    <div id="mob-dock-cmd-status" class="mob-dock-cmd-status" aria-live="polite">Perintah: memeriksa jalur...</div>
+    <div class="mob-dock-meta">
+      <div id="mob-dock-context" class="mob-dock-context">SITL • Api Cepat • 1x</div>
+      <div id="mob-dock-cmd-status" class="mob-dock-cmd-status" aria-live="polite">Perintah: memeriksa jalur...</div>
+    </div>
     <div id="mob-dock-tray" class="mob-dock-tray" hidden>
-      <div class="mob-cmd-scope">
-        <label for="mob-sel-cmd-target">Sasaran Perintah</label>
-        <select id="mob-sel-cmd-target" class="op-select" aria-label="Sasaran Perintah Mobile">
-          <option value="auto" selected>Semua jalur aktif</option>
-          <option value="sitl">Hanya SITL (Python)</option>
-          <option value="esp32">Hanya ESP32 (:6669)</option>
-        </select>
+      <div class="mob-tray-group">
+        <span class="sim-zone-label">Simulasi</span>
+        <div class="mob-quick-sim">
+          <select id="mob-sel-sim-target" class="op-select" aria-label="Target Eksekusi Mobile">
+            <option value="sitl" selected>Target: SITL</option>
+            <option value="hils">Target: HILS (ESP32)</option>
+          </select>
+          <select id="mob-sel-scenario" class="op-select" aria-label="Skenario Simulasi Mobile">
+            <option value="flaming" selected>Api Cepat (flaming)</option>
+            <option value="smolder">Membara (smolder)</option>
+            <option value="clean">Udara Bersih (clean)</option>
+            <option value="fault">Putus Sensor (fault)</option>
+          </select>
+        </div>
+        <div class="mob-speed-row">
+          <span>Kecepatan</span>
+          <div role="toolbar" focusgroup="toolbar wrap" aria-label="Kecepatan Simulasi Mobile" id="mob-speed-toolbar">
+            <button type="button" class="chip-btn mob-spd-btn" data-speed="1" aria-pressed="true">1x</button>
+            <button type="button" class="chip-btn mob-spd-btn" data-speed="5" aria-pressed="false">5x</button>
+            <button type="button" class="chip-btn mob-spd-btn" data-speed="10" aria-pressed="false">10x</button>
+            <button type="button" class="chip-btn mob-spd-btn" data-speed="20" aria-pressed="false">20x</button>
+          </div>
+        </div>
+        <label class="mob-fault-row touch-label" for="mob-sw-preempt">
+          <span>AI Preempt (FORCE MAX Dini)</span>
+          <input id="mob-sw-preempt" type="checkbox" switch role="switch">
+        </label>
+        <label class="mob-fault-row touch-label" for="mob-sw-fault">
+          <span>Injeksi Putus Sensor (FAILSAFE)</span>
+          <input id="mob-sw-fault" type="checkbox" switch role="switch">
+        </label>
       </div>
-      <div class="mob-tray-actions">
-        <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="FORCE_OFF" data-variant="danger" aria-pressed="false" aria-describedby="mob-dock-cmd-status" disabled>OFF 0%</button>
-        <button type="button" class="cmd-btn" id="mob-btn-stop" disabled>Berhenti</button>
-        <button type="button" class="cmd-btn" id="btn-mob-reset" data-cmd="RESET" data-variant="danger" aria-describedby="mob-dock-cmd-status" disabled>Reset Sistem</button>
+      <div class="mob-tray-group">
+        <span class="sim-zone-label">Override &amp; Aksi</span>
+        <div class="mob-cmd-scope" id="mob-cmd-scope-row" hidden>
+          <label for="mob-sel-cmd-target">Sasaran Perintah</label>
+          <select id="mob-sel-cmd-target" class="op-select" aria-label="Sasaran Perintah Mobile">
+            <option value="auto" selected>Semua jalur aktif</option>
+            <option value="sitl">Hanya SITL (Python)</option>
+            <option value="esp32">Hanya ESP32 (:6669)</option>
+          </select>
+        </div>
+        <div class="mob-tray-actions">
+          <button type="button" class="cmd-btn mob-cmd-btn" data-cmd="FORCE_OFF" data-variant="danger" aria-pressed="false" aria-describedby="mob-dock-cmd-status" disabled>OFF 0%</button>
+          <button type="button" class="cmd-btn" id="mob-btn-stop" disabled>Berhenti</button>
+          <button type="button" class="cmd-btn" id="btn-mob-reset" data-cmd="RESET" data-variant="danger" aria-describedby="mob-dock-cmd-status" disabled>Reset Sistem</button>
+        </div>
       </div>
     </div>
     <div class="mob-dock-row">
@@ -3440,21 +3783,45 @@ RENDERED_HTML = """<!DOCTYPE html>
       <button type="button" class="chip-btn" id="help-close">Tutup</button>
     </div>
     <div class="glossary-list">
-      <div><strong>FI (Fusion Index):</strong> Indeks gabungan dalam µg/m³: <code class="topic-tag">FI = PM_Kalman + W_gas × GAS_FULL_PM × g + max(0, dC/dt) × t_lead</code> (W_gas = 0,30; GAS_FULL_PM = 100; t_lead = 15 s). Memicu FSM WASPADA ≥ 55 dan BAHAYA ≥ 150 dengan histeresis pemulihan.</div>
-      <div><strong>PM-proxy Kalman, Mentah &amp; dC/dt:</strong> PM tersaring Median3 + Kalman 2-state; <em>Mentah</em> adalah nilai setelah Median3 sebelum Kalman; dC/dt adalah laju kenaikan asap (µg/m³/s); <code class="topic-tag">Vd</code> tegangan debu Sharp; <code class="topic-tag">V0</code> baseline udara bersih.</div>
-      <div><strong>Gas MQ-135 (<code class="topic-tag">ppm</code>, Skor <code class="topic-tag">g</code>, <code class="topic-tag">Vm</code>):</strong> Estimasi gas pembakaran, skor ternormalisasi 0,00–1,00, dan tegangan ADC MQ-135.</div>
-      <div><strong>Prakiraan AI (<code class="topic-tag">t+60s</code>, <code class="topic-tag">ETA</code>, <code class="topic-tag">MAE</code>):</strong> Regresi linear 60 detik ke depan; ETA = perkiraan waktu menuju BAHAYA; MAE = galat absolut rata-rata prakiraan. Memicu <strong>AI Preempt</strong> (FORCE MAX 100% dini).</div>
-      <div><strong>State FSM &amp; FAILSAFE:</strong> <code class="topic-tag">NORMAL</code>, <code class="topic-tag">WASPADA</code>, <code class="topic-tag">BAHAYA</code>, dan <code class="topic-tag">FAILSAFE</code> (kipas terkunci aman 70% bila kabel debu terputus, kecuali override manual). Sebelum ada data, kartu State menampilkan <em>BELUM ADA DATA</em>.</div>
-      <div><strong>Skenario <em>Putus Sensor (fault)</em> vs Saklar <em>Injeksi Putus Kabel (FAILSAFE)</em>:</strong> skenario fault otomatis memutus sensor debu pada <code class="topic-tag">t=200–230s</code> di dalam simulasi; saklar injeksi memaksa <code class="topic-tag">Vd=0V</code> secara manual kapan saja, tanpa menunggu skenario.</div>
-      <div><strong>SITL vs HILS &amp; Paritas (<code class="topic-tag">ΔFI</code>):</strong> SITL memakai firmware virtual Python; HILS menguji ESP32 fisik <em>lock-step</em> via MQTT :6669 dan membandingkannya dengan firmware referensi. Paritas dinyatakan <strong>OK</strong> bila maks |ΔFI| &lt; 1,0 dan 100% state cocok; selain itu tampil <strong>Cek</strong>.</div>
-      <div><strong>Tujuan Perintah Override:</strong> panel Override memiliki pengunci sasaran (<em>Semua jalur aktif</em>, <em>Hanya SITL (Python)</em>, atau <em>Hanya ESP32 (:6669)</em>) agar pengujian satu jalur tidak mengganggu jalur lain. Tombol dinonaktifkan bila jalur yang dipilih tidak aktif.</div>
-      <div><strong>Skala Kurva &amp; Pemulihan Cepat:</strong> <code class="topic-tag">Gas × 0.2</code>, <code class="topic-tag">g × 100</code>, <code class="topic-tag">Vd/Vm × 50</code> (sumbu kanan tampil otomatis saat kurva diaktifkan). Bila HILS timeout, cek USB/Wi-Fi ESP32 dan pastikan <code class="topic-tag">hils.py</code> tidak berjalan ganda di terminal.</div>
-      <div><strong>Broker :6669 Terputus:</strong> pastikan layanan Mosquitto berjalan (<code class="topic-tag">mosquitto -c mosquitto.conf -d</code>) dan port <code class="topic-tag">6669</code> tidak terblokir firewall.</div>
+      <details class="help-sec" name="help-sec" open>
+        <summary>
+          <span>Metrik DSP &amp; Prakiraan AI</span>
+          <svg class="ico drawer-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+        </summary>
+        <div class="help-sec-body">
+          <div><strong>FI (Fusion Index):</strong> Indeks gabungan dalam µg/m³: <code class="topic-tag">FI = PM_Kalman + W_gas × GAS_FULL_PM × g + max(0, dC/dt) × t_lead</code> (W_gas = 0,30; GAS_FULL_PM = 100; t_lead = 15 s). Memicu FSM WASPADA ≥ 55 dan BAHAYA ≥ 150 dengan histeresis pemulihan.</div>
+          <div><strong>PM-proxy Kalman, Mentah &amp; dC/dt:</strong> PM tersaring Median3 + Kalman 2-state; <em>Mentah</em> adalah nilai setelah Median3 sebelum Kalman; dC/dt adalah laju kenaikan asap (µg/m³/s); <code class="topic-tag">Vd</code> tegangan debu Sharp; <code class="topic-tag">V0</code> baseline udara bersih.</div>
+          <div><strong>Gas MQ-135 (<code class="topic-tag">ppm</code>, Skor <code class="topic-tag">g</code>, <code class="topic-tag">Vm</code>):</strong> Estimasi gas pembakaran, skor ternormalisasi 0,00–1,00, dan tegangan ADC MQ-135.</div>
+          <div><strong>Prakiraan AI (<code class="topic-tag">t+60s</code>, <code class="topic-tag">ETA</code>, <code class="topic-tag">MAE</code>):</strong> Regresi linear 60 detik ke depan; ETA = perkiraan waktu menuju BAHAYA; MAE = galat absolut rata-rata prakiraan. Memicu <strong>AI Preempt</strong> (FORCE MAX 100% dini).</div>
+        </div>
+      </details>
+      <details class="help-sec" name="help-sec">
+        <summary>
+          <span>Mode Simulasi &amp; Kendali Override</span>
+          <svg class="ico drawer-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+        </summary>
+        <div class="help-sec-body">
+          <div><strong>State FSM &amp; FAILSAFE:</strong> <code class="topic-tag">NORMAL</code>, <code class="topic-tag">WASPADA</code>, <code class="topic-tag">BAHAYA</code>, dan <code class="topic-tag">FAILSAFE</code> (kipas terkunci aman 70% bila kabel debu terputus, kecuali override manual). Sebelum ada data, kartu State menampilkan <em>BELUM ADA DATA</em>.</div>
+          <div><strong>Skenario <em>Putus Sensor (fault)</em> vs Saklar <em>Injeksi Putus Kabel (FAILSAFE)</em>:</strong> skenario fault otomatis memutus sensor debu pada <code class="topic-tag">t=200–230s</code> di dalam simulasi; saklar injeksi memaksa <code class="topic-tag">Vd=0V</code> secara manual kapan saja, tanpa menunggu skenario.</div>
+          <div><strong>SITL vs HILS &amp; Paritas (<code class="topic-tag">ΔFI</code>):</strong> SITL memakai firmware virtual Python; HILS menguji ESP32 fisik <em>lock-step</em> via MQTT :6669 dan membandingkannya dengan firmware referensi. Paritas dinyatakan <strong>OK</strong> bila maks |ΔFI| &lt; 1,0 dan 100% state cocok; selain itu tampil <strong>Cek</strong>.</div>
+          <div><strong>Tujuan Perintah Override:</strong> panel Override memiliki pengunci sasaran (<em>Semua jalur aktif</em>, <em>Hanya SITL (Python)</em>, atau <em>Hanya ESP32 (:6669)</em>) agar pengujian satu jalur tidak mengganggu jalur lain. Tombol dinonaktifkan bila jalur yang dipilih tidak aktif.</div>
+        </div>
+      </details>
+      <details class="help-sec" name="help-sec">
+        <summary>
+          <span>Koneksi MQTT &amp; Pemecahan Masalah</span>
+          <svg class="ico drawer-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+        </summary>
+        <div class="help-sec-body">
+          <div><strong>Skala Kurva &amp; Pemulihan Cepat:</strong> <code class="topic-tag">Gas × 0.2</code>, <code class="topic-tag">g × 100</code>, <code class="topic-tag">Vd/Vm × 50</code> (sumbu kanan tampil otomatis saat kurva diaktifkan). Bila HILS timeout, cek USB/Wi-Fi ESP32 dan pastikan <code class="topic-tag">hils.py</code> tidak berjalan ganda di terminal.</div>
+          <div><strong>Broker :6669 Terputus:</strong> pastikan layanan Mosquitto berjalan (<code class="topic-tag">mosquitto -c mosquitto.conf -d</code>) dan port <code class="topic-tag">6669</code> tidak terblokir firewall.</div>
+        </div>
+      </details>
     </div>
     <h3 class="sim-zone-label help-subhead">Pintasan Keyboard</h3>
     <p class="brand-sub">Demi keselamatan, perintah <code class="topic-tag">FORCE OFF (0%)</code> sengaja tidak diberi pintasan keyboard. Tekan <kbd class="key-hint">Esc</kbd> untuk menutup dialog ini.</p>
     <label class="touch-label shortcut-toggle-row" for="sw-shortcuts">
-      <input id="sw-shortcuts" type="checkbox" switch checked>
+      <input id="sw-shortcuts" type="checkbox" switch role="switch" checked>
       <span>Aktifkan pintasan satu tombol (S, P, 1–3, Space)</span>
     </label>
     <div class="shortcut-grid">
@@ -3466,6 +3833,14 @@ RENDERED_HTML = """<!DOCTYPE html>
       <div><kbd class="key-hint">Esc</kbd> Lepas crosshair • <kbd class="key-hint">?</kbd> Bantuan</div>
     </div>
   </dialog>
+
+  <div id="abbr-popover" popover="auto" class="abbr-popover" role="note">
+    <div class="abbr-popover-head">
+      <strong id="abbr-popover-title">Istilah Metrik</strong>
+      <button type="button" class="abbr-popover-close" popovertarget="abbr-popover" popovertargetaction="hide" aria-label="Tutup penjelasan istilah">✕</button>
+    </div>
+    <div id="abbr-popover-body"></div>
+  </div>
 
   <script>
     (() => {
@@ -3608,6 +3983,13 @@ RENDERED_HTML = """<!DOCTYPE html>
         return `${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
       }
 
+      function formatClock(sec) {
+        const s = Math.max(0, Math.round(Number(sec) || 0));
+        const m = Math.floor(s / 60);
+        const rem = s % 60;
+        return `${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+      }
+
       function describeFanState(row) {
         if (!row) return '--';
         if (row.mode === 'FORCE_MAX') return 'Dipaksa Aktif 100%';
@@ -3633,13 +4015,15 @@ RENDERED_HTML = """<!DOCTYPE html>
           pm: '#38bdf8',
           pm_true: '#4ade80',
           pm_raw: '#9ca7b4',
-          forecast: '#e879f9',
-          forecastFill: 'rgba(232,121,249,0.08)',
-          nowLine: 'rgba(232,121,249,0.65)',
-          gas_ppm: '#2dd4bf',
+          forecast: '#cbb2e8',
+          forecastFill: 'rgba(203,178,232,0.08)',
+          nowLine: 'rgba(203,178,232,0.62)',
+          suspendedFill: 'rgba(148,163,184,0.12)',
+          suspendedLine: 'rgba(148,163,184,0.62)',
+          gas_ppm: '#68c89c',
           g_scaled: '#facc15',
           v_dust: '#60a5fa',
-          v_mq: '#a78bfa',
+          v_mq: '#cbb2e8',
           waspada: '#fbbf24',
           bahaya: 'rgba(248,113,113,0.85)',
           fault: '#f472b6',
@@ -3661,6 +4045,8 @@ RENDERED_HTML = """<!DOCTYPE html>
           forecast: '#6d28d9',
           forecastFill: 'rgba(109,40,217,0.06)',
           nowLine: 'rgba(109,40,217,0.55)',
+          suspendedFill: 'rgba(100,116,139,0.10)',
+          suspendedLine: 'rgba(71,85,105,0.52)',
           gas_ppm: '#0f766e',
           g_scaled: '#854d0e',
           v_dust: '#2563eb',
@@ -3708,7 +4094,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           list.push({ label: 'PM Ruang Asap (True)', color: pal.pm_true, style: 'solid' });
         }
         if (state.layers.pm_raw) list.push({ label: 'PM Mentah (Median)', color: pal.pm_raw, style: 'solid' });
-        if (state.layers.forecast) list.push({ label: 'Prakiraan AI (+60s)', color: pal.forecast, style: 'dotted' });
+        if (state.layers.forecast) list.push({ label: 'Prakiraan PM AI (+60s)', color: pal.forecast, style: 'dotted' });
         if (state.layers.gas_ppm) list.push({ label: 'Gas MQ-135 (×0.2)', color: pal.gas_ppm, style: 'dashed' });
         if (state.layers.g_scaled) list.push({ label: 'Skor g (×100)', color: pal.g_scaled, style: 'dotted' });
         if (state.layers.voltages) {
@@ -3765,6 +4151,24 @@ RENDERED_HTML = """<!DOCTYPE html>
           const active = (val === 'system' && norm === null) || (val === norm);
           btn.setAttribute('aria-pressed', active ? 'true' : 'false');
         });
+        const cycBtn = document.getElementById('btn-theme-cycle');
+        const cycIco = document.getElementById('ico-theme-cycle');
+        const cycLbl = document.getElementById('lbl-theme-cycle');
+        if (cycBtn && cycIco) {
+          const lblMap = { light: 'Proyektor', dark: 'Gelap', system: 'Sistem' };
+          const shortMap = { light: 'Terang', dark: 'Gelap', system: 'Sistem' };
+          const pathMap = {
+            light: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+            dark: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+            system: '<circle cx="12" cy="12" r="9"/><path d="M12 3v18"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/>',
+          };
+          const key = norm || 'system';
+          const lbl = `Ganti tema tampilan (Saat ini: ${lblMap[key]})`;
+          cycBtn.setAttribute('aria-label', lbl);
+          cycBtn.title = lbl;
+          cycIco.innerHTML = pathMap[key];
+          if (cycLbl) cycLbl.textContent = shortMap[key];
+        }
         if (persist) savePrefs();
         syncLayerChipColors();
         renderChartLegend();
@@ -3817,10 +4221,10 @@ RENDERED_HTML = """<!DOCTYPE html>
         safetyLive.textContent = msg;
       }
 
-      function syncCanvasSize(canvas, fallbackW, fallbackH) {
+      function syncCanvasSize(canvas, fallbackW, fallbackH, minH = 110) {
         const rect = canvas.getBoundingClientRect();
         const cw = Math.max(260, Math.round(rect.width || fallbackW));
-        const ch = Math.max(110, Math.round(rect.height || fallbackH));
+        const ch = Math.max(minH, Math.round(rect.height || fallbackH));
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
         const pw = Math.round(cw * dpr);
         const ph = Math.round(ch * dpr);
@@ -3839,8 +4243,29 @@ RENDERED_HTML = """<!DOCTYPE html>
         ro.observe(subCanvas);
       }
 
+      function syncMqttLogPlaceholder() {
+        if (!logBox) return;
+        const existingReal = Array.from(logBox.children).some((el) => el.getAttribute('data-placeholder') !== 'true');
+        if (existingReal) return;
+        const sim = state.sim || {};
+        const port = sim.broker_port || 6669;
+        const msg = sim.enable_mqtt === false
+          ? `MQTT dinonaktifkan (--no-mqtt) — log trafik broker :${port} tidak direkam.`
+          : `Belum ada pesan MQTT tercatat pada broker :${port}.`;
+        let ph = logBox.querySelector('[data-placeholder="true"]');
+        if (!ph) {
+          ph = document.createElement('div');
+          ph.className = 'log-line log-empty-note';
+          ph.setAttribute('data-placeholder', 'true');
+          logBox.appendChild(ph);
+        }
+        if (ph.textContent !== msg) ph.textContent = msg;
+      }
+
       function appendMqttLog(line, countAsLog = true) {
         if (!line) return;
+        const ph = logBox.querySelector('[data-placeholder="true"]');
+        if (ph) logBox.removeChild(ph);
         const div = document.createElement('div');
         div.className = 'log-line';
         div.textContent = line;
@@ -3929,14 +4354,21 @@ RENDERED_HTML = """<!DOCTYPE html>
         const banner = document.getElementById('esp-banner');
         const bannerText = document.getElementById('esp-banner-text');
         const wrap = document.getElementById('main-wrap');
-        const hilsTimeoutShown = !!(state.sim && state.sim.target === 'hils' && (state.sim.hils_consec_timeouts > 0 || state.hilsTimeoutInfo));
+        const hilsTimeoutShown = !!(state.sim && state.sim.running && state.sim.target === 'hils' && (state.sim.hils_consec_timeouts > 0 || state.hilsTimeoutInfo));
         const stale = src === 'esp32' && !state.esp.online;
         wrap.classList.toggle('is-stale', stale);
         banner.hidden = !stale || hilsTimeoutShown;
         if (stale) {
-          bannerText.textContent = state.esp.lastRx
-            ? `ESP32 TERPUTUS — tidak ada data sejak ${Math.max(0, Math.round((Date.now() - state.esp.lastRx) / 1000))} detik lalu (grafik dibekukan)`
-            : 'Menunggu ESP32 — belum ada telemetri atau heartbeat dari broker MQTT';
+          const port = (state.sim && state.sim.broker_port) || 6669;
+          if (state.sim && state.sim.enable_mqtt === false) {
+            bannerText.textContent = 'MQTT dinonaktifkan — jalankan dashboard tanpa --no-mqtt untuk menerima telemetri ESP32';
+          } else if (state.sim && !state.sim.broker_connected) {
+            bannerText.textContent = `Broker MQTT :${port} belum terhubung — pastikan Mosquitto aktif sebelum menguji HILS/ESP32`;
+          } else {
+            bannerText.textContent = state.esp.lastRx
+              ? `ESP32 TERPUTUS — tidak ada data sejak ${Math.max(0, Math.round((Date.now() - state.esp.lastRx) / 1000))} detik lalu (grafik dibekukan)`
+              : `Menunggu ESP32 — belum ada telemetri atau heartbeat di broker :${port}`;
+          }
           if (!state.wasEspStale) {
             state.wasEspStale = true;
             announceSafety('ESP32 terputus, grafik dibekukan.');
@@ -3981,7 +4413,7 @@ RENDERED_HTML = """<!DOCTYPE html>
             buildActions: (c) => c.appendChild(makeActionBtn('Muat Snapshot', () => loadStateSnapshot(true))),
             announce: '',
           };
-        } else if (sim && sim.target === 'hils' && (sim.hils_consec_timeouts > 0 || state.hilsTimeoutInfo)) {
+        } else if (sim && sim.running && sim.target === 'hils' && (sim.hils_consec_timeouts > 0 || state.hilsTimeoutInfo)) {
           const info = state.hilsTimeoutInfo || {};
           const consec = info.consec || sim.hils_consec_timeouts || 0;
           const canResume = !!(sim.paused && sim.running);
@@ -4021,6 +4453,8 @@ RENDERED_HTML = """<!DOCTYPE html>
               if (faultOn) {
                 c.appendChild(makeActionBtn('Matikan Injeksi Fault', () => {
                   document.getElementById('sw-fault').checked = false;
+                  const mobSwF = document.getElementById('mob-sw-fault');
+                  if (mobSwF) mobSwF.checked = false;
                   postSim({ fault_inject: false }, 'Injeksi fault dimatikan.');
                 }));
               }
@@ -4165,6 +4599,12 @@ RENDERED_HTML = """<!DOCTYPE html>
           return;
         }
         state.lastRunSummary = summary;
+        const rsTitle = document.getElementById('rs-title');
+        if (rsTitle) {
+          rsTitle.textContent = summary.stopped_early
+            ? `Ringkasan Simulasi (Dihentikan t=${formatClock(summary.duration_s || 0)})`
+            : 'Ringkasan Simulasi Terakhir';
+        }
         document.getElementById('rs-scenario').textContent = SCENARIO_LABELS[summary.scenario] || summary.scenario || '-';
         document.getElementById('rs-target').textContent = (summary.target || 'sitl').toUpperCase();
         document.getElementById('rs-peak').textContent = `${Number(summary.peak_fi || 0).toFixed(1)} µg/m³`;
@@ -4227,21 +4667,29 @@ RENDERED_HTML = """<!DOCTYPE html>
         const hitsSitl = hasSitl && (targetLock === 'auto' || targetLock === 'sitl');
         const hitsEsp = (hasBroker || hasHilsRef) && (targetLock === 'auto' || targetLock === 'esp32');
         const canSend = hitsSitl || hitsEsp;
+        const showScope = (hasSitl && (hasBroker || hasHilsRef)) || (targetLock !== 'auto');
+        const scopeRow = document.getElementById('override-scope-row');
+        if (scopeRow) scopeRow.hidden = !showScope;
+        const mobScopeRow = document.getElementById('mob-cmd-scope-row');
+        if (mobScopeRow) mobScopeRow.hidden = !showScope;
         const viewedSrc = activeSource();
         let tone = 'ok';
         let dest = '';
         let mobDest = '';
         if (!canSend) {
           tone = 'idle';
+          const mqttOff = sim.enable_mqtt === false;
           if (targetLock === 'sitl') {
             dest = 'Perintah nonaktif — mulai simulasi SITL';
             mobDest = 'Nonaktif — mulai SITL';
           } else if (targetLock === 'esp32') {
-            dest = `Perintah nonaktif — broker\u00A0:${port} belum terhubung`;
-            mobDest = `Nonaktif — broker\u00A0:${port} putus`;
+            dest = mqttOff ? 'Perintah nonaktif — MQTT dinonaktifkan' : `Perintah nonaktif — broker\u00A0:${port} belum terhubung`;
+            mobDest = mqttOff ? 'Nonaktif — MQTT mati' : `Nonaktif — broker\u00A0:${port} putus`;
           } else {
-            dest = `Perintah nonaktif — mulai SITL atau sambungkan broker\u00A0:${port}`;
-            mobDest = `Nonaktif — SITL / broker\u00A0:${port}`;
+            dest = mqttOff
+              ? 'Perintah nonaktif — mulai SITL (MQTT dinonaktifkan)'
+              : `Perintah nonaktif — mulai SITL atau sambungkan broker\u00A0:${port}`;
+            mobDest = mqttOff ? 'Nonaktif — mulai SITL (MQTT mati)' : `Nonaktif — SITL / broker\u00A0:${port}`;
           }
         } else {
           if (hitsSitl && hitsEsp) {
@@ -4290,19 +4738,10 @@ RENDERED_HTML = """<!DOCTYPE html>
         const el = document.getElementById('sim-adv-summary');
         if (!el) return;
         const sim = state.sim || {};
-        const spdBtn = document.querySelector('.spd-btn[aria-pressed="true"]');
-        const spd = sim.speed || (spdBtn ? Number(spdBtn.getAttribute('data-speed') || 1) : 1);
-        const swPre = document.getElementById('sw-preempt');
         const swFlt = document.getElementById('sw-fault');
-        const pre = swPre ? swPre.checked : !!sim.ai_preempt;
         const flt = swFlt ? swFlt.checked : !!sim.fault_inject;
-        const parts = [`${spd}x`];
-        if (pre) parts.push('AI Preempt');
-        if (flt) parts.push('Putus Sensor');
-        if (!pre && !flt) parts.push('Standar');
-        el.textContent = parts.join(' • ');
+        el.textContent = flt ? 'Injeksi Fault' : 'Standar';
         if (flt) el.setAttribute('data-tone', 'fault');
-        else if (pre) el.setAttribute('data-tone', 'accent');
         else el.removeAttribute('data-tone');
       }
 
@@ -4341,11 +4780,12 @@ RENDERED_HTML = """<!DOCTYPE html>
         const showParity = parity && parity.samples > 0 && (activeSource() === 'esp32' || (sim && sim.target === 'hils'));
         if (showParity && parity.last_delta_fi != null) {
           const ok = parity.max_delta_fi < 1.0 && parity.state_matches === parity.samples;
+          const maxDeltaFi = parity.max_delta_fi != null ? parity.max_delta_fi : parity.last_delta_fi;
           badge.hidden = false;
           badge.setAttribute('data-tone', ok ? 'ok' : 'warn');
-          badge.textContent = `Paritas HILS: ΔFI ${parity.last_delta_fi.toFixed(2)} (${parity.state_matches}/${parity.samples} sama)`;
+          badge.textContent = `Paritas HILS: maks ΔFI ${maxDeltaFi.toFixed(2)} (${parity.state_matches}/${parity.samples} sama)`;
           kpiWrap.hidden = false;
-          kpiParity.textContent = `Δ${parity.last_delta_fi.toFixed(2)} (${ok ? 'OK' : 'Cek'})`;
+          kpiParity.textContent = `maks Δ${maxDeltaFi.toFixed(2)} • ${parity.state_matches}/${parity.samples} (${ok ? 'OK' : 'Cek'})`;
           kpiParity.style.color = ok ? 'var(--ok)' : 'var(--warn)';
         } else {
           badge.hidden = true;
@@ -4477,14 +4917,13 @@ RENDERED_HTML = """<!DOCTYPE html>
         document.getElementById('kpi-state').textContent = st;
         document.getElementById('kpi-state-wrap').style.color = colorMap[st] || 'var(--ok)';
         document.getElementById('kpi-mode').textContent = row.mode || 'AUTO';
-        document.getElementById('kpi-t').textContent = formatTime(row.t ?? 0);
         const activeSim = sim || state.sim;
         const durEl = document.getElementById('kpi-t-dur');
+        const showDur = !!(durEl && activeSim && Number(activeSim.duration) > 0 && (activeSim.running || activeSource() === 'sitl' || activeSim.target === 'hils'));
+        document.getElementById('kpi-t').textContent = showDur ? formatClock(row.t ?? 0) : formatTime(row.t ?? 0);
         if (durEl) {
-          const dur = activeSim && Number(activeSim.duration);
-          const showDur = dur > 0 && (activeSim.running || activeSource() === 'sitl' || activeSim.target === 'hils');
           if (showDur) {
-            durEl.textContent = ` / ${formatTime(dur)}`;
+            durEl.textContent = ` / ${formatClock(Number(activeSim.duration))}`;
             durEl.hidden = false;
           } else {
             durEl.textContent = '';
@@ -4528,7 +4967,7 @@ RENDERED_HTML = """<!DOCTYPE html>
           if (pmUnitEl) pmUnitEl.hidden = true;
           if (pmWrapEl) pmWrapEl.style.color = 'var(--fault)';
           if (pmFrozEl) {
-            pmFrozEl.textContent = `Terakhir: ${(row.pm ?? 0).toFixed(1)} µg/m³ (beku)`;
+            pmFrozEl.textContent = `Beku: ${(row.pm ?? 0).toFixed(1)} µg/m³`;
             pmFrozEl.hidden = false;
           }
         } else {
@@ -4562,8 +5001,8 @@ RENDERED_HTML = """<!DOCTYPE html>
           document.getElementById('kpi-fc-wrap').style.color = 'var(--fault)';
           if (fcFrozEl) {
             fcFrozEl.textContent = fcVal != null
-              ? `Terakhir: ${fcVal.toFixed(1)} µg/m³ (beku)`
-              : 'Prakiraan dijeda (sensor debu putus)';
+              ? `Beku: ${fcVal.toFixed(1)} µg/m³`
+              : 'Dijeda (sensor putus)';
             fcFrozEl.hidden = false;
           }
           document.getElementById('kpi-eta').textContent = '— (FAILSAFE)';
@@ -4578,8 +5017,8 @@ RENDERED_HTML = """<!DOCTYPE html>
           document.getElementById('kpi-fc-wrap').style.color =
             fcVal == null ? 'var(--text-muted)'
             : (fcVal >= 150 ? 'var(--danger)' : (fcVal >= 55 ? 'var(--warn)' : 'var(--violet)'));
-          if (st === 'BAHAYA' && row.eta_bahaya_s != null && row.eta_bahaya_s <= 0.5) {
-            document.getElementById('kpi-eta').textContent = 'Tercapai';
+          if (st === 'BAHAYA') {
+            document.getElementById('kpi-eta').textContent = 'Tercapai (FI ≥ 150)';
           } else {
             document.getElementById('kpi-eta').textContent = row.eta_bahaya_s != null ? `${row.eta_bahaya_s.toFixed(0)} s` : '-';
           }
@@ -4616,33 +5055,45 @@ RENDERED_HTML = """<!DOCTYPE html>
           document.querySelectorAll('.tgt-btn').forEach((b) => {
             b.setAttribute('aria-pressed', b.getAttribute('data-target') === sim.target ? 'true' : 'false');
           });
+          const mobSelTgt = document.getElementById('mob-sel-sim-target');
+          if (mobSelTgt) mobSelTgt.value = sim.target;
           document.getElementById('hils-concurrency-hint').hidden = sim.target !== 'hils';
         }
         if (sim.scenario && (!dlg || !dlg.open)) {
           document.getElementById('sel-scenario').value = sim.scenario;
+          const mobSelScen = document.getElementById('mob-sel-scenario');
+          if (mobSelScen) mobSelScen.value = sim.scenario;
         }
         if (sim.speed != null) {
-          document.querySelectorAll('.spd-btn').forEach((b) => {
+          document.querySelectorAll('.spd-btn, .mob-spd-btn').forEach((b) => {
             b.setAttribute('aria-pressed', Number(b.getAttribute('data-speed')) === Number(sim.speed) ? 'true' : 'false');
           });
         }
         if (typeof sim.ai_preempt === 'boolean') {
           document.getElementById('sw-preempt').checked = sim.ai_preempt;
+          const mobSwPre = document.getElementById('mob-sw-preempt');
+          if (mobSwPre) mobSwPre.checked = sim.ai_preempt;
         }
+        syncMqttLogPlaceholder();
         if (typeof sim.fault_inject === 'boolean') {
           document.getElementById('sw-fault').checked = sim.fault_inject;
+          const mobSwFault = document.getElementById('mob-sw-fault');
+          if (mobSwFault) mobSwFault.checked = sim.fault_inject;
         }
-        if (sim.running && sim.hils_consec_timeouts === 0) {
+        if (!sim.running || (sim.running && sim.hils_consec_timeouts === 0)) {
           state.hilsTimeoutInfo = null;
         }
 
         const tgtLabel = (sim.target || 'sitl').toUpperCase();
         const bSim = document.getElementById('badge-sim-state');
         if (bSim) {
-          bSim.hidden = !!sim.running;
+          bSim.hidden = !!(sim.running && !sim.paused);
           if (!sim.running) {
             bSim.textContent = 'Tidak aktif';
             bSim.removeAttribute('data-tone');
+          } else if (sim.paused) {
+            bSim.textContent = 'Dijeda';
+            bSim.setAttribute('data-tone', 'warn');
           }
         }
 
@@ -4658,11 +5109,12 @@ RENDERED_HTML = """<!DOCTYPE html>
         lblStart.textContent = sim.running ? 'Ulang' : 'Mulai';
         if (kbdStart) kbdStart.hidden = !!sim.running;
         btnPause.disabled = !sim.running;
-        btnPause.setAttribute('aria-pressed', sim.paused ? 'true' : 'false');
+        btnPause.classList.toggle('btn-primary', !!(sim.running && sim.paused));
+        btnPause.setAttribute('aria-pressed', 'false');
         lblPause.textContent = sim.paused ? 'Lanjut' : 'Jeda';
         btnStop.disabled = !sim.running;
         if (mobPlay) {
-          mobPlay.classList.toggle('btn-primary', !sim.running);
+          mobPlay.classList.toggle('btn-primary', !sim.running || !!(sim.running && sim.paused));
           mobPlay.textContent = !sim.running ? 'Mulai' : (sim.paused ? 'Lanjut' : 'Jeda');
         }
         if (mobStop) mobStop.disabled = !sim.running;
@@ -4727,7 +5179,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         syncHoverDismissBtn();
       }
 
-      function getChartPads(w) {
+      function getChartPads(w, hasRightAxis = false) {
         const compact = w < 520;
         const fsmCompact = w < 420;
         const isProj = window.matchMedia('(max-height: 820px) and (min-width: 1280px)').matches;
@@ -4737,13 +5189,13 @@ RENDERED_HTML = """<!DOCTYPE html>
           isProj,
           chartScale: isProj ? 1.15 : 1,
           padL: compact ? 46 : (isProj ? 60 : 54),
-          padR: fsmCompact ? 52 : (isProj ? 92 : 84),
+          padR: hasRightAxis ? (fsmCompact ? 52 : (isProj ? 92 : 84)) : 16,
         };
       }
 
       function drawCharts() {
-        syncCanvasSize(mainCanvas, 960, 320);
-        syncCanvasSize(subCanvas, 960, 150);
+        syncCanvasSize(mainCanvas, 960, 320, 110);
+        syncCanvasSize(subCanvas, 960, 150, 72);
 
         const w = mainCanvas._cw;
         const h = mainCanvas._ch;
@@ -4762,7 +5214,8 @@ RENDERED_HTML = """<!DOCTYPE html>
         const monoFont = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
 
         const rows = state.history;
-        const { compact, fsmCompact, chartScale, padL, padR } = getChartPads(w);
+        const hasRightAxis = !!(state.layers.gas_ppm || state.layers.g_scaled || state.layers.voltages);
+        const { compact, fsmCompact, chartScale, padL, padR } = getChartPads(w, hasRightAxis);
         const fs = (px) => Math.max(12, Math.round(px * chartScale));
         const lw = (px) => Number((px * chartScale).toFixed(2));
         const padT = 26;
@@ -4770,17 +5223,46 @@ RENDERED_HTML = """<!DOCTYPE html>
         const plotW = Math.max(40, w - padL - padR);
         const plotH = Math.max(40, h - padT - padB);
 
-        const sPadT = 24, sPadB = 10;
-        const sInnerH = Math.max(54, sh - sPadT - sPadB);
+        const sPadT = 22, sPadB = 8;
+        const sInnerH = Math.max(42, sh - sPadT - sPadB);
         const dutyTop = sPadT;
-        const dutyH = Math.max(28, Math.round(sInnerH * 0.58));
+        const dutyH = Math.max(22, Math.round(sInnerH * 0.56));
         const dutyBot = dutyTop + dutyH;
-        const sepY = dutyBot + Math.max(3, Math.round(sInnerH * 0.06));
-        const ribbonTop = dutyBot + Math.max(6, Math.round(sInnerH * 0.12));
-        const ribbonH = Math.max(18, sh - sPadB - ribbonTop);
+        const sepY = dutyBot + Math.max(2, Math.round(sInnerH * 0.06));
+        const ribbonTop = dutyBot + Math.max(5, Math.round(sInnerH * 0.12));
+        const ribbonH = Math.max(15, sh - sPadB - ribbonTop);
         const syOf = (v) => dutyTop + dutyH - (Math.max(0, Math.min(100, v)) / 100) * dutyH;
 
-        function drawSubBase() {
+        function drawSubHeader() {
+          sCtx.font = `700 ${fs(12)}px system-ui, sans-serif`;
+          sCtx.fillStyle = palette.duty;
+          sCtx.fillRect(padL, 8, 12, 3);
+          sCtx.fillStyle = palette.text;
+          const dutyLegTxt = compact ? 'Duty %' : 'Duty Kipas (0–100%)';
+          sCtx.fillText(dutyLegTxt, padL + 16, 14);
+
+          const fsmLegX = padL + 22 + Math.ceil(sCtx.measureText(dutyLegTxt).width);
+          sCtx.fillStyle = palette.fsm;
+          sCtx.fillRect(fsmLegX, 8, 12, 3);
+          sCtx.fillStyle = palette.text;
+          const fsmLegTxt = compact ? 'FSM' : 'Pita State FSM';
+          sCtx.fillText(fsmLegTxt, fsmLegX + 16, 14);
+
+          const fsLegX = fsmLegX + 22 + Math.ceil(sCtx.measureText(fsmLegTxt).width);
+          const fsLegLbl = '70% FAILSAFE';
+          if (fsLegX + 18 + Math.ceil(sCtx.measureText(fsLegLbl).width) <= sw - 4) {
+            sCtx.save();
+            sCtx.strokeStyle = palette.fault;
+            sCtx.lineWidth = 2;
+            sCtx.setLineDash([4, 3]);
+            sCtx.beginPath(); sCtx.moveTo(fsLegX, 9.5); sCtx.lineTo(fsLegX + 12, 9.5); sCtx.stroke();
+            sCtx.restore();
+            sCtx.fillStyle = palette.fault;
+            sCtx.fillText(fsLegLbl, fsLegX + 16, 14);
+          }
+        }
+
+        function drawSubGrid() {
           sCtx.strokeStyle = palette.grid;
           sCtx.fillStyle = palette.text;
           sCtx.font = `${fs(12)}px ${monoFont}`;
@@ -4809,55 +5291,31 @@ RENDERED_HTML = """<!DOCTYPE html>
           sCtx.font = `700 ${fs(12)}px ${monoFont}`;
           sCtx.fillStyle = palette.text;
           sCtx.fillText('FSM', 6, ribbonTop + ribbonH / 2 + 4);
-
-          sCtx.font = `700 ${fs(12)}px system-ui, sans-serif`;
-          sCtx.fillStyle = palette.duty;
-          sCtx.fillRect(padL, 8, 14, 3);
-          sCtx.fillStyle = palette.text;
-          const dutyLegTxt = 'Duty Kipas (0–100%)';
-          sCtx.fillText(dutyLegTxt, padL + 18, 14);
-
-          const fsmLegX = padL + 24 + Math.ceil(sCtx.measureText(dutyLegTxt).width);
-          sCtx.fillStyle = palette.fsm;
-          sCtx.fillRect(fsmLegX, 8, 14, 3);
-          sCtx.fillStyle = palette.text;
-          const fsmLegTxt = 'Pita State FSM';
-          sCtx.fillText(fsmLegTxt, fsmLegX + 18, 14);
-
-          if (!compact) {
-            const fsLegX = fsmLegX + 26 + Math.ceil(sCtx.measureText(fsmLegTxt).width);
-            if (fsLegX + 110 < sw - padR) {
-              sCtx.save();
-              sCtx.strokeStyle = palette.fault;
-              sCtx.lineWidth = 2;
-              sCtx.setLineDash([4, 3]);
-              sCtx.beginPath(); sCtx.moveTo(fsLegX, 9.5); sCtx.lineTo(fsLegX + 14, 9.5); sCtx.stroke();
-              sCtx.restore();
-              sCtx.fillStyle = palette.fault;
-              sCtx.fillText('70% FAILSAFE', fsLegX + 18, 14);
-            }
-          }
         }
 
-        drawSubBase();
-
         if (!rows.length) {
-          mCtx.fillStyle = palette.text;
-          mCtx.font = `600 ${fs(13)}px system-ui, sans-serif`;
-          const actionLoc = window.matchMedia('(max-width: 1279px)').matches ? 'di panel bawah' : 'di panel kanan';
-          const msg = activeSource() === 'esp32'
+          const isEspWaiting = activeSource() === 'esp32' && !state.esp.online;
+          const isMobileLayout = window.matchMedia('(max-width: 767px)').matches;
+          const actionLoc = isMobileLayout ? 'di bilah bawah' : (window.matchMedia('(max-width: 1279px)').matches ? 'di panel bawah' : 'di panel kanan');
+          const msg = isEspWaiting
             ? 'Menunggu telemetri ESP32 dari broker MQTT (:6669)...'
             : `Belum ada data SITL — tekan "Mulai" ${actionLoc}.`;
-          mCtx.fillText(msg, padL + 12, h / 2, w - padL - padR - 24);
+          if (!isEspWaiting) {
+            mCtx.fillStyle = palette.text;
+            mCtx.font = `600 ${fs(13)}px system-ui, sans-serif`;
+            mCtx.fillText(msg, padL + 12, h / 2, w - padL - padR - 24);
+          }
 
           sCtx.fillStyle = palette.muted;
           sCtx.font = `600 ${fs(12)}px system-ui, sans-serif`;
-          sCtx.fillText('Belum ada histori duty kipas & pita state FSM.', padL + 12, dutyTop + dutyH / 2 + 4, sw - padL - padR - 24);
+          sCtx.fillText('Belum ada histori duty kipas & pita state FSM.', padL + 12, (sh / 2) + 4, sw - padL - padR - 24);
           document.getElementById('chart-sr-summary').textContent = msg;
           const subSr = document.getElementById('subchart-sr-summary');
           if (subSr) subSr.textContent = 'Belum ada histori duty kipas dan state FSM.';
           return;
         }
+        drawSubHeader();
+        drawSubGrid();
 
         const monotonic = [];
         for (const r of rows) {
@@ -4903,16 +5361,16 @@ RENDERED_HTML = """<!DOCTYPE html>
           const xRight = w - padR;
           if (xNow < xRight) {
             mCtx.save();
-            mCtx.fillStyle = latestIsFault ? palette.faultFill : palette.forecastFill;
+            mCtx.fillStyle = latestIsFault ? palette.suspendedFill : palette.forecastFill;
             mCtx.fillRect(xNow, padT, xRight - xNow, plotH);
-            mCtx.strokeStyle = latestIsFault ? palette.fault : palette.nowLine;
+            mCtx.strokeStyle = latestIsFault ? palette.suspendedLine : palette.nowLine;
             mCtx.lineWidth = 1.25;
             mCtx.setLineDash([4, 3]);
             mCtx.beginPath();
             mCtx.moveTo(xNow, padT);
             mCtx.lineTo(xNow, h - padB);
             mCtx.stroke();
-            mCtx.fillStyle = latestIsFault ? palette.fault : palette.forecast;
+            mCtx.fillStyle = latestIsFault ? palette.muted : palette.forecast;
             mCtx.font = `700 ${fs(12)}px ${monoFont}`;
             const nowLbl = latestIsFault
               ? (compact ? 'PRAKIRAAN JEDA' : 'PRAKIRAAN DITANGGUHKAN')
@@ -4964,7 +5422,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         if (rightAxes.length > 0) {
           mCtx.font = `700 ${fs(12)}px ${monoFont}`;
           mCtx.fillStyle = rightAxes[0].color;
-          const unitHdr = rightAxes.map((a) => a.unit).join('/');
+          const unitHdr = fsmCompact ? rightAxes[0].unit : rightAxes.map((a) => a.unit).join('/');
           mCtx.fillText(unitHdr, w - padR + 4, 15, padR - 6);
         }
 
@@ -4987,6 +5445,8 @@ RENDERED_HTML = """<!DOCTYPE html>
         }
 
         // Threshold lines (when within current Y range) + tight-zoom note when < 55
+        const latestRowForThr = visible.length ? visible[visible.length - 1] : null;
+        const earlyFaultThr = !!(latestRowForThr && (latestRowForThr.state === 'FAILSAFE' || latestRowForThr.sensor_fault) && xOf(maxT) < padL + 170);
         if (state.layers.thresholds) {
           mCtx.save();
           mCtx.font = `700 ${fs(12)}px system-ui, sans-serif`;
@@ -4996,14 +5456,18 @@ RENDERED_HTML = """<!DOCTYPE html>
             mCtx.strokeStyle = palette.waspada;
             mCtx.beginPath(); mCtx.moveTo(padL, yW); mCtx.lineTo(w - padR, yW); mCtx.stroke();
             mCtx.fillStyle = palette.waspada;
-            mCtx.fillText('WASPADA (55)', padL + 6, yW - 5);
+            const wLbl = 'WASPADA (55)';
+            const wX = earlyFaultThr ? (w - padR - mCtx.measureText(wLbl).width - 8) : (padL + 6);
+            mCtx.fillText(wLbl, wX, yW - 5);
           }
           if (150 <= maxY) {
             const yB = yOf(150);
             mCtx.strokeStyle = palette.bahaya;
             mCtx.beginPath(); mCtx.moveTo(padL, yB); mCtx.lineTo(w - padR, yB); mCtx.stroke();
             mCtx.fillStyle = palette.bahaya;
-            mCtx.fillText('BAHAYA (150)', padL + 6, yB - 5);
+            const bLbl = 'BAHAYA (150)';
+            const bX = earlyFaultThr ? (w - padR - mCtx.measureText(bLbl).width - 8) : (padL + 6);
+            mCtx.fillText(bLbl, bX, yB - 5);
           }
           if (state.zoomY && maxY < 55) {
             mCtx.setLineDash([]);
@@ -5056,18 +5520,21 @@ RENDERED_HTML = """<!DOCTYPE html>
           const isF = r.state === 'FAILSAFE' || !!r.sensor_fault;
           if (!isF) continue;
           const rt = r.t ?? 0;
-          const nextT = (i + 1 < visible.length) ? (visible[i + 1].t ?? rt) : Math.max(rt + 1, minT + spanT * 0.015);
+          const nextT = (i + 1 < visible.length) ? (visible[i + 1].t ?? rt) : rt;
           if (faultSegs.length && Math.abs(faultSegs[faultSegs.length - 1].endT - rt) <= 2.0) {
             faultSegs[faultSegs.length - 1].endT = Math.max(faultSegs[faultSegs.length - 1].endT, nextT);
           } else {
-            faultSegs.push({ startT: rt, endT: Math.max(rt + 0.5, nextT) });
+            faultSegs.push({ startT: rt, endT: nextT });
           }
         }
         if (faultSegs.length) {
+          const xNowEdge = state.layers.forecast ? Math.min(w - padR, xOf(maxT)) : (w - padR);
           mCtx.save();
           faultSegs.forEach((seg) => {
             const x1 = Math.max(padL, xOf(seg.startT));
-            const x2 = Math.min(w - padR, Math.max(x1 + 3, xOf(seg.endT)));
+            const rawX2 = xOf(seg.endT);
+            const clampRight = seg.endT >= maxT ? xNowEdge : (w - padR);
+            const x2 = Math.min(w - padR, Math.max(x1 + 3, Math.min(clampRight, rawX2)));
             const segW = Math.max(2, x2 - x1);
             mCtx.fillStyle = palette.faultFill;
             mCtx.fillRect(x1, padT, segW, plotH);
@@ -5076,20 +5543,25 @@ RENDERED_HTML = """<!DOCTYPE html>
             mCtx.setLineDash([4, 3]);
             mCtx.beginPath();
             mCtx.moveTo(x1, padT); mCtx.lineTo(x1, h - padB);
-            mCtx.moveTo(x2, padT); mCtx.lineTo(x2, h - padB);
+            if (!(state.layers.forecast && Math.abs(x2 - xOf(maxT)) < 2.5)) {
+              mCtx.moveTo(x2, padT); mCtx.lineTo(x2, h - padB);
+            }
             mCtx.stroke();
-            if (segW >= 42) {
+            if (segW >= 18) {
               mCtx.font = `700 ${fs(12)}px ${monoFont}`;
-              const lbl = segW >= 120 ? 'FAILSAFE (Vd=0V)' : (segW >= 64 ? 'FAILSAFE' : 'FAIL');
-              const lblW = Math.min(segW - 10, mCtx.measureText(lbl).width);
-              const lblY = h - padB - 12;
-              mCtx.save();
-              mCtx.fillStyle = palette.exportBg;
-              mCtx.globalAlpha = 0.92;
-              mCtx.fillRect(x1 + 3, lblY - 11, lblW + 6, 15);
-              mCtx.restore();
-              mCtx.fillStyle = palette.fault;
-              mCtx.fillText(lbl, x1 + 6, lblY, segW - 12);
+              const lbl = segW >= 124 ? 'FAILSAFE (Vd=0V)' : 'FAILSAFE';
+              const lblW = mCtx.measureText(lbl).width;
+              const lblY = Math.round(padT + plotH * 0.44);
+              const pillX = Math.min(xNowEdge - lblW - 8, Math.max(padL + 3, x1 + 3));
+              if (pillX >= padL && pillX + lblW + 6 <= xNowEdge + 2) {
+                mCtx.save();
+                mCtx.fillStyle = palette.exportBg;
+                mCtx.globalAlpha = 0.94;
+                mCtx.fillRect(pillX, lblY - 11, lblW + 6, 15);
+                mCtx.restore();
+                mCtx.fillStyle = palette.fault;
+                mCtx.fillText(lbl, pillX + 3, lblY);
+              }
             }
           });
           mCtx.restore();
@@ -5110,7 +5582,32 @@ RENDERED_HTML = """<!DOCTYPE html>
             plotSeries((r) => (r.state === 'FAILSAFE' || r.sensor_fault) ? r.fi : null, palette.fault, lw(1.8), [5, 4]);
           }
         }
-        if (state.layers.forecast && !latestIsFault) plotSeries((r) => r.forecast, palette.forecast, lw(2.4), [3, 3], 60, true);
+        if (state.layers.forecast && !latestIsFault) {
+          mCtx.save();
+          mCtx.globalAlpha = 0.52;
+          plotSeries((r) => (((r.t ?? 0) + 60) <= maxT ? r.forecast : null), palette.forecast, lw(1.6), [2, 3], 60, false);
+          mCtx.restore();
+          if (latestVisible && latestVisible.forecast != null) {
+            mCtx.save();
+            mCtx.strokeStyle = palette.forecast;
+            mCtx.lineWidth = lw(2.5);
+            mCtx.setLineDash([5, 4]);
+            const x0 = xOf(maxT);
+            const y0 = yOf(latestVisible.pm ?? 0);
+            const x1 = xOf(maxT + 60);
+            const y1 = yOf(latestVisible.forecast);
+            mCtx.beginPath();
+            mCtx.moveTo(x0, y0);
+            mCtx.lineTo(x1, y1);
+            mCtx.stroke();
+            mCtx.setLineDash([]);
+            mCtx.fillStyle = palette.forecast;
+            mCtx.beginPath();
+            mCtx.arc(x1, y1, 4, 0, Math.PI * 2);
+            mCtx.fill();
+            mCtx.restore();
+          }
+        }
 
         // Sub-chart Lane 1 (Upper): Duty Kipas (%) step function
         function plotStepSub(extractYFn, color, width, dash = []) {
@@ -5169,20 +5666,23 @@ RENDERED_HTML = """<!DOCTYPE html>
             const r = visible[i];
             const stName = r.state || 'NORMAL';
             const rt = r.t ?? 0;
-            const nextT = (i + 1 < visible.length) ? (visible[i + 1].t ?? rt) : Math.max(rt + 1, minT + spanT * 0.015);
+            const nextT = (i + 1 < visible.length) ? (visible[i + 1].t ?? rt) : rt;
             if (segments.length && segments[segments.length - 1].state === stName) {
               segments[segments.length - 1].endT = Math.max(segments[segments.length - 1].endT, nextT);
             } else {
-              segments.push({ state: stName, startT: rt, endT: Math.max(rt + 0.5, nextT) });
+              segments.push({ state: stName, startT: rt, endT: nextT });
             }
           }
           sCtx.save();
+          const sxNowBound = state.layers.forecast ? Math.min(sw - padR, xOf(maxT)) : (sw - padR);
           let lastSegLabeled = false;
           let lastSegX2 = padL;
           segments.forEach((seg, segIdx) => {
             const stStyle = ribbonStyles[seg.state] || ribbonStyles.NORMAL;
             const x1 = Math.max(padL, xOf(seg.startT));
-            const x2 = Math.min(sw - padR, Math.max(x1 + 3, xOf(seg.endT)));
+            const rawX2 = xOf(seg.endT);
+            const clampRight = seg.endT >= maxT ? Math.max(x1 + 3, sxNowBound) : (sw - padR);
+            const x2 = Math.min(sw - padR, Math.max(x1 + 3, Math.min(clampRight, rawX2)));
             const segW = Math.max(2, x2 - x1);
             if (segIdx === segments.length - 1) lastSegX2 = x2;
             sCtx.fillStyle = stStyle.fill;
@@ -5227,13 +5727,40 @@ RENDERED_HTML = """<!DOCTYPE html>
           if (lastSeg && !lastSegLabeled) {
             const stStyle = ribbonStyles[lastSeg.state] || ribbonStyles.NORMAL;
             const tailLbl = fsmCompact ? stStyle.short : lastSeg.state;
-            sCtx.fillStyle = stStyle.stroke;
             sCtx.font = `700 ${fs(12)}px ${monoFont}`;
             const tailW = sCtx.measureText(tailLbl).width;
-            const tailX = Math.min(sw - tailW - 4, lastSegX2 + 6);
+            const fitInsidePast = (sxNowBound - padL) >= (tailW + 6);
+            const tailX = fitInsidePast
+              ? Math.max(padL + 2, Math.min(lastSegX2 - tailW - 3, sxNowBound - tailW - 3))
+              : Math.min(sw - tailW - 6, lastSegX2 + 6);
+            sCtx.save();
+            sCtx.fillStyle = palette.exportBg;
+            sCtx.globalAlpha = 0.88;
+            sCtx.fillRect(tailX - 2, ribbonTop + 2, tailW + 4, ribbonH - 4);
+            sCtx.restore();
+            sCtx.fillStyle = stStyle.stroke;
             sCtx.fillText(tailLbl, tailX, ribbonTop + ribbonH / 2 + 4);
           }
           sCtx.restore();
+        }
+
+        // Sync vertical SEKARANG boundary on sub-chart so ribbon end aligns with main-chart horizon
+        if (state.layers.forecast) {
+          const sxNow = xOf(maxT);
+          const sxRight = sw - padR;
+          if (sxNow < sxRight) {
+            sCtx.save();
+            sCtx.fillStyle = latestIsFault ? palette.suspendedFill : palette.forecastFill;
+            sCtx.fillRect(sxNow, dutyTop, sxRight - sxNow, ribbonTop + ribbonH - dutyTop);
+            sCtx.strokeStyle = latestIsFault ? palette.suspendedLine : palette.nowLine;
+            sCtx.lineWidth = 1.25;
+            sCtx.setLineDash([4, 3]);
+            sCtx.beginPath();
+            sCtx.moveTo(sxNow, dutyTop);
+            sCtx.lineTo(sxNow, ribbonTop + ribbonH);
+            sCtx.stroke();
+            sCtx.restore();
+          }
         }
 
         const lastVisible = visible[visible.length - 1];
@@ -5263,23 +5790,41 @@ RENDERED_HTML = """<!DOCTYPE html>
             state.hoverIdx = nearestIdx;
             const nearest = visible[nearestIdx];
             if (nearest) {
+              const rowIsFault = (nearest.state === 'FAILSAFE' || !!nearest.sensor_fault);
               if (state.hoverFromKey) {
                 state.hoverFromKey = false;
                 const lr = document.getElementById('chart-live-readout');
                 if (lr) {
-                  lr.textContent = `Inspeksi t=${(nearest.t ?? 0).toFixed(0)} detik, ${nearest.state}, FI ${(nearest.fi ?? 0).toFixed(1)}, PM ${(nearest.pm ?? 0).toFixed(1)}, Kipas ${(nearest.duty ?? 0).toFixed(0)} persen.`;
+                  lr.textContent = rowIsFault
+                    ? `Inspeksi t=${(nearest.t ?? 0).toFixed(0)} detik, FAILSAFE, FI tidak valid (sensor debu putus), PM beku ${(nearest.pm ?? 0).toFixed(1)}, Prakiraan ditangguhkan, Kipas ${(nearest.duty ?? 0).toFixed(0)} persen.`
+                    : `Inspeksi t=${(nearest.t ?? 0).toFixed(0)} detik, ${nearest.state}, FI ${(nearest.fi ?? 0).toFixed(1)}, PM ${(nearest.pm ?? 0).toFixed(1)}, Kipas ${(nearest.duty ?? 0).toFixed(0)} persen.`;
                 }
               }
               const cx = xOf(nearest.t ?? 0);
               const lines = [
                 { font: `700 ${fs(12)}px ${monoFont}`, text: `t=${(nearest.t ?? 0).toFixed(0)}s | FSM:${nearest.state}` },
-                { font: `${fs(12)}px ${monoFont}`, text: `FI:${(nearest.fi ?? 0).toFixed(1)} | PM:${(nearest.pm ?? 0).toFixed(1)}` },
+                {
+                  font: `${fs(12)}px ${monoFont}`,
+                  text: rowIsFault
+                    ? `FI:TIDAK VALID | PM:beku (${(nearest.pm ?? 0).toFixed(1)})`
+                    : `FI:${(nearest.fi ?? 0).toFixed(1)} | PM:${(nearest.pm ?? 0).toFixed(1)}`,
+                },
                 { font: `${fs(12)}px ${monoFont}`, text: `Gas:${(nearest.gas_ppm ?? 400).toFixed(0)}ppm (g=${(nearest.g ?? 0).toFixed(2)})` },
-                { font: `${fs(12)}px ${monoFont}`, text: `Duty:${(nearest.duty ?? 0).toFixed(0)}% | Fc:${nearest.forecast != null ? nearest.forecast.toFixed(1) : '-'}` },
+                {
+                  font: `${fs(12)}px ${monoFont}`,
+                  text: rowIsFault
+                    ? `Duty:${(nearest.duty ?? 0).toFixed(0)}% | Fc:DITANGGUHKAN`
+                    : `Duty:${(nearest.duty ?? 0).toFixed(0)}% | Fc:${nearest.forecast != null ? nearest.forecast.toFixed(1) : '-'}`,
+                },
               ];
               if (state.layers.pm_true || state.layers.pm_raw) {
                 const pt = nearest.pm_true != null ? nearest.pm_true.toFixed(1) : '-';
-                lines.push({ font: `${fs(12)}px ${monoFont}`, text: `True:${pt} | Mentah:${(nearest.pm_raw ?? 0).toFixed(1)} | dC:${(nearest.dcdt ?? 0).toFixed(2)}` });
+                lines.push({
+                  font: `${fs(12)}px ${monoFont}`,
+                  text: rowIsFault
+                    ? `True:${pt} | Mentah:-- | dC:beku`
+                    : `True:${pt} | Mentah:${(nearest.pm_raw ?? 0).toFixed(1)} | dC:${(nearest.dcdt ?? 0).toFixed(2)}`,
+                });
               }
               if (state.layers.voltages) {
                 lines.push({ font: `${fs(12)}px ${monoFont}`, text: `Vd:${(nearest.v_dust ?? 0).toFixed(2)}V | Vm:${(nearest.v_mq ?? 0).toFixed(2)}V` });
@@ -5288,7 +5833,7 @@ RENDERED_HTML = """<!DOCTYPE html>
                 lines.push({ font: `${fs(12)}px ${monoFont}`, text: `RefFI:${nearest.ref_fi.toFixed(1)} | dFI:${nearest.parity_delta_fi.toFixed(2)}` });
               }
 
-              const tipW = Math.min(258, w - 16);
+              const tipW = Math.min(286, w - 16);
               const tipH = 14 + lines.length * 17;
               let boxX = cx + 10;
               if (boxX + tipW > w - padR - 4) boxX = cx - tipW - 10;
@@ -5334,6 +5879,29 @@ RENDERED_HTML = """<!DOCTYPE html>
           applyTheme(btn.getAttribute('data-theme-val'), true);
         });
       });
+
+      const themeCycBtn = document.getElementById('btn-theme-cycle');
+      if (themeCycBtn) {
+        themeCycBtn.addEventListener('click', () => {
+          const order = ['light', 'dark', null];
+          const cur = state.theme === 'light' ? 'light' : (state.theme === 'dark' ? 'dark' : null);
+          const next = order[(order.indexOf(cur) + 1) % order.length];
+          applyTheme(next, true);
+        });
+      }
+
+      const quickSrcBtn = document.getElementById('btn-quick-src');
+      if (quickSrcBtn) {
+        quickSrcBtn.addEventListener('click', () => {
+          const order = ['auto', 'esp32', 'sitl'];
+          const next = order[(order.indexOf(state.viewMode) + 1) % order.length];
+          state.viewMode = next;
+          if (next === 'sitl' || next === 'esp32') state.lastActiveSource = next;
+          clearHover();
+          savePrefs();
+          applyView();
+        });
+      }
 
       document.getElementById('btn-toggle-layers').addEventListener('click', () => {
         const drawer = document.getElementById('layers-drawer');
@@ -5389,7 +5957,8 @@ RENDERED_HTML = """<!DOCTYPE html>
         const rect = canvas.getBoundingClientRect();
         if (!rect.width || !state.history.length) return;
         const w = canvas._cw || rect.width || 960;
-        const { padL, padR } = getChartPads(w);
+        const hasRightAxis = !!(state.layers.gas_ppm || state.layers.g_scaled || state.layers.voltages);
+        const { padL, padR } = getChartPads(w, hasRightAxis);
         const plotW = Math.max(40, w - padL - padR);
         const px = e.clientX - rect.left;
         if (px < padL || px > w - padR) {
@@ -5410,8 +5979,25 @@ RENDERED_HTML = """<!DOCTYPE html>
         scheduleDraw();
       }
       [mainCanvas, subCanvas].forEach((cvs) => {
-        cvs.addEventListener('pointermove', (e) => updateHoverFromPointer(e, cvs));
-        cvs.addEventListener('pointerdown', (e) => updateHoverFromPointer(e, cvs));
+        let touchStart = null;
+        cvs.addEventListener('pointermove', (e) => {
+          if (e.pointerType !== 'touch') updateHoverFromPointer(e, cvs);
+        });
+        cvs.addEventListener('pointerdown', (e) => {
+          if (e.pointerType === 'touch') {
+            touchStart = { x: e.clientX, y: e.clientY };
+          } else {
+            updateHoverFromPointer(e, cvs);
+          }
+        });
+        cvs.addEventListener('pointerup', (e) => {
+          if (e.pointerType === 'touch' && touchStart) {
+            const dx = e.clientX - touchStart.x;
+            const dy = e.clientY - touchStart.y;
+            touchStart = null;
+            if (Math.hypot(dx, dy) < 10) updateHoverFromPointer(e, cvs);
+          }
+        });
         cvs.addEventListener('pointerleave', (e) => {
           if (e.pointerType === 'mouse') {
             clearHover();
@@ -5470,11 +6056,41 @@ RENDERED_HTML = """<!DOCTYPE html>
         cvs.addEventListener('keydown', handleChartKeydown);
       });
 
-      // Accessible KPI abbreviation explanation buttons
+      // Accessible KPI abbreviation explanation anchored native popover
+      const abbrPop = document.getElementById('abbr-popover');
+      const abbrTitle = document.getElementById('abbr-popover-title');
+      const abbrBody = document.getElementById('abbr-popover-body');
+      let abbrAnchor = null;
+      if (abbrPop) {
+        abbrPop.addEventListener('toggle', (ev) => {
+          if (ev.newState === 'closed') abbrAnchor = null;
+        });
+      }
       document.querySelectorAll('.kpi-abbr-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
           const msg = btn.getAttribute('data-abbr-help') || btn.getAttribute('title');
-          if (msg) showToast(msg, 'ok');
+          if (!msg) return;
+          if (!abbrPop || typeof abbrPop.showPopover !== 'function') {
+            showToast(msg, 'ok');
+            return;
+          }
+          if (abbrPop.matches(':popover-open') && abbrAnchor === btn) {
+            abbrPop.hidePopover();
+            return;
+          }
+          abbrAnchor = btn;
+          if (abbrTitle) abbrTitle.textContent = btn.textContent.replace(/[:\\s]+$/, '') || 'Istilah Metrik';
+          if (abbrBody) abbrBody.textContent = msg;
+          abbrPop.showPopover();
+          const bRect = btn.getBoundingClientRect();
+          const pRect = abbrPop.getBoundingClientRect();
+          const pad = 12;
+          const left = Math.max(pad, Math.min(window.innerWidth - pRect.width - pad, bRect.left));
+          const belowTop = bRect.bottom + 6;
+          const aboveTop = bRect.top - pRect.height - 6;
+          const top = (belowTop + pRect.height <= window.innerHeight - pad) ? belowTop : Math.max(pad, aboveTop);
+          abbrPop.style.insetInlineStart = `${Math.round(left)}px`;
+          abbrPop.style.insetBlockStart = `${Math.round(top)}px`;
         });
       });
 
@@ -5524,9 +6140,10 @@ RENDERED_HTML = """<!DOCTYPE html>
         const sh = subCanvas._ch || 150;
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
+        const expFontPx = 12;
         const tmpCanvas = document.createElement('canvas');
         const tCtx = tmpCanvas.getContext('2d');
-        tCtx.font = '600 11px system-ui, sans-serif';
+        tCtx.font = `600 ${expFontPx}px system-ui, sans-serif`;
         const legendRows = [];
         let curRow = [];
         let curW = 0;
@@ -5544,7 +6161,7 @@ RENDERED_HTML = """<!DOCTYPE html>
         }
         if (curRow.length) legendRows.push(curRow);
 
-        const headerH = specs.length ? (48 + legendRows.length * 18) : 44;
+        const headerH = specs.length ? (48 + legendRows.length * (expFontPx + 7)) : 44;
         const gap = 10;
         const out = document.createElement('canvas');
         out.width = Math.round((cw + 24) * dpr);
@@ -5558,16 +6175,16 @@ RENDERED_HTML = """<!DOCTYPE html>
         const srcText = document.getElementById('src-label').textContent;
         ctx.fillText(`Karhutla Edge-IoT — ${srcText}`, 14, 22);
         ctx.fillStyle = pal.muted;
-        ctx.font = '11px system-ui, sans-serif';
+        ctx.font = `${expFontPx}px system-ui, sans-serif`;
         const parityStr = document.getElementById('parity-badge').hidden ? '' : ` • ${document.getElementById('parity-badge').textContent}`;
         const presetLabel = PRESET_LABELS[state.preset] || state.preset;
         ctx.fillText(`Diekspor: ${new Date().toLocaleString('id-ID')} • Preset: ${presetLabel}${parityStr}`, 14, 38);
 
         if (legendRows.length) {
-          ctx.font = '600 11px system-ui, sans-serif';
+          ctx.font = `600 ${expFontPx}px system-ui, sans-serif`;
           legendRows.forEach((rSpecs, rIdx) => {
             let lx = 14;
-            const ly = 58 + rIdx * 18;
+            const ly = 58 + rIdx * (expFontPx + 7);
             for (const s of rSpecs) {
               const tw = ctx.measureText(s.label).width;
               ctx.save();
@@ -5773,16 +6390,38 @@ RENDERED_HTML = """<!DOCTYPE html>
       }
 
       function requestActuatorCmd(cmd) {
-        const activeRow = state.src[activeSource()].latest;
-        if (cmd === 'FORCE_OFF' && activeRow && (activeRow.state === 'BAHAYA' || activeRow.state === 'WASPADA' || activeRow.state === 'FAILSAFE')) {
-          askConfirm(
-            'Matikan Kipas Saat Kondisi Kritis?',
-            `Sistem sedang berada pada status ${activeRow.state} (FI ${(activeRow.fi ?? 0).toFixed(1)} µg/m³). Menyetel FORCE OFF (0%) akan memutus ventilasi pengaman.`,
-            'Tetap Matikan (OFF 0%)',
-            () => sendActuatorCmd('FORCE_OFF'),
-            'danger',
-          );
-          return;
+        if (cmd === 'FORCE_OFF') {
+          const sim = state.sim || {};
+          const targetLock = state.cmdTarget || 'auto';
+          const hitsSitl = !!sim.has_sitl && (targetLock === 'auto' || targetLock === 'sitl');
+          const hitsEsp = (!!sim.has_broker || !!sim.has_hils_ref) && (targetLock === 'auto' || targetLock === 'esp32');
+          const candidates = [];
+          if (hitsSitl) candidates.push({ label: 'SITL', row: state.src.sitl.latest });
+          if (hitsEsp) candidates.push({ label: 'ESP32', row: state.src.esp32.latest });
+          if (!candidates.length) {
+            const act = activeSource();
+            candidates.push({ label: act.toUpperCase(), row: state.src[act].latest });
+          }
+          const critical = candidates.filter((item) => {
+            const r = item.row;
+            return !!(r && (r.state === 'BAHAYA' || r.state === 'WASPADA' || r.state === 'FAILSAFE' || r.sensor_fault));
+          });
+          if (critical.length) {
+            const details = critical.map(({ label, row }) => {
+              const isF = (row.state === 'FAILSAFE' || !!row.sensor_fault);
+              return isF
+                ? `${label}: FAILSAFE (sensor debu putus, FI tidak valid — kipas pengaman ${(row.duty ?? 0).toFixed(0)}%)`
+                : `${label}: ${row.state} (FI ${(row.fi ?? 0).toFixed(1)} µg/m³)`;
+            }).join('; ');
+            askConfirm(
+              'Matikan Kipas Saat Kondisi Kritis?',
+              `Jalur target berada pada kondisi kritis (${details}). Menyetel FORCE OFF (0%) akan memutus ventilasi pengaman.`,
+              'Tetap Matikan (OFF 0%)',
+              () => sendActuatorCmd('FORCE_OFF'),
+              'danger',
+            );
+            return;
+          }
         }
         sendActuatorCmd(cmd);
       }
@@ -5901,9 +6540,17 @@ RENDERED_HTML = """<!DOCTYPE html>
 
       function startTargetWithCheck(tgt, overrideScenario = null) {
         if (tgt === 'hils' && !state.esp.online) {
+          const sim = state.sim || {};
+          const port = sim.broker_port || 6669;
+          let msg = `Node ESP32 saat ini sedang offline di broker :${port}. Menjalankan HILS tanpa ESP32 akan mengalami timeout dan jeda otomatis setelah 3x gagal. Tetap mulai?`;
+          if (sim.enable_mqtt === false) {
+            msg = 'MQTT dinonaktifkan (--no-mqtt). Jalankan HILS hanya jika Anda sengaja menguji mode timeout; tetap mulai?';
+          } else if (!sim.broker_connected) {
+            msg = `Broker MQTT :${port} belum terhubung. Pastikan Mosquitto aktif sebelum menguji ESP32; tetap mulai?`;
+          }
           askConfirm(
             'ESP32 Belum Terdeteksi',
-            'Node ESP32 saat ini sedang offline di broker :6669. Menjalankan HILS tanpa ESP32 akan mengalami timeout dan jeda otomatis setelah 3x gagal. Tetap mulai?',
+            msg,
             'Tetap Mulai HILS',
             () => launchSim('hils', overrideScenario),
             'warn',
@@ -6032,7 +6679,13 @@ RENDERED_HTML = """<!DOCTYPE html>
             'Mulai Ulang dengan Skenario Ini',
             () => launchSim(state.simTarget || 'sitl', newScen),
             'warn',
-            () => { document.getElementById('sel-scenario').value = state.sim.scenario || 'flaming'; },
+            () => {
+              const sc = state.sim.scenario || 'flaming';
+              document.getElementById('sel-scenario').value = sc;
+              const mobSc = document.getElementById('mob-sel-scenario');
+              if (mobSc) mobSc.value = sc;
+              updateMobileDockContext();
+            },
           );
           return;
         }
@@ -6040,25 +6693,71 @@ RENDERED_HTML = """<!DOCTYPE html>
         postSim({ scenario: newScen });
       });
 
-      document.querySelectorAll('.spd-btn').forEach((btn) => {
+      document.querySelectorAll('.spd-btn, .mob-spd-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
-          document.querySelectorAll('.spd-btn').forEach((b) => b.setAttribute('aria-pressed', 'false'));
-          btn.setAttribute('aria-pressed', 'true');
+          const spd = Number(btn.getAttribute('data-speed'));
+          document.querySelectorAll('.spd-btn, .mob-spd-btn').forEach((b) => {
+            b.setAttribute('aria-pressed', Number(b.getAttribute('data-speed')) === spd ? 'true' : 'false');
+          });
           updateSimAdvancedSummary();
           updateMobileDockContext();
-          postSim({ speed: Number(btn.getAttribute('data-speed')) });
+          postSim({ speed: spd });
         });
       });
 
       document.getElementById('sw-preempt').addEventListener('change', (e) => {
+        const mobSwPre = document.getElementById('mob-sw-preempt');
+        if (mobSwPre) mobSwPre.checked = e.target.checked;
         updateSimAdvancedSummary();
         postSim({ ai_preempt: e.target.checked });
       });
 
+      const mobSwPreempt = document.getElementById('mob-sw-preempt');
+      if (mobSwPreempt) {
+        mobSwPreempt.addEventListener('change', (e) => {
+          const swPre = document.getElementById('sw-preempt');
+          if (swPre) swPre.checked = e.target.checked;
+          updateSimAdvancedSummary();
+          postSim({ ai_preempt: e.target.checked });
+        });
+      }
+
       document.getElementById('sw-fault').addEventListener('change', (e) => {
+        const mobSwFault = document.getElementById('mob-sw-fault');
+        if (mobSwFault) mobSwFault.checked = e.target.checked;
         updateSimAdvancedSummary();
         postSim({ fault_inject: e.target.checked });
       });
+
+      const mobSelSimTgt = document.getElementById('mob-sel-sim-target');
+      if (mobSelSimTgt) {
+        mobSelSimTgt.addEventListener('change', (e) => {
+          const tgt = e.target.value;
+          const desktopBtn = document.querySelector(`.tgt-btn[data-target="${tgt}"]`);
+          if (desktopBtn) desktopBtn.click();
+        });
+      }
+
+      const mobSelScen = document.getElementById('mob-sel-scenario');
+      if (mobSelScen) {
+        mobSelScen.addEventListener('change', (e) => {
+          const sel = document.getElementById('sel-scenario');
+          if (sel) {
+            sel.value = e.target.value;
+            sel.dispatchEvent(new Event('change'));
+          }
+        });
+      }
+
+      const mobSwFault = document.getElementById('mob-sw-fault');
+      if (mobSwFault) {
+        mobSwFault.addEventListener('change', (e) => {
+          const swFlt = document.getElementById('sw-fault');
+          if (swFlt) swFlt.checked = e.target.checked;
+          updateSimAdvancedSummary();
+          postSim({ fault_inject: e.target.checked });
+        });
+      }
 
       // Global keyboard shortcuts (S start idle, 1/2/3 presets, P/Space pause, Alt+Shift+A AUTO, Alt+Shift+M FORCE_MAX, ? Help)
       document.addEventListener('keydown', (e) => {
@@ -6152,6 +6851,7 @@ RENDERED_HTML = """<!DOCTYPE html>
               appendMqttLog('--- Koneksi live ke server tersambung kembali ---', false);
             }
             updateSimBadges(d.sim);
+            syncMqttLogPlaceholder();
             applyView();
             const ls = d.sim && d.sim.last_summary;
             if (ls && !(d.sim && d.sim.running)) {
@@ -6238,7 +6938,8 @@ RENDERED_HTML = """<!DOCTYPE html>
             const parNote = (s.hils_parity && s.hils_parity.samples > 0)
               ? `, paritas ΔFI maks ${s.hils_parity.max_delta_fi.toFixed(2)}`
               : '';
-            showToast(`Simulasi ${SCENARIO_LABELS[s.scenario] || s.scenario} selesai (${s.samples} sampel, FI puncak ${Number(s.peak_fi || 0).toFixed(1)} µg/m³${parNote}).`, 'ok');
+            const verb = s.stopped_early ? 'dihentikan' : 'selesai';
+            showToast(`Simulasi ${SCENARIO_LABELS[s.scenario] || s.scenario} ${verb} (${s.samples} sampel, FI puncak ${Number(s.peak_fi || 0).toFixed(1)} µg/m³${parNote}).`, 'ok');
           } else if (msg.type === 'mqtt_log') {
             appendMqttLog(msg.line, true);
           } else if (msg.type === 'sim') {
@@ -6292,6 +6993,10 @@ def start_dashboard_server(engine, host="0.0.0.0", port=8080):
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
+                return
+            if parsed.path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
                 return
             if parsed.path == "/api/state":
                 self._send_json(engine.get_state_snapshot())
