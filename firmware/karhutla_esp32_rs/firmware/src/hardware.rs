@@ -193,6 +193,7 @@ impl<'d> RtcClock<'d> {
         self.i2c.write_read(DS3231_ADDR, &[0x00], regs).is_ok()
     }
 
+    #[allow(dead_code)]
     pub fn is_hw_present(&self) -> bool {
         self.hw_present
     }
