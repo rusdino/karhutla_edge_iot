@@ -218,6 +218,23 @@ def build_mobile_dashboard_config(broker_host=None, broker_port=None):
                                 "payload": "RESET",
                                 "qos": 0,
                             },
+                            {
+                                "panelName": "Penggunaan Memori Log ESP32 (%)",
+                                "type": "progress",
+                                "topic": f"{K.T_TELEM_SCALAR}/log_pct",
+                                "min": 0,
+                                "max": 100,
+                                "unit": "%",
+                                "qos": 0,
+                            },
+                            {
+                                "panelName": "Status Memori Penuh (Log ESP32)",
+                                "type": "led_status",
+                                "topic": f"{K.T_TELEM_SCALAR}/log_full",
+                                "payloadOnline": "1",
+                                "payloadOffline": "0",
+                                "qos": 0,
+                            },
                         ],
                     }
                 ],
@@ -250,6 +267,7 @@ class DashboardEngine:
             "count": None, "meta_count": None, "crc32": None, "cap": None, "full": None, "bytes": None,
             "cap_bytes": None, "synced_key": None, "downloaded_key": None, "busy": None,
             "progress": None, "last_error": None, "last_sync": None, "batch_csv": None,
+            "rtc_ok": None, "epoch_s": None,
         }
         self._log_cond = threading.Condition()
         self._log_op = threading.Lock()
@@ -496,7 +514,22 @@ class DashboardEngine:
                 for k_hb, k_lg in (("log_cap", "cap"), ("log_full", "full"), ("log_bytes", "bytes"),
                                    ("log_cap_bytes", "cap_bytes")):
                     if k_hb in hb:
+                        if lg.get(k_lg) != hb[k_hb]:
+                            changed = True
                         lg[k_lg] = hb[k_hb]
+            if "rtc_ok" in hb:
+                r_ok = bool(hb["rtc_ok"]) if hb["rtc_ok"] is not None else None
+                if lg.get("rtc_ok") != r_ok:
+                    changed = True
+                lg["rtc_ok"] = r_ok
+            if "epoch_s" in hb:
+                try:
+                    ep = int(hb["epoch_s"]) if hb["epoch_s"] is not None else None
+                except (TypeError, ValueError):
+                    ep = None
+                if lg.get("epoch_s") != ep:
+                    changed = True
+                lg["epoch_s"] = ep
         if changed:
             self._broadcast_esp_log()
         rtc_ok = hb.get("rtc_ok")
@@ -536,6 +569,8 @@ class DashboardEngine:
             "busy": lg["busy"], "progress": lg["progress"], "last_error": lg["last_error"],
             "last_sync": lg["last_sync"],
             "csv_file": os.path.basename(lg["batch_csv"]) if lg["batch_csv"] else None,
+            "rtc_ok": lg.get("rtc_ok"),
+            "epoch_s": lg.get("epoch_s"),
         }
 
     def _broadcast_esp_log(self):
@@ -999,6 +1034,7 @@ class DashboardEngine:
                 "esp32": {"history": esp_hist, "latest": esp_latest, "online": esp_online},
             },
             "esp": self.get_esp_status(),
+            "esp_log": self.get_esp_log_status(),
             "mobile": {"ip": self._lan_ip, "ip_is_fallback": self._ip_is_fallback},
             "mqtt_logs": logs,
             "sim": self.get_sim_status(),
@@ -3565,6 +3601,66 @@ RENDERED_HTML = """<!DOCTYPE html>
         border-color: var(--accent);
       }
     }
+
+    .esp-rtc-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px 10px;
+    }
+
+    .esp-rtc-clock {
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .esp-log-meter {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .esp-log-track {
+      inline-size: 100%;
+      block-size: 10px;
+      border-radius: 999px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-subtle);
+      overflow: hidden;
+    }
+
+    .esp-log-fill {
+      block-size: 100%;
+      inline-size: 0%;
+      border-radius: 999px;
+      background: var(--accent);
+      transition: inline-size 180ms ease, background-color 180ms ease;
+    }
+
+    .esp-log-fill[data-tone="warn"] { background: var(--warn); }
+    .esp-log-fill[data-tone="danger"] { background: var(--danger); }
+
+    .esp-log-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px 8px;
+      font-size: 0.78rem;
+    }
+
+    .esp-log-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .esp-log-actions > button {
+      flex: 1 1 180px;
+    }
   </style>
 </head>
 <body>
@@ -4008,6 +4104,30 @@ RENDERED_HTML = """<!DOCTYPE html>
                 <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
                 Reset Sistem
               </button>
+            </div>
+          </section>
+
+          <section class="panel-card" id="esp-log-card" aria-label="Memori Backup ESP32 dan RTC">
+            <div class="panel-header">
+              <h2 class="panel-title">Memori Backup ESP32 &amp; RTC</h2>
+              <span id="esp-log-full-badge" class="pill-badge" data-tone="danger" hidden>MEMORI PENUH — BUZZER AKTIF</span>
+            </div>
+            <div class="esp-rtc-row">
+              <span id="esp-rtc-badge" class="pill-badge" data-tone="fault">RTC: Menunggu ESP32</span>
+              <span id="esp-rtc-clock" class="esp-rtc-clock">--:--:-- WIB</span>
+            </div>
+            <div class="esp-log-meter">
+              <div class="esp-log-track">
+                <div id="esp-log-bar" class="esp-log-fill" role="progressbar" aria-label="Penggunaan Memori Backup ESP32" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" style="width: 0%;"></div>
+              </div>
+              <div class="esp-log-meta">
+                <span id="esp-log-usage">0 / 43.008 sampel</span>
+                <span id="esp-log-status-note" class="brand-sub">Hubungkan ESP32 untuk menyinkronkan log flash</span>
+              </div>
+            </div>
+            <div class="esp-log-actions">
+              <button type="button" class="chip-btn" id="btn-esp-log-sync" disabled>Sinkronkan &amp; Unduh Log ESP32</button>
+              <button type="button" class="cmd-btn" id="btn-esp-log-clear" data-variant="danger" disabled>Kosongkan Memori ESP32</button>
             </div>
           </section>
 
@@ -7191,6 +7311,9 @@ RENDERED_HTML = """<!DOCTYPE html>
               state.esp.hw_mode = d.esp.hw_mode || null;
               state.esp.lastRx = d.esp.age_s != null ? Date.now() - d.esp.age_s * 1000 : null;
             }
+            if (d.esp_log) {
+              updateEspLogCard(d.esp_log);
+            }
             if (d.mobile && d.mobile.ip_is_fallback) {
               const hint = document.getElementById('mobile-config-hint');
               if (hint) {
@@ -7224,8 +7347,176 @@ RENDERED_HTML = """<!DOCTYPE html>
           });
       }
 
+      function fmtIntId(n) {
+        return Number(n).toLocaleString('id-ID');
+      }
+
+      function formatEspClockWib(epochS) {
+        if (!epochS || epochS < 1700000000) return '--:--:-- WIB';
+        try {
+          const dt = new Date(epochS * 1000);
+          const s = dt.toLocaleString('id-ID', {
+            timeZone: 'Asia/Jakarta',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+          });
+          return `${s} WIB`;
+        } catch (e) {
+          return '--:--:-- WIB';
+        }
+      }
+
+      function updateEspLogCard(st) {
+        if (!st) return;
+        const rtcBadge = document.getElementById('esp-rtc-badge');
+        const rtcClock = document.getElementById('esp-rtc-clock');
+        const bar = document.getElementById('esp-log-bar');
+        const usage = document.getElementById('esp-log-usage');
+        const fullBadge = document.getElementById('esp-log-full-badge');
+        const note = document.getElementById('esp-log-status-note');
+        const btnSync = document.getElementById('btn-esp-log-sync');
+        const btnClear = document.getElementById('btn-esp-log-clear');
+        if (!rtcBadge || !bar || !usage || !btnSync || !btnClear) return;
+
+        const online = !!st.online;
+        const cap = (st.log_cap != null && st.log_cap > 0) ? st.log_cap : 43008;
+        const count = st.log_count;
+        const pct = count != null ? Math.min(100, Math.max(0, Math.round((count / cap) * 100))) : 0;
+
+        if (!online) {
+          rtcBadge.textContent = 'RTC: ESP32 Offline';
+          rtcBadge.setAttribute('data-tone', 'fault');
+        } else if (st.rtc_ok) {
+          rtcBadge.textContent = 'RTC: Tersinkron';
+          rtcBadge.setAttribute('data-tone', 'ok');
+        } else {
+          rtcBadge.textContent = 'RTC: Belum Sinkron';
+          rtcBadge.setAttribute('data-tone', 'warn');
+        }
+        if (rtcClock) rtcClock.textContent = formatEspClockWib(st.epoch_s);
+
+        bar.style.width = `${pct}%`;
+        bar.setAttribute('aria-valuenow', String(pct));
+        if (st.log_full || pct >= 95) bar.setAttribute('data-tone', 'danger');
+        else if (pct >= 75) bar.setAttribute('data-tone', 'warn');
+        else bar.removeAttribute('data-tone');
+
+        usage.textContent = `${count != null ? fmtIntId(count) : '0'} / ${fmtIntId(cap)} sampel (${pct}%)`;
+        if (fullBadge) fullBadge.hidden = !st.log_full;
+
+        const busy = st.busy;
+        btnSync.disabled = !online || !!busy;
+        btnSync.setAttribute('aria-busy', busy === 'sync' ? 'true' : 'false');
+        const canClear = !!st.can_clear && !(count > 0 && !(st.synced && st.downloaded));
+        btnClear.disabled = !canClear;
+        btnClear.setAttribute('aria-busy', busy === 'clear' ? 'true' : 'false');
+
+        if (note) {
+          if (busy === 'sync') {
+            const p = st.progress != null ? Math.round(st.progress * 100) : 0;
+            note.textContent = `Menyinkronkan chunk... ${p}%`;
+          } else if (busy === 'clear') {
+            note.textContent = 'Menghapus memori flash ESP32...';
+          } else if (st.last_error) {
+            note.textContent = `Galat: ${st.last_error}`;
+          } else if (st.synced && st.downloaded) {
+            note.textContent = `Siap dikosongkan (${st.csv_file || 'CSV terunduh'})`;
+          } else if (st.synced) {
+            note.textContent = 'Tersinkron — mengunduh CSV...';
+          } else if (st.last_sync) {
+            note.textContent = `Sinkron terakhir: ${st.last_sync}`;
+          } else {
+            note.textContent = online ? 'Siap disinkronkan via MQTT' : 'Hubungkan ESP32 untuk menyinkronkan log flash';
+          }
+        }
+      }
+
+      function refreshEspLogStatus() {
+        return fetch('/api/esp-log/status')
+          .then((r) => (r.ok ? r.json() : null))
+          .then((st) => { if (st) updateEspLogCard(st); })
+          .catch(() => {});
+      }
+
+      const btnEspLogSync = document.getElementById('btn-esp-log-sync');
+      if (btnEspLogSync) {
+        btnEspLogSync.addEventListener('click', () => {
+          btnEspLogSync.disabled = true;
+          btnEspLogSync.setAttribute('aria-busy', 'true');
+          fetch('/api/esp-log/sync', { method: 'POST' })
+            .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+            .then(async ({ ok, d }) => {
+              if (d && d.status) updateEspLogCard(d.status);
+              if (!ok || !d.ok) {
+                showToast((d && d.error) ? d.error : 'Gagal menyinkronkan log ESP32.', 'danger');
+                return;
+              }
+              const dl = await fetch('/api/esp-log/download');
+              if (!dl.ok) {
+                showToast('Sinkronisasi berhasil, tetapi gagal mengunduh CSV.', 'danger');
+                return;
+              }
+              const blob = await dl.blob();
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = (d.status && d.status.csv_file) || 'karhutla_esp32_backup.csv';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              URL.revokeObjectURL(url);
+              await refreshEspLogStatus();
+              showToast('Log ESP32 berhasil disinkronkan dan diunduh.', 'ok');
+            })
+            .catch(() => {
+              showToast('Gagal menghubungi server saat sinkronisasi log ESP32.', 'danger');
+            })
+            .finally(() => {
+              refreshEspLogStatus();
+            });
+        });
+      }
+
+      const btnEspLogClear = document.getElementById('btn-esp-log-clear');
+      if (btnEspLogClear) {
+        btnEspLogClear.addEventListener('click', () => {
+          askConfirm(
+            'Kosongkan Memori ESP32?',
+            'Semua rekaman backup di flash ESP32 akan dihapus permanen setelah dipastikan sudah tersinkron dan terunduh. Lanjutkan?',
+            'Ya, Kosongkan',
+            () => {
+              btnEspLogClear.disabled = true;
+              btnEspLogClear.setAttribute('aria-busy', 'true');
+              fetch('/api/esp-log/clear', { method: 'POST' })
+                .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+                .then(({ ok, d }) => {
+                  if (d && d.status) updateEspLogCard(d.status);
+                  if (!ok || !d.ok) {
+                    showToast((d && d.error) ? d.error : 'Gagal mengosongkan memori ESP32.', 'danger');
+                    return;
+                  }
+                  showToast('Memori backup ESP32 berhasil dikosongkan.', 'ok');
+                })
+                .catch(() => {
+                  showToast('Gagal menghubungi server saat mengosongkan memori ESP32.', 'danger');
+                })
+                .finally(() => {
+                  refreshEspLogStatus();
+                });
+            },
+            'danger'
+          );
+        });
+      }
+
       applyTheme(state.theme, false);
       loadStateSnapshot(false, false);
+      refreshEspLogStatus();
 
       const es = new EventSource('/api/stream');
       es.onopen = () => {
@@ -7275,6 +7566,8 @@ RENDERED_HTML = """<!DOCTYPE html>
               state.esp.lastRx = Date.now() - msg.age_s * 1000;
             }
             applyView();
+          } else if (msg.type === 'esp_log_status') {
+            updateEspLogCard(msg);
           } else if (msg.type === 'hils_timeout') {
             state.hilsTimeoutInfo = msg;
             if (msg.sim) updateSimBadges(msg.sim);

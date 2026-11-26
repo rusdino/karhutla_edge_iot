@@ -1133,6 +1133,44 @@ class TestEspBackupSyncAndClear(unittest.TestCase):
             finally:
                 self._stop(eng, srv)
 
+    def test_esp_log_ui_card_and_mobile_config(self):
+        html = dashboard.RENDERED_HTML
+        self.assertIn('id="esp-log-card"', html)
+        self.assertIn("Memori Backup ESP32 &amp; RTC", html)
+        self.assertIn('id="esp-rtc-badge"', html)
+        self.assertIn('id="esp-rtc-clock"', html)
+        self.assertIn('id="esp-log-bar"', html)
+        self.assertIn('id="esp-log-usage"', html)
+        self.assertIn("43.008 sampel", html)
+        self.assertIn('id="esp-log-full-badge"', html)
+        self.assertIn("MEMORI PENUH — BUZZER AKTIF", html)
+        self.assertIn('id="btn-esp-log-sync"', html)
+        self.assertIn("Sinkronkan &amp; Unduh Log ESP32", html)
+        self.assertIn('id="btn-esp-log-clear"', html)
+        self.assertIn("Kosongkan Memori ESP32", html)
+        # Clear button must be disabled by default in rendered HTML
+        clear_idx = html.index('id="btn-esp-log-clear"')
+        clear_tag = html[html.rfind("<button", 0, clear_idx):html.index(">", clear_idx) + 1]
+        self.assertIn("disabled", clear_tag)
+        # Zero external CDN <script src="http or <link href="http
+        self.assertNotIn('<script src="http', html)
+        self.assertNotIn('<link href="http', html)
+        self.assertNotIn("<link rel=\"stylesheet\" href=\"http", html)
+        # SSE and API hooks present
+        self.assertIn("esp_log_status", html)
+        self.assertIn("/api/esp-log/sync", html)
+        self.assertIn("/api/esp-log/download", html)
+        self.assertIn("/api/esp-log/clear", html)
+
+        # Mobile IoT MQTT Panel config must include log_pct and log_full panels
+        cfg = dashboard.build_mobile_dashboard_config(broker_host="192.168.1.10")
+        panels = cfg["connections"][0]["dashboards"][0]["panels"]
+        topics = {p.get("topic"): p for p in panels}
+        self.assertIn("karhutla/t/log_pct", topics)
+        self.assertIn("karhutla/t/log_full", topics)
+        self.assertEqual(topics["karhutla/t/log_pct"]["type"], "progress")
+        self.assertEqual(topics["karhutla/t/log_full"]["type"], "led_status")
+
 
 if __name__ == "__main__":
     unittest.main()
