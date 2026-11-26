@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/karhutla-core"]
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+debug = 2
