@@ -16,7 +16,7 @@ Karhutla Edge-IoT adalah sistem prediksi dini dan mitigasi asap kebakaran hutan/
 
 ## Positioning
 
-Satu basis algoritma DSP dan kontrol yang 100% identik antara Python (`core.py`) dan firmware Native ESP-IDF v5.5.5 (`firmware/karhutla_esp32/src/main.cpp`, tanpa Arduino Core) — mencakup filter `Median3`, adaptasi baseline `v0`, Kalman Filter 2-state (`pm`, `dcdt`), Sensor Fusion Index (`FI`), FSM 4-state (`NORMAL`, `WASPADA`, `BAHAYA`, `FAILSAFE` 70%), serta AI Linear Trend Forecast 60 detik dan `PreemptController` — yang dapat dijalankan lintas 3 mode (`SITL`, `HILS` via MQTT `:6669`, dan `Riil`) dari satu dashboard web terpadu.
+Satu basis algoritma DSP dan kontrol yang 100% identik antara Python (`core.py`), firmware utama **Rust `no_std` + Embassy** (`firmware/karhutla_esp32_rs/crates/karhutla-core/` & `firmware/karhutla_esp32_rs/firmware/`), serta firmware fallback Native ESP-IDF v5.5.5 (`firmware/karhutla_esp32/src/main.cpp`, tanpa Arduino Core) — mencakup filter `Median3`, adaptasi baseline `v0`, Kalman Filter 2-state (`pm`, `dcdt`), Sensor Fusion Index (`FI`), FSM 4-state (`NORMAL`, `WASPADA`, `BAHAYA`, `FAILSAFE` 70%), 8 pola buzzer komposit (4 state FSM × status memori penuh), RTC eksternal I2C (`DS3231/DS1307`, `GPIO21`/`GPIO22`, `0x68`), pencatatan cadangan (*backup logger*) flash lokal 2,625 MiB (43.008 sampel × 64 byte, *append-only* tanpa menimpa data lama), serta AI Linear Trend Forecast 60 detik dan `PreemptController` — yang dapat dijalankan lintas 3 mode (`SITL`, `HILS` via MQTT `:6669`, dan `Riil`) dari satu dashboard web terpadu.
 
 ## Operating Context
 
@@ -29,7 +29,7 @@ Satu basis algoritma DSP dan kontrol yang 100% identik antara Python (`core.py`)
 - **Offline-first & Zero-build:** Antarmuka web wajib tetap berjalan lokal/offline di LAN tanpa CDN internet dan tanpa toolchain build Node/React (tetap single-file Python/HTML di `dashboard.py`).
 - **Bahasa & Terminologi:** Seluruh label dan pesan UI wajib menggunakan Bahasa Indonesia dengan istilah teknis yang akurat (`FI`, `PM-proxy`, `Kalman`, `FSM`, `NORMAL`, `WASPADA`, `BAHAYA`, `FAILSAFE`, `HILS`, `SITL`, `AI Preempt`, `AUTO`, `FORCE_MAX`, `FORCE_OFF`, `RESET`).
 - **Kendali Cepat Multi-Perangkat:** Harus nyaman dipantau dan dikendalikan cepat saat demo langsung di layar laptop maupun browser HP.
-- **Fitur Terkonfirmasi:** Grafik multi-overlay *real-time*, 6 kartu KPI, kontrol override aktuator (`karhutla/cmd`), operasi simulasi terpadu untuk target `SITL (Python)` dan `HILS (ESP32)` (`1x`–`20x`, skenario `flaming`/`smolder`/`clean`/`fault`, saklar `AI Preempt` & injeksi putus kabel sensor `FAILSAFE`), deteksi status `ESP32` online/offline otomatis, live MQTT log `:6669`, dan unduh konfigurasi HP `.json`.
+- **Fitur Terkonfirmasi:** Grafik multi-overlay *real-time*, 6 kartu KPI, kontrol override aktuator (`karhutla/cmd`), operasi simulasi terpadu untuk target `SITL (Python)` dan `HILS (ESP32)` (`1x`–`20x`, skenario `flaming`/`smolder`/`clean`/`fault`, saklar `AI Preempt` & injeksi putus kabel sensor `FAILSAFE`), panel **Memori Backup ESP32 & RTC** (status RTC & kapasitas 43.008 sampel dari `karhutla/hb`, sinkronisasi & unduh CSV `/api/esp-log/sync` → `/api/esp-log/download`, serta penghapusan aman dua fase `/api/esp-log/clear` dengan gerbang `HTTP 409`), deteksi status `ESP32` online/offline otomatis, live MQTT log `:6669`, dan unduh konfigurasi HP `.json`.
 - **Batasan Operasional:** Saat menjalankan target `HILS (ESP32)` di `dashboard.py`, jangan menjalankan `hils.py` di terminal secara bersamaan agar kedua runner tidak berebut mengirim sampel ke ESP32 yang sama.
 - **Belum Diputuskan / Di Luar Cakupan Saat Ini:** Deployment cloud/publik internet, autentikasi multi-pengguna, dan operasional lapangan di luar uji laboratorium kotak asap.
 
@@ -42,8 +42,8 @@ Satu basis algoritma DSP dan kontrol yang 100% identik antara Python (`core.py`)
 
 - Grafik validasi SITL 3-panel aktual: `sitl_flaming.png`, `sitl_fault.png`, `sitl_smolder.png`, `sitl_clean.png`.
 - Screenshot dashboard & klien mobile aktual: `logs/dashboard_ss_terbaru.png`, `logs/another_dashboard_ss_terbaru.png`, `logs/mqtt_dashboard_ss.jpeg`.
-- Pengujian otomatis: `tests/test_mqtt_and_dashboard.py` (26/26 unit test lulus).
-- Firmware & konfigurasi aktual: `firmware/karhutla_esp32/src/main.cpp`, `README.md`, `karhutla_iot_mqtt_panel.json`.
+- Pengujian otomatis: `cargo test --target x86_64-unknown-linux-gnu -p karhutla-core` (11/11 unit & golden-vector test lulus) serta `tests/test_mqtt_and_dashboard.py` (40/40 unit test lulus).
+- Firmware & konfigurasi aktual: `firmware/karhutla_esp32_rs/` (Rust Embassy + `partitions.csv`), `firmware/karhutla_esp32/src/main.cpp` (fallback PlatformIO ESP-IDF), `README.md`, `karhutla_iot_mqtt_panel.json`.
 - **Ketiadaan Bukti (jangan difabrikasi):** Belum ada data pengujian lapangan hutan karhutla skala penuh, testimoni pengguna eksternal, maupun sertifikasi industri.
 
 ## Product Principles
