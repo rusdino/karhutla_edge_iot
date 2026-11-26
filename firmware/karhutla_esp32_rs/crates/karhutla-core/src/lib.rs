@@ -5,6 +5,11 @@ use libm::{fabsf, fmaxf, fminf, powf};
 #[cfg(test)]
 mod golden_vectors;
 
+pub mod buzzer;
+pub mod mqtt_codec;
+pub mod record;
+pub mod rtc;
+
 pub mod cfg {
     // ---- Jaringan ----
     pub const WIFI_SSID: &str = "Hotspot LSKK";
