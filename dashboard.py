@@ -14,6 +14,7 @@ Contoh:
   python dashboard.py --auto-sim flaming --speed 1   # langsung mulai simulasi flaming
 """
 import argparse
+import base64
 from collections import deque
 import csv
 import datetime
@@ -24,10 +25,12 @@ import math
 import os
 import socket
 import socketserver
+import struct
 import subprocess
 import threading
 import time
 import urllib.parse
+import zlib
 
 import config as K
 from core import Firmware
@@ -243,6 +246,16 @@ class DashboardEngine:
         self._esp_fc = LinearTrendForecaster()
         self._watchdog_stop = threading.Event()
         self._watchdog_thread = None
+        self.esp_log = {
+            "count": None, "meta_count": None, "crc32": None, "cap": None, "full": None, "bytes": None,
+            "cap_bytes": None, "synced_key": None, "downloaded_key": None, "busy": None,
+            "progress": None, "last_error": None, "last_sync": None, "batch_csv": None,
+        }
+        self._log_cond = threading.Condition()
+        self._log_op = threading.Lock()
+        self._log_meta = None
+        self._log_chunks = {}
+        self._log_acks = []
 
         self.lock = threading.Lock()
         self.history = deque(maxlen=1800)
@@ -354,11 +367,9 @@ class DashboardEngine:
                     with self.lock:
                         self.sim_ref_fw.apply_command(payload)
             elif topic == K.T_HEARTBEAT:
-                try:
-                    hb = json.loads(payload)
-                except ValueError:
-                    hb = {}
-                self._esp_alive(hb.get("mode") if isinstance(hb, dict) else None)
+                self.ingest_mqtt(topic, payload)
+            elif topic in (K.T_LOG_META, K.T_LOG_CHUNK, K.T_LOG_ACK):
+                self.ingest_mqtt(topic, payload)
             elif topic == K.T_TELEM:
                 try:
                     tel = json.loads(payload)
@@ -422,6 +433,348 @@ class DashboardEngine:
                 changed = True
         if changed:
             self._broadcast({"type": "esp_status", "online": True, "hw_mode": self.esp_hw_mode, "age_s": 0.0})
+
+    # ---------- Backup log ESP32 (sync / download / clear) ----------
+    ESP_REC = struct.Struct("<4sBBBBIII10fI")
+    ESP_WIB = datetime.timezone(datetime.timedelta(hours=7))
+    ESP_LOG_COLS = ["timestamp", "epoch_s", "uptime_ms", "seq", "record_crc32", "rtc_valid", "mode_hils",
+                    "state", "mode", "v_dust", "v_mq", "pm_raw", "pm", "dcdt", "gas_ppm", "g", "fi", "v0", "duty"]
+    ESP_LOG_KEY = ("epoch_s", "uptime_ms", "seq", "record_crc32")
+
+    def _esp_log_publish(self, topic, payload):
+        if self.client is None:
+            raise RuntimeError("klien MQTT tidak tersedia")
+        self.client.publish(topic, payload, qos=1)
+
+    def ingest_mqtt(self, topic, payload):
+        """Tangani heartbeat ESP32 + topik backup log (dipanggil on_msg MQTT)."""
+        if topic == K.T_HEARTBEAT:
+            try:
+                hb = json.loads(payload)
+            except ValueError:
+                hb = {}
+            if not isinstance(hb, dict):
+                hb = {}
+            self._esp_alive(hb.get("mode"))
+            self._on_esp_heartbeat(hb)
+            return
+        if topic not in (K.T_LOG_META, K.T_LOG_CHUNK, K.T_LOG_ACK):
+            return
+        try:
+            msg = json.loads(payload)
+        except ValueError:
+            return
+        if not isinstance(msg, dict):
+            return
+        with self._log_cond:
+            if topic == K.T_LOG_META:
+                self._log_meta = msg
+            elif topic == K.T_LOG_CHUNK:
+                try:
+                    self._log_chunks[int(msg.get("start"))] = msg
+                except (TypeError, ValueError):
+                    return
+            else:
+                self._log_acks.append(msg)
+            self._log_cond.notify_all()
+
+    def _on_esp_heartbeat(self, hb):
+        changed = False
+        with self.lock:
+            lg = self.esp_log
+            if "log_count" in hb:
+                try:
+                    cnt = int(hb["log_count"])
+                except (TypeError, ValueError):
+                    cnt = None
+                if cnt is not None:
+                    if cnt != lg["count"] or cnt != lg["meta_count"]:
+                        if cnt != lg["meta_count"]:
+                            lg["crc32"] = None   # isi flash berubah -> bukti sync lama tidak berlaku
+                        changed = True
+                    lg["count"] = cnt
+                for k_hb, k_lg in (("log_cap", "cap"), ("log_full", "full"), ("log_bytes", "bytes"),
+                                   ("log_cap_bytes", "cap_bytes")):
+                    if k_hb in hb:
+                        lg[k_lg] = hb[k_hb]
+        if changed:
+            self._broadcast_esp_log()
+        rtc_ok = hb.get("rtc_ok")
+        if rtc_ok is None:
+            return
+        now = time.time()
+        try:
+            drift = abs(float(hb.get("epoch_s", 0)) - now)
+        except (TypeError, ValueError):
+            drift = float("inf")
+        if (not rtc_ok) or drift > 10:
+            try:
+                self._esp_log_publish(K.T_TIME_SYNC, str(int(now)))
+            except Exception:
+                pass
+
+    def _esp_log_key(self):
+        lg = self.esp_log
+        if lg["count"] is None or lg["crc32"] is None:
+            return None
+        return (lg["count"], lg["crc32"])
+
+    def get_esp_log_status(self):
+        with self.lock:
+            lg = dict(self.esp_log)
+            online = self.esp_online
+        key = (lg["count"], lg["crc32"]) if lg["count"] is not None and lg["crc32"] is not None else None
+        synced = key is not None and lg["synced_key"] == key
+        downloaded = synced and lg["downloaded_key"] == key
+        count = lg["count"]
+        can_clear = bool(online and count is not None and not lg["busy"]
+                         and (count == 0 or (synced and downloaded)))
+        return {
+            "online": online, "log_count": count, "log_cap": lg["cap"], "log_full": lg["full"],
+            "log_bytes": lg["bytes"], "log_cap_bytes": lg["cap_bytes"], "crc32": lg["crc32"],
+            "synced": synced, "downloaded": downloaded, "can_clear": can_clear,
+            "busy": lg["busy"], "progress": lg["progress"], "last_error": lg["last_error"],
+            "last_sync": lg["last_sync"],
+            "csv_file": os.path.basename(lg["batch_csv"]) if lg["batch_csv"] else None,
+        }
+
+    def _broadcast_esp_log(self):
+        self._broadcast({"type": "esp_log_status", **self.get_esp_log_status()})
+
+    def _esp_log_set(self, **kw):
+        with self.lock:
+            self.esp_log.update(kw)
+        self._broadcast_esp_log()
+
+    def _esp_log_request_meta(self, timeout=5.0):
+        with self._log_cond:
+            self._log_meta = None
+        self._esp_log_publish(K.T_LOG_REQ, "META")
+        with self._log_cond:
+            if not self._log_cond.wait_for(lambda: self._log_meta is not None, timeout):
+                return None
+            meta = self._log_meta
+        try:
+            return {"count": int(meta["count"]), "crc32": int(meta["crc32"]) & 0xFFFFFFFF, "raw": meta}
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _esp_log_apply_meta(self, m):
+        raw = m["raw"]
+        with self.lock:
+            lg = self.esp_log
+            lg["count"] = m["count"]
+            lg["meta_count"] = m["count"]
+            lg["crc32"] = m["crc32"]
+            for k_m, k_lg in (("cap", "cap"), ("full", "full"), ("used_bytes", "bytes"), ("cap_bytes", "cap_bytes")):
+                if k_m in raw:
+                    lg[k_lg] = raw[k_m]
+
+    def _esp_log_fetch_chunk(self, start, want, total, retries=3, timeout=5.0):
+        last = "tidak ada respons"
+        size = self.ESP_REC.size
+        for _ in range(retries):
+            with self._log_cond:
+                self._log_chunks.pop(start, None)
+            self._esp_log_publish(K.T_LOG_REQ, f"GET:{start}:{want}")
+            with self._log_cond:
+                if not self._log_cond.wait_for(lambda: start in self._log_chunks, timeout):
+                    last = f"timeout chunk {start}"
+                    continue
+                msg = self._log_chunks.pop(start)
+            try:
+                data = base64.b64decode(msg.get("data", ""), validate=True)
+            except (ValueError, TypeError):
+                last = f"base64 chunk {start} rusak"
+                continue
+            if len(data) != want * size or int(msg.get("count", -1)) != want or int(msg.get("total", -1)) != total:
+                last = f"chunk {start} terpotong/tidak konsisten"
+                continue
+            bad = None
+            for i in range(want):
+                slot = data[i * size:(i + 1) * size]
+                if self._esp_parse_record(slot) is None:
+                    bad = start + i
+                    break
+            if bad is not None:
+                last = f"CRC/magic rekaman {bad} salah"
+                continue
+            return data, None
+        return None, last
+
+    def _esp_parse_record(self, slot):
+        if len(slot) != self.ESP_REC.size:
+            return None
+        f = self.ESP_REC.unpack(slot)
+        if f[0] != b"KLOG" or f[1] != 1:
+            return None
+        if (zlib.crc32(slot[:60]) & 0xFFFFFFFF) != f[-1]:
+            return None
+        flags = f[4]
+        return {
+            "state": f[2], "mode": f[3], "rtc_valid": flags & 1, "mode_hils": (flags >> 1) & 1,
+            "epoch_s": f[5], "uptime_ms": f[6], "seq": f[7],
+            "v_dust": f[8], "v_mq": f[9], "pm_raw": f[10], "pm": f[11], "dcdt": f[12],
+            "gas_ppm": f[13], "g": f[14], "fi": f[15], "v0": f[16], "duty": f[17],
+            "record_crc32": f[18],
+        }
+
+    def _esp_record_row(self, rec):
+        row = dict(rec)
+        if rec["rtc_valid"] and rec["epoch_s"] > 0:
+            dt = datetime.datetime.fromtimestamp(rec["epoch_s"], self.ESP_WIB)
+            row["timestamp"] = dt.isoformat(timespec="seconds")
+            day = dt.date().isoformat()
+        else:
+            row["timestamp"] = f"UNSYNCED+{rec['uptime_ms']}ms"
+            day = "unsynced"
+        for k_f in ("v_dust", "v_mq", "pm_raw", "pm", "dcdt", "gas_ppm", "g", "fi", "v0", "duty"):
+            row[k_f] = f"{row[k_f]:.6g}"
+        return row, day
+
+    def _write_esp_archives(self, rows_by_day):
+        os.makedirs(self.out_dir, exist_ok=True)
+        for day, rows in rows_by_day.items():
+            path = os.path.join(self.out_dir, f"karhutla_esp32_backup_{day}.csv")
+            seen = set()
+            exists = os.path.exists(path)
+            if exists:
+                with open(path, newline="", encoding="utf-8") as f:
+                    for r in csv.DictReader(f):
+                        seen.add(tuple(str(r.get(k_, "")) for k_ in self.ESP_LOG_KEY))
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=self.ESP_LOG_COLS)
+                if not exists:
+                    w.writeheader()
+                for r in rows:
+                    key = tuple(str(r[k_]) for k_ in self.ESP_LOG_KEY)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    w.writerow(r)
+
+    def sync_esp_logs(self):
+        if not self._log_op.acquire(blocking=False):
+            return False, {"error": "operasi log lain sedang berjalan"}
+        try:
+            return self._sync_esp_logs_locked()
+        finally:
+            self._log_op.release()
+            self._esp_log_set(busy=None, progress=None)
+
+    def _fail_sync(self, msg):
+        self._esp_log_set(last_error=msg)
+        return False, {"error": msg}
+
+    def _sync_esp_logs_locked(self):
+        if not self.esp_online:
+            return self._fail_sync("ESP32 offline")
+        self._esp_log_set(busy="sync", progress=0.0, last_error=None)
+        try:
+            meta = self._esp_log_request_meta()
+            if meta is None:
+                return self._fail_sync("META tidak dijawab ESP32")
+            total = meta["count"]
+            size = self.ESP_REC.size
+            parts = []
+            for start in range(0, total, 16):
+                want = min(16, total - start)
+                data, err = self._esp_log_fetch_chunk(start, want, total)
+                if data is None:
+                    return self._fail_sync(f"sync gagal: {err}")
+                parts.append(data)
+                self._esp_log_set(progress=round((start + want) / max(total, 1), 3))
+            raw_all = b"".join(parts)
+            if len(raw_all) != total * size or (zlib.crc32(raw_all) & 0xFFFFFFFF) != meta["crc32"]:
+                return self._fail_sync("CRC-32 total log tidak cocok dengan META")
+            rows, by_day = [], {}
+            for i in range(total):
+                rec = self._esp_parse_record(raw_all[i * size:(i + 1) * size])
+                row, day = self._esp_record_row(rec)
+                rows.append(row)
+                by_day.setdefault(day, []).append(row)
+            self._write_esp_archives(by_day)
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            batch = os.path.join(self.out_dir, f"karhutla_esp32_sync_{stamp}.csv")
+            tmp = batch + ".tmp"
+            with open(tmp, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=self.ESP_LOG_COLS)
+                w.writeheader()
+                w.writerows(rows)
+            os.replace(tmp, batch)
+            self._esp_log_apply_meta(meta)
+            self._esp_log_set(synced_key=(meta["count"], meta["crc32"]), downloaded_key=None,
+                              batch_csv=batch, last_sync=datetime.datetime.now().isoformat(timespec="seconds"),
+                              last_error=None)
+            return True, {"count": total, "crc32": meta["crc32"], "csv_file": os.path.basename(batch)}
+        except Exception as exc:
+            return self._fail_sync(f"sync gagal: {exc}")
+
+    def get_esp_log_download_path(self):
+        with self.lock:
+            lg = self.esp_log
+            key = (lg["count"], lg["crc32"]) if lg["count"] is not None and lg["crc32"] is not None else None
+            if key is None or lg["synced_key"] != key or not lg["batch_csv"] \
+                    or not os.path.exists(lg["batch_csv"]):
+                return None, "Belum sync (atau log berubah sejak sync); jalankan sync dulu."
+            path = lg["batch_csv"]
+            lg["downloaded_key"] = key
+        self._broadcast_esp_log()
+        return path, None
+
+    def clear_esp_logs(self):
+        if not self._log_op.acquire(blocking=False):
+            return 409, {"ok": False, "error": "operasi log lain sedang berjalan"}
+        try:
+            return self._clear_esp_logs_locked()
+        finally:
+            self._log_op.release()
+            self._esp_log_set(busy=None, progress=None)
+
+    def _clear_esp_logs_locked(self):
+        st = self.get_esp_log_status()
+        if not st["online"] or st["log_count"] is None:
+            return 409, {"ok": False, "error": "ESP32 offline; clear ditolak."}
+        if st["log_count"] > 0 and not (st["synced"] and st["downloaded"]):
+            return 409, {"ok": False, "error": "Log belum disinkronkan dan diunduh; clear ditolak."}
+        self._esp_log_set(busy="clear", progress=None, last_error=None)
+        meta = self._esp_log_request_meta()
+        if meta is None:
+            return 504, {"ok": False, "error": "META tidak dijawab ESP32"}
+        self._esp_log_apply_meta(meta)
+        if meta["count"] > 0:
+            cur = (meta["count"], meta["crc32"])
+            with self.lock:
+                ok = self.esp_log["synced_key"] == cur and self.esp_log["downloaded_key"] == cur
+            if not ok:
+                self._broadcast_esp_log()
+                return 409, {"ok": False, "error": "Isi log berubah sejak sync/unduh; clear ditolak."}
+        with self._log_cond:
+            self._log_acks.clear()
+        self._esp_log_publish(K.T_LOG_REQ, f"CLEAR:{meta['count']}:{meta['crc32']}")
+
+        def find(status):
+            for a in self._log_acks:
+                if a.get("action") == "CLEAR" and a.get("status") == status:
+                    return a
+            return None
+        with self._log_cond:
+            if not self._log_cond.wait_for(lambda: find("started") is not None, 5.0):
+                return 504, {"ok": False, "error": "ESP32 tidak mengakui CLEAR"}
+            try:
+                sectors = int(find("started").get("sectors", 0))
+            except (TypeError, ValueError):
+                sectors = 0
+            timeout = min(90.0, max(20.0, math.ceil(sectors * 0.12) + 15.0))
+            if not self._log_cond.wait_for(lambda: find("done") is not None, timeout):
+                return 504, {"ok": False, "error": "timeout menunggu CLEAR selesai"}
+            done = find("done")
+        if not done.get("ok"):
+            self._esp_log_set(last_error="CLEAR gagal di ESP32")
+            return 500, {"ok": False, "error": "CLEAR gagal di ESP32", "ack": done}
+        self._esp_log_set(count=0, meta_count=0, crc32=0, synced_key=None, downloaded_key=None,
+                          batch_csv=None, full=False, bytes=0)
+        return 200, {"ok": True, "ack": done}
 
     def _watchdog_loop(self):
         """Deteksi ESP32 dicabut: tidak ada telemetri/heartbeat > esp_stale_s."""
@@ -7001,6 +7354,24 @@ def start_dashboard_server(engine, host="0.0.0.0", port=8080):
             if parsed.path == "/api/state":
                 self._send_json(engine.get_state_snapshot())
                 return
+            if parsed.path == "/api/esp-log/status":
+                self._send_json(engine.get_esp_log_status())
+                return
+            if parsed.path == "/api/esp-log/download":
+                path, err = engine.get_esp_log_download_path()
+                if path is None:
+                    self._send_json({"ok": False, "error": err}, 409)
+                    return
+                with open(path, "rb") as f:
+                    raw = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
             if parsed.path == "/api/mobile-config":
                 cfg = build_mobile_dashboard_config(engine.broker_host, engine.broker_port)
                 raw = json.dumps(cfg, indent=2).encode("utf-8")
@@ -7117,6 +7488,14 @@ def start_dashboard_server(engine, host="0.0.0.0", port=8080):
                     "reason": None if ok else getattr(engine, "_last_cmd_error", "Perintah ditolak."),
                     "paths": getattr(engine, "_last_cmd_paths", {"sitl": False, "esp32": False}) if ok else None,
                 })
+                return
+            if parsed.path == "/api/esp-log/sync":
+                ok, info = engine.sync_esp_logs()
+                self._send_json({"ok": ok, **info, "status": engine.get_esp_log_status()}, 200 if ok else 502)
+                return
+            if parsed.path == "/api/esp-log/clear":
+                code, info = engine.clear_esp_logs()
+                self._send_json({**info, "status": engine.get_esp_log_status()}, code)
                 return
             if parsed.path == "/api/sim":
                 ok = engine.control_sim(data)

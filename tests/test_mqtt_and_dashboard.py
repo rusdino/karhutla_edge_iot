@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 import urllib.request
+import io
 import config as K
 from core import Firmware
 from logger import DailyMqttLogger
@@ -931,6 +932,189 @@ class TestModernWebDashboard(unittest.TestCase):
                 eng.shutdown()
                 srv.shutdown()
                 srv.server_close()
+
+
+import base64
+import csv as _csv
+import datetime as _dt
+import glob
+import struct
+import zlib
+import urllib.error
+
+_REC = struct.Struct("<4sBBBBIII10fI")
+
+
+def _mk_rec(epoch_s, uptime_ms, seq, rtc=True, pm=10.0):
+    flags = 1 if rtc else 0
+    head = struct.pack("<4sBBBBIII10f", b"KLOG", 1, 1, 0, flags, epoch_s, uptime_ms, seq,
+                       0.1, 0.2, pm, pm, 0.0, 400.0, 0.0, 0.0, 0.6, 50.0)
+    return head + struct.pack("<I", zlib.crc32(head) & 0xFFFFFFFF)
+
+
+class FakeEsp:
+    """Meniru firmware: menjawab karhutla/log/req lewat engine.ingest_mqtt."""
+
+    def __init__(self, records):
+        self.records = list(records)
+        self.eng = None
+        self.published = []
+        self.corrupt = False
+
+    def raw(self):
+        return b"".join(self.records)
+
+    def hb(self, rtc_ok=True, epoch_s=None):
+        epoch_s = int(time.time()) if epoch_s is None else epoch_s
+        self.eng.ingest_mqtt("karhutla/hb", json.dumps({
+            "mode": "RIIL", "uptime_ms": 1000, "rtc_ok": rtc_ok, "epoch_s": epoch_s,
+            "log_count": len(self.records), "log_cap": 43008, "log_full": False,
+            "log_bytes": len(self.records) * 64, "log_cap_bytes": 2752512}))
+
+    def publish(self, topic, payload, *a, **k):
+        self.published.append((topic, payload))
+        if topic != "karhutla/log/req":
+            return
+        e = self.eng
+        if payload == "META":
+            e.ingest_mqtt("karhutla/log/meta", json.dumps({
+                "count": len(self.records), "cap": 43008, "full": False,
+                "used_bytes": len(self.records) * 64, "cap_bytes": 2752512,
+                "crc32": zlib.crc32(self.raw()) & 0xFFFFFFFF, "rtc_ok": True, "epoch_s": 0}))
+        elif payload.startswith("GET:"):
+            _, st, cnt = payload.split(":")
+            st, cnt = int(st), int(cnt)
+            data = bytearray(b"".join(self.records[st:st + cnt]))
+            if self.corrupt and data:
+                data[5] ^= 0xFF
+            e.ingest_mqtt("karhutla/log/chunk", json.dumps({
+                "start": st, "count": len(self.records[st:st + cnt]), "total": len(self.records),
+                "data": base64.b64encode(bytes(data)).decode()}))
+        elif payload.startswith("CLEAR:"):
+            e.ingest_mqtt("karhutla/log/ack", json.dumps({"action": "CLEAR", "status": "started", "sectors": 4}))
+            self.records = []
+            e.ingest_mqtt("karhutla/log/ack", json.dumps({"action": "CLEAR", "status": "done", "ok": True}))
+
+
+class TestEspBackupSyncAndClear(unittest.TestCase):
+    def _setup(self, tmp, records):
+        eng = dashboard.DashboardEngine(out_dir=tmp, enable_mqtt=False)
+        esp = FakeEsp(records)
+        esp.eng = eng
+        eng.client = esp
+        srv = dashboard.start_dashboard_server(eng, host="127.0.0.1", port=0)
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        esp.hb()
+        return eng, esp, srv, base
+
+    def _req(self, base, path, method="GET"):
+        rq = urllib.request.Request(base + path, method=method, data=b"{}" if method == "POST" else None)
+        try:
+            with urllib.request.urlopen(rq, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def _stop(self, eng, srv):
+        eng.shutdown()
+        srv.shutdown()
+        srv.server_close()
+
+    def _recs(self, n):
+        t = 1764000000
+        return [_mk_rec(t + i, 1000 * i, i + 1) for i in range(n)]
+
+    def test_clear_blocked_with_409_until_synced_and_downloaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, esp, srv, base = self._setup(tmp, self._recs(5))
+            try:
+                self.assertEqual(self._req(base, "/api/esp-log/clear", "POST")[0], 409)
+                st, body = self._req(base, "/api/esp-log/sync", "POST")
+                self.assertEqual(st, 200, body)
+                self.assertEqual(self._req(base, "/api/esp-log/clear", "POST")[0], 409)
+                self.assertFalse([p for p in esp.published if str(p[1]).startswith("CLEAR")])
+                st, body = self._req(base, "/api/esp-log/download")
+                self.assertEqual(st, 200)
+                crc = zlib.crc32(esp.raw()) & 0xFFFFFFFF
+                st, body = self._req(base, "/api/esp-log/clear", "POST")
+                self.assertEqual(st, 200, body)
+                self.assertIn(("karhutla/log/req", f"CLEAR:5:{crc}"), esp.published)
+            finally:
+                self._stop(eng, srv)
+
+    def test_clear_blocked_if_new_offline_record_appended_after_sync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, esp, srv, base = self._setup(tmp, self._recs(5))
+            try:
+                self.assertEqual(self._req(base, "/api/esp-log/sync", "POST")[0], 200)
+                self.assertEqual(self._req(base, "/api/esp-log/download")[0], 200)
+                esp.records.append(_mk_rec(1764000100, 99000, 6))
+                esp.hb()
+                self.assertEqual(self._req(base, "/api/esp-log/clear", "POST")[0], 409)
+                self.assertFalse([p for p in esp.published if str(p[1]).startswith("CLEAR")])
+            finally:
+                self._stop(eng, srv)
+
+    def test_sync_rejects_corrupt_crc_or_torn_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, esp, srv, base = self._setup(tmp, self._recs(3))
+            try:
+                esp.corrupt = True
+                st, body = self._req(base, "/api/esp-log/sync", "POST")
+                self.assertNotEqual(st, 200)
+                status = json.loads(self._req(base, "/api/esp-log/status")[1])
+                self.assertFalse(status["synced"])
+                self.assertEqual(glob.glob(os.path.join(tmp, "karhutla_esp32_*")), [])
+            finally:
+                self._stop(eng, srv)
+
+    def test_sync_multiday_and_unsynced_clock_dedup(self):
+        wib = _dt.timezone(_dt.timedelta(hours=7))
+        t1 = int(_dt.datetime(2026, 11, 25, 23, 59, 30, tzinfo=wib).timestamp())
+        t2 = int(_dt.datetime(2026, 11, 26, 0, 0, 30, tzinfo=wib).timestamp())
+        recs = [_mk_rec(t1, 1000, 1), _mk_rec(t2, 61000, 2),
+                _mk_rec(0, 5000, 1, rtc=False), _mk_rec(0, 6000, 1, rtc=False)]
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, esp, srv, base = self._setup(tmp, recs)
+            try:
+                self.assertEqual(self._req(base, "/api/esp-log/sync", "POST")[0], 200)
+                self.assertEqual(self._req(base, "/api/esp-log/sync", "POST")[0], 200)
+                self.assertFalse(glob.glob(os.path.join(tmp, "*1970-01-01*")))
+                for d in ("2026-11-25", "2026-11-26"):
+                    p = os.path.join(tmp, f"karhutla_esp32_backup_{d}.csv")
+                    self.assertTrue(os.path.exists(p), p)
+                    with open(p, newline="", encoding="utf-8") as f:
+                        self.assertEqual(len(list(_csv.DictReader(f))), 1)
+                unsynced = glob.glob(os.path.join(tmp, "karhutla_esp32_backup_*unsynced*.csv"))
+                self.assertEqual(len(unsynced), 1)
+                with open(unsynced[0], newline="", encoding="utf-8") as f:
+                    rows = list(_csv.DictReader(f))
+                self.assertEqual([r["timestamp"] for r in rows], ["UNSYNCED+5000ms", "UNSYNCED+6000ms"])
+                st, body = self._req(base, "/api/esp-log/download")
+                self.assertEqual(st, 200)
+                rows = list(_csv.DictReader(io.StringIO(body.decode("utf-8"))))
+                self.assertEqual(len(rows), 4)
+            finally:
+                self._stop(eng, srv)
+
+    def test_auto_time_sync_published_on_drift_or_unset_rtc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            eng, esp, srv, base = self._setup(tmp, [])
+            try:
+                esp.published.clear()
+                esp.hb(rtc_ok=False, epoch_s=0)
+                syncs = [p for p in esp.published if p[0] == K.T_TIME_SYNC]
+                self.assertEqual(len(syncs), 1)
+                self.assertAlmostEqual(int(syncs[0][1]), time.time(), delta=5)
+                esp.published.clear()
+                esp.hb(rtc_ok=True, epoch_s=int(time.time()) + 60)
+                self.assertEqual(len([p for p in esp.published if p[0] == K.T_TIME_SYNC]), 1)
+                esp.published.clear()
+                time.sleep(0)
+                esp.hb(rtc_ok=True)
+                self.assertEqual([p for p in esp.published if p[0] == K.T_TIME_SYNC], [])
+            finally:
+                self._stop(eng, srv)
 
 
 if __name__ == "__main__":
