@@ -2,24 +2,28 @@
 
 Satu basis algoritma, tiga cara menjalankan:
 
-| Mode | Firmware | Sensor | Plant | Perintah |
+| Mode | Firmware / Engine | Sensor | Plant | Perintah |
 |---|---|---|---|---|
-| **SITL** | `core.py` (virtual ESP32) | model Python | `plant.py` | `python sitl.py` |
-| **Web Dashboard** | `core.py` / monitor MQTT `:6669` | model Python / live MQTT | `plant.py` / live | `python dashboard.py` |
-| **HILS** | ESP32 asli (Rust Embassy `--features hils`, fallback `pio run -e hils`) | tegangan dikirim laptop via MQTT | `plant.py` | `python hils.py` |
-| **Riil** | ESP32 asli (Rust Embassy `--features riil`, fallback `pio run -e riil`) | Sharp + MQ-135 fisik (+ RTC DS3231/DS1307) | dunia nyata | `python field_node.py` |
+| **Aplikasi Terpadu (Desktop/Web/APK)** | `karhutla_app` (Dioxus 0.7 + `karhutla-core`) | Virtual / Live MQTT | Virtual / ESP32 | `dx serve --platform desktop` / `karhutla-server` |
+| **SITL (Python Ref)** | `core.py` (virtual ESP32) | model Python | `plant.py` | `python sitl.py` |
+| **Web Dashboard (Python Ref)** | `core.py` / monitor MQTT `:6669` | model Python / live MQTT | `plant.py` / live | `python dashboard.py` |
+| **HILS** | ESP32 asli (Rust Embassy `--features hils`, fallback `pio run -e hils`) | tegangan dikirim laptop via MQTT | `plant.py` | UI Dioxus (`HILS`) / `python hils.py` |
+| **Riil** | ESP32 asli (Rust Embassy `--features riil`, fallback `pio run -e riil`) | Sharp + MQ-135 fisik (+ RTC DS3231/DS1307) | dunia nyata | UI Dioxus (`Direct MQTT`) / `python field_node.py` |
 
 ## Struktur
 ```
-config.py            parameter bersama (harus sama dgn crates/karhutla-core/src/lib.rs & include/config.h)
-core.py              firmware virtual: median3 -> Kalman 2-state -> fusi -> FSM -> PWM -> failsafe
-plant.py             ruang asap + model tegangan Sharp & MQ-135 (skenario clean/smolder/flaming/fault)
-forecast.py          AI tren linear (t+horizon) + PreemptController (FORCE_MAX proaktif yang aman)
-logger.py            CSV harian logs/karhutla_<sumber>_YYYY-MM-DD.csv & log MQTT logs/mqtt_YYYY-MM-DD.log
-report.py            ringkasan + uji lulus/gagal
-dashboard.py         Modern Web Dashboard di laptop (grafik multi-overlay, kontrol cmd, runner SITL & HILS, Memori Backup ESP32 & RTC, live MQTT log)
-sitl.py  hils.py  field_node.py
-mosquitto.conf       broker lokal (port 6669)
+karhutla_app/                    Platform terpadu Full-Rust (Dioxus 0.7 + Axum + karhutla-sim)
+  crates/karhutla-protocol/      Skema JSON, topik MQTT, konfigurasi IoT MQTT Panel
+  crates/karhutla-sim/           Simulator ruang asap + forecaster AI + daily logger (memakai karhutla-core)
+  crates/karhutla-server/        Engine Axum HTTP/WebSocket (:8080) + MQTT bridge (:6669) + HILS lock-step
+  apps/karhutla-ui/              UI tunggal Dioxus 0.7 (Web WASM, Desktop Embedded Host, Android APK Direct MQTT)
+  scripts/build_android_apk.sh   Skrip pembantu build & verifikasi Android APK (aarch64-linux-android)
+.github/workflows/build-apps.yml CI multi-target (Workspace tests, Web WASM, Desktop Linux, Android APK)
+config.py                        [Ref Python] parameter bersama (harus sama dgn crates/karhutla-core/src/lib.rs)
+core.py                          [Ref Python] firmware virtual: median3 -> Kalman 2-state -> fusi -> FSM -> PWM
+plant.py                         [Ref Python] ruang asap + model tegangan Sharp & MQ-135
+forecast.py / logger.py / report.py / dashboard.py / sitl.py / hils.py / field_node.py
+mosquitto.conf                   broker lokal (port 6669)
 firmware/karhutla_esp32_rs/
   partitions.csv               tabel partisi 4 MiB (nvs, factory 1,25 MiB, logs 2,625 MiB)
   crates/karhutla-core/        pustaka no_std DSP, FSM, RTC BCD, 8 pola buzzer, codec MQTT & record flash 64 B
@@ -228,7 +232,39 @@ Anda bisa langsung mencoba tampilan dan tombol di HP bahkan sebelum menyalakan E
 
 ---
 
-## 5. Panduan Lengkap Modern Web Dashboard di Laptop (`dashboard.py`) & Auto-Logging
+## 5. Aplikasi Terpadu Rust + Dioxus 0.7 (`karhutla_app/`): Web, Desktop & Android APK
+
+Antarmuka utama Karhutla kini dibangun dengan **Dioxus 0.7 (Full Rust)** di `karhutla_app/`, mendukung 3 target dari satu basis kode UI:
+
+### A. Build & Jalankan di Laptop (Web WASM + Desktop Embedded Host)
+```bash
+# 1. Uji semua unit & integrasi Rust (termasuk uji live roundtrip Mosquitto Direct MQTT)
+cd karhutla_app && cargo test --workspace
+
+# 2. Build bundel Web WASM lalu sajikan lewat karhutla-server (:8080 HTTP/WS + :6669 MQTT)
+cd apps/karhutla-ui && dx build --platform web
+cd ../.. && cargo run -p karhutla-server -- --web-dir target/dx/karhutla-ui/debug/web/public
+
+# 3. Atau jalankan aplikasi Desktop (Embedded Host otomatis menyalakan server :8080 LAN + MQTT)
+cd apps/karhutla-ui && dx serve --platform desktop
+```
+
+### B. Saklar Mode Koneksi (Host Lokal / Server LAN :8080 / Direct MQTT :6669)
+Klik tombol **`Host Lokal` / `Server LAN` / `Direct MQTT`** di bilah atas (`#btn-open-conn`) untuk berpindah mode:
+1. **`Host Lokal` (Desktop):** Aplikasi desktop bertindak sebagai server embedded (:8080 LAN & :6669 MQTT) yang otomatis menampung klien browser/HP di jaringan Wi-Fi yang sama.
+2. **`Server LAN (:8080)` (Web, Desktop, Android):** Menyambungkan aplikasi ke server host (`http://<IP_LAN>:8080`) untuk simulasi SITL/HILS, pembaruan grafik *real-time*, sinkronisasi log flash ESP32, dan ekspor data.
+3. **`Direct MQTT (:6669)` (Desktop & Android APK):** Menyambungkan aplikasi langsung ke broker Mosquitto lapangan (`tcp://<IP_BROKER>:6669` via `rumqttc`) **tanpa perlu laptop perantara** — cocok untuk pemantauan mode **Riil** di lapangan serta pengiriman perintah cepat `AUTO` / `FORCE_MAX` / `FORCE_OFF` / `RESET` dan ekspor CSV/Log lokal. *(Catatan: pada browser Web WASM, koneksi Direct TCP :6669 dinonaktifkan oleh sandbox browser sehingga browser diarahkan memakai Server LAN `:8080`.)*
+
+### C. Build Android APK (Lokal NDK atau GitHub Actions CI)
+- **GitHub Actions CI (`.github/workflows/build-apps.yml`):** Secara otomatis menjalankan `cargo test --workspace`, `karhutla-core` test, build Web WASM, Desktop Linux, serta menyusun artefak **Android APK (`aarch64-linux-android`)** dengan Android SDK & NDK terpasang.
+- **Lokal (jika `ANDROID_HOME` & `ANDROID_NDK_HOME` sudah terpasang):**
+  ```bash
+  ./karhutla_app/scripts/build_android_apk.sh
+  ```
+
+---
+
+## 6. Panduan Lengkap Web Dashboard Python Referensi (`dashboard.py`) & Auto-Logging
 
 Selain memantau dari HP, Anda dapat membuka **Telemetry & Command Center** langsung di browser laptop (`http://localhost:8080`) yang terhubung ke broker MQTT `:6669` secara *real-time*.
 

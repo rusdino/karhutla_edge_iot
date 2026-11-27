@@ -1,0 +1,14 @@
+[package]
+name = "karhutla-sim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+karhutla-core.workspace = true
+karhutla-protocol.workspace = true
+base64.workspace = true
+chrono.workspace = true
+csv.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true

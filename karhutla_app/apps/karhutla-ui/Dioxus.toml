@@ -1,0 +1,25 @@
+[application]
+name = "karhutla-ui"
+
+[web.app]
+title = "Karhutla Edge-IoT — Pusat Telemetri & Kendali"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]
+
+[web.resource]
+style = []
+script = []
+
+[web.resource.dev]
+style = []
+script = []
+
+[bundle]
+identifier = "id.karhutla.edgeiot"
+publisher = "Karhutla Edge-IoT"
+icon = ["assets/icon.png"]
+category = "Utility"
+short_description = "Monitor Real-Time Karhutla SITL, HILS & Direct MQTT"
+long_description = "Aplikasi lintas platform Karhutla Edge-IoT untuk memantau indeks bahaya kebakaran (FI), PM2.5, gas MQ-135, prakiraan AI 60 detik, dan mengirim perintah override kipas baik melalui Server LAN maupun Direct MQTT (:6669) di lapangan."

@@ -1,0 +1,61 @@
+[package]
+name = "karhutla-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dioxus = { version = "0.7", features = [] }
+karhutla-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+
+# Web (WASM) dependencies
+gloo-net = { version = "0.6", features = ["http", "websocket"], optional = true }
+gloo-timers = { version = "0.3", features = ["futures"], optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = ["Window", "Document", "Location", "Storage", "MediaQueryList"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+# Desktop (Embedded Host) & Mobile dependencies
+karhutla-server = { path = "../../crates/karhutla-server", optional = true }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+rumqttc = { version = "0.24", default-features = false, optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+tokio-tungstenite = { version = "0.24", optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+default = ["desktop"]
+web = [
+    "dioxus/web",
+    "dep:gloo-net",
+    "dep:gloo-timers",
+    "dep:js-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+    "dep:futures-util",
+]
+desktop = [
+    "dioxus/desktop",
+    "dep:karhutla-server",
+    "dep:axum",
+    "dep:tokio",
+    "dep:rumqttc",
+    "dep:reqwest",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "dep:tracing-subscriber",
+]
+mobile = [
+    "dioxus/mobile",
+    "dep:tokio",
+    "dep:rumqttc",
+    "dep:reqwest",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+]

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/karhutla-protocol",
+    "crates/karhutla-sim",
+    "crates/karhutla-server",
+    "apps/karhutla-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+karhutla-core = { path = "../firmware/karhutla_esp32_rs/crates/karhutla-core" }
+karhutla-protocol = { path = "crates/karhutla-protocol" }
+karhutla-sim = { path = "crates/karhutla-sim" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+csv = "1"
+rand = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+rumqttc = "0.24"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"

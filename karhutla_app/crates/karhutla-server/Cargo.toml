@@ -1,0 +1,35 @@
+[package]
+name = "karhutla-server"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "karhutla_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "karhutla-server"
+path = "src/main.rs"
+
+[dependencies]
+karhutla-core.workspace = true
+karhutla-protocol.workspace = true
+karhutla-sim.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+csv.workspace = true
+futures-util.workspace = true
+rumqttc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"

@@ -12,3 +12,7 @@ __pycache__/
 # Runtime CSV & MQTT Log Files
 logs/*.csv
 logs/*.log
+
+# Rust Host/Dioxus App Build Artifacts
+karhutla_app/target/
+karhutla_app/dist/
