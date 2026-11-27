@@ -25,10 +25,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system Mosquitto broker for Direct MQTT test
+      - name: Install system Mosquitto broker & Linux UI libs for workspace tests
         run: |
           sudo apt-get update
-          sudo apt-get install -y mosquitto
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libasound2-dev \
+            libudev-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            libglib2.0-dev \
+            mosquitto
 
       - name: Install Rust toolchain (host + wasm32)
         uses: dtolnay/rust-toolchain@stable
@@ -125,9 +133,11 @@ jobs:
         run: |
           NDK_DIR="${ANDROID_HOME}/ndk/27.2.12479018"
           echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "$GITHUB_ENV"
+          echo "NDK_HOME=${NDK_DIR}" >> "$GITHUB_ENV"
           echo "${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
           echo "CC_aarch64_linux_android=${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain with Android aarch64 target
         uses: dtolnay/rust-toolchain@stable
@@ -142,15 +152,73 @@ jobs:
         working-directory: karhutla_app
         run: cargo check -p karhutla-ui --target aarch64-linux-android --no-default-features --features mobile
 
-      - name: Bundle Android APK
+      - name: Bundle Android APK (arm64-v8a)
         working-directory: karhutla_app/apps/karhutla-ui
-        run: dx bundle --platform android --package-types apk --release
+        run: dx bundle --platform android --target aarch64-linux-android --package-types apk --release
+
+      - name: Verify, 16KB-align & Sign ARM64 APK
+        run: |
+          set -euo pipefail
+          RAW_APK="$(find karhutla_app/target/dx/karhutla-ui/release/android -type f -name '*.apk' | head -n 1)"
+          if [ -z "$RAW_APK" ]; then
+            echo "APK tidak ditemukan setelah dx bundle!" >&2
+            exit 1
+          fi
+          echo "Found RAW_APK=$RAW_APK"
+
+          python3 - "$RAW_APK" <<'PY'
+          import struct, sys, zipfile
+          apk = sys.argv[1]
+          with zipfile.ZipFile(apk) as zf:
+              libs = [n for n in zf.namelist() if n.startswith("lib/")]
+              print("APK native libs:", libs)
+              assert "lib/arm64-v8a/libmain.so" in libs, f"Missing lib/arm64-v8a/libmain.so! Found: {libs}"
+              so = zf.read("lib/arm64-v8a/libmain.so")
+              assert so[:4] == b"\x7fELF" and so[4] == 2, "Expected ELF64 aarch64 binary"
+              e_phoff, = struct.unpack_from("<Q", so, 32)
+              e_phentsize, e_phnum = struct.unpack_from("<HH", so, 54)
+              aligns = []
+              for i in range(e_phnum):
+                  p_type, = struct.unpack_from("<I", so, e_phoff + i * e_phentsize)
+                  if p_type == 1:
+                      p_align, = struct.unpack_from("<Q", so, e_phoff + i * e_phentsize + 48)
+                      aligns.append(p_align)
+              print("arm64-v8a libmain.so PT_LOAD p_align:", aligns)
+              assert aligns and all(a >= 16384 for a in aligns), f"Expected 16KB PT_LOAD alignment >= 16384, got {aligns}"
+          PY
+
+          mkdir -p apk_out
+          BT="${ANDROID_HOME}/build-tools/35.0.0"
+          "${BT}/zipalign" -f -p -P 16 4 "$RAW_APK" apk_out/karhutla-android-arm64-v8a-aligned.apk
+
+          KEYSTORE="${HOME}/.android/debug.keystore"
+          if [ ! -f "$KEYSTORE" ]; then
+            mkdir -p "${HOME}/.android"
+            keytool -genkeypair -v -keystore "$KEYSTORE" \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          "${BT}/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out apk_out/karhutla-android-arm64-v8a.apk \
+            apk_out/karhutla-android-arm64-v8a-aligned.apk
+
+          "${BT}/apksigner" verify --verbose --print-certs apk_out/karhutla-android-arm64-v8a.apk
+          "${BT}/zipalign" -c -P 16 4 apk_out/karhutla-android-arm64-v8a.apk
 
       - name: Upload Android APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: karhutla-android-apk
-          path: karhutla_app/target/dx/karhutla-ui/release/android/**/*.apk
+          path: apk_out/karhutla-android-arm64-v8a.apk
 
   publish-android-release:
     name: Attach Android APK to Tag Release
@@ -171,5 +239,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARGET_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          find apk_dist -type f -name '*.apk' -exec \
-            gh release upload "${TARGET_TAG}" {} --repo "${GITHUB_REPOSITORY}" --clobber \;
+          set -euo pipefail
+          mv apk_dist/karhutla-android-arm64-v8a.apk "apk_dist/karhutla-android-arm64-v8a-${TARGET_TAG}.apk"
+          gh release upload "${TARGET_TAG}" "apk_dist/karhutla-android-arm64-v8a-${TARGET_TAG}.apk" \
+            --repo "${GITHUB_REPOSITORY}" --clobber

@@ -35,6 +35,8 @@ if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
 fi
 
 NDK_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+export NDK_HOME="${ANDROID_NDK_HOME}"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="${CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS:-} -C link-arg=-Wl,-z,max-page-size=16384"
 if [[ -d "$NDK_BIN" ]]; then
   export PATH="${NDK_BIN}:${PATH}"
   export CC_aarch64_linux_android="${NDK_BIN}/aarch64-linux-android24-clang"
@@ -44,8 +46,8 @@ fi
 echo "==> Memeriksa kompilasi lintas platform aarch64-linux-android (mobile)..."
 (cd "${ROOT_DIR}/karhutla_app" && cargo check -p karhutla-ui --target aarch64-linux-android --no-default-features --features mobile)
 
-echo "==> Memaketkan Android APK rilis lewat Dioxus CLI..."
-(cd "${UI_DIR}" && dx bundle --platform android --package-types apk --release)
+echo "==> Memaketkan Android APK (arm64-v8a) rilis lewat Dioxus CLI..."
+(cd "${UI_DIR}" && dx bundle --platform android --target aarch64-linux-android --package-types apk --release)
 
 echo "==> Selesai! Berkas APK tersedia di:"
 find "${ROOT_DIR}/karhutla_app/target/dx/karhutla-ui" -type f -name '*.apk' 2>/dev/null || true
